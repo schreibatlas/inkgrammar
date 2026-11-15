@@ -18,10 +18,9 @@ from PIL import Image
 from pydantic import Field
 
 from ..models import StrictModel
-from ..raster import otsu_mask
 from .models import ObservationMetrics
 
-PREPROCESS_VERSION = 1
+PREPROCESS_VERSION = 2
 
 GlyphClass = Literal["lowercase", "uppercase", "mixed"]
 
@@ -29,8 +28,8 @@ GlyphClass = Literal["lowercase", "uppercase", "mixed"]
 class PreprocessParams(StrictModel):
     """Parameters for all preprocessing operations (versioned as a set)."""
 
-    version: Literal[1] = 1
-    threshold_policy: Literal["otsu-256-v1"] = "otsu-256-v1"
+    version: Literal[2] = 2
+    threshold_policy: Literal["rasterregions-grayscale-v2"] = "rasterregions-grayscale-v2"
     background_percentile: float | None = Field(default=None, gt=0.0, le=100.0)
     speck_min_area: int = Field(default=4, ge=1)
     crop_pad: int = Field(default=2, ge=0)
@@ -114,36 +113,32 @@ def normalize_background(gray: np.ndarray, *, percentile: float = 95.0) -> np.nd
 
 
 def threshold_mask(gray: np.ndarray) -> np.ndarray:
-    """Binarize with the recorded threshold policy (``otsu-256-v1``)."""
-    return otsu_mask(gray)
-
-
-def label_components(mask: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Label 8-connected ink components as writable ``(ys, xs)`` arrays."""
-    return [(component.ys.copy(), component.xs.copy()) for component in rr.components(mask)]
+    """Binarize grayscale pixels with RasterRegions' versioned grayscale policy."""
+    return rr.foreground_mask(gray, mode="grayscale").mask
 
 
 def detect_speck_candidates(mask: np.ndarray, *, min_area: int) -> list[RemovedComponent]:
     """Propose small components as dust/speck candidates (review decides)."""
-    candidates = []
-    for ys, xs in label_components(mask):
-        area = int(ys.size)
-        if area < min_area:
-            bbox = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
-            candidates.append(RemovedComponent(bbox=bbox, area=area))
-    return candidates
+    return [
+        RemovedComponent(bbox=component.bbox.as_tuple(), area=component.area)
+        for component in rr.components(mask)
+        if component.area < min_area
+    ]
 
 
 def clean_mask(mask: np.ndarray, params: PreprocessParams) -> tuple[np.ndarray, CleanupRecord]:
     """Remove speck candidates from a copy of the raw mask; never mutate raw."""
     cleaned = mask.copy()
     removed = []
-    for ys, xs in label_components(mask):
-        area = int(ys.size)
-        if area < params.speck_min_area:
-            bbox = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
-            removed.append(RemovedComponent(bbox=bbox, area=area))
-            cleaned[ys, xs] = False
+    for component in rr.components(mask):
+        if component.area < params.speck_min_area:
+            removed.append(
+                RemovedComponent(
+                    bbox=component.bbox.as_tuple(),
+                    area=component.area,
+                )
+            )
+            cleaned[component.ys, component.xs] = False
     return cleaned, CleanupRecord(removed_components=removed)
 
 

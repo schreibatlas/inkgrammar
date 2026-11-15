@@ -1,5 +1,10 @@
 import numpy as np
 import pytest
+from planarcurve.spline import (
+    bspline_from_geometry,
+    control_roughness_matrix,
+    spline_design_matrix,
+)
 from pydantic import ValidationError
 
 from inkgrammar.fitting.models import (
@@ -8,14 +13,11 @@ from inkgrammar.fitting.models import (
     PrimitiveTemplate,
     TopologyTransform,
 )
-from inkgrammar.fitting.spline import (
-    bspline_from_geometry,
-    control_roughness_matrix,
-    evaluate_primitive_curve,
-    sample_curve_by_arclength,
-    spline_design_matrix,
-    spline_to_cubic_segments,
+from inkgrammar.fitting.planarcurve_adapters import (
+    bspline_geometry_to_cubic_segments,
+    to_planar_bspline,
 )
+from inkgrammar.fitting.spline import evaluate_primitive_curve, sample_curve_by_arclength
 
 
 def geometry_payload():
@@ -121,7 +123,7 @@ def test_spline_evaluation_returns_exact_endpoints_and_derivatives():
 
 def test_cubic_simple_knot_has_c2_continuity():
     geometry = BSplineGeometry.model_validate(geometry_payload())
-    x_spline, y_spline = bspline_from_geometry(geometry)
+    x_spline, y_spline = bspline_from_geometry(to_planar_bspline(geometry))
     left = np.array(
         [
             [spline.derivative(order)(0.5 - 1e-8) for spline in (x_spline, y_spline)]
@@ -139,7 +141,7 @@ def test_cubic_simple_knot_has_c2_continuity():
 
 def test_spline_design_and_roughness_matrices_have_expected_shape():
     geometry = BSplineGeometry.model_validate(geometry_payload())
-    design = spline_design_matrix(np.array([0.0, 0.25, 0.5, 1.0]), geometry)
+    design = spline_design_matrix(np.array([0.0, 0.25, 0.5, 1.0]), to_planar_bspline(geometry))
     roughness = control_roughness_matrix(5)
 
     assert design.shape == (4, 5)
@@ -178,7 +180,7 @@ def test_curve_affine_transform_applies_scale_shear_and_translation():
 
 def test_spline_to_cubic_segments_reproduces_each_span():
     geometry = BSplineGeometry.model_validate(geometry_payload())
-    segments = spline_to_cubic_segments(geometry, tolerance=1e-10)
+    segments = bspline_geometry_to_cubic_segments(geometry, tolerance=1e-10)
     primitive = PrimitiveTemplate(
         id="converted",
         frame=PrimitiveFrame(

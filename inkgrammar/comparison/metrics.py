@@ -76,8 +76,7 @@ def analyze_comparison(result: ComparisonResult) -> ComparisonAnalysis:
     tangent_error_deg = np.degrees(tangent_error_rad)
     heading_error_deg = np.abs(tangent_error_deg)
     turn_rate_error = (
-        sample_geometry.turn_rate_rad_per_progress
-        - reference_geometry.turn_rate_rad_per_progress
+        sample_geometry.turn_rate_rad_per_progress - reference_geometry.turn_rate_rad_per_progress
     )
     absolute_turn_rate_error = np.abs(turn_rate_error)
     normalized_origin = reference_xy[0]
@@ -122,18 +121,10 @@ def analyze_comparison(result: ComparisonResult) -> ComparisonAnalysis:
             "p95_error": position_summary["p95"],
             "max_error": position_summary["maximum"],
             "x_rmse": float(
-                np.sqrt(
-                    np.mean(
-                        (sample_xy_normalized[:, 0] - reference_xy_normalized[:, 0]) ** 2
-                    )
-                )
+                np.sqrt(np.mean((sample_xy_normalized[:, 0] - reference_xy_normalized[:, 0]) ** 2))
             ),
             "y_rmse": float(
-                np.sqrt(
-                    np.mean(
-                        (sample_xy_normalized[:, 1] - reference_xy_normalized[:, 1]) ** 2
-                    )
-                )
+                np.sqrt(np.mean((sample_xy_normalized[:, 1] - reference_xy_normalized[:, 1]) ** 2))
             ),
         },
         "heading": {
@@ -150,8 +141,7 @@ def analyze_comparison(result: ComparisonResult) -> ComparisonAnalysis:
             "reference_total_rad": float(reference_geometry.cumulative_turn_rad[-1]),
             "sample_total_rad": float(sample_geometry.cumulative_turn_rad[-1]),
             "difference_rad": float(
-                sample_geometry.cumulative_turn_rad[-1]
-                - reference_geometry.cumulative_turn_rad[-1]
+                sample_geometry.cumulative_turn_rad[-1] - reference_geometry.cumulative_turn_rad[-1]
             ),
         },
         "endpoints": {

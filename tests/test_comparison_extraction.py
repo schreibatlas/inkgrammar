@@ -3,14 +3,15 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from PIL import Image, ImageDraw
+from rasterregions import BBox, MaskMode, MaskResult, foreground_mask, tighten_bbox
 from skimage.draw import circle_perimeter
 
 from inkgrammar.comparison import (
     CropRect,
     analyze_skeleton,
     crop_image,
-    extract_ink_mask,
 )
+from inkgrammar.raster import crop_to_ink
 
 
 def test_crop_rect_keeps_requested_pixels_without_resizing() -> None:
@@ -40,20 +41,20 @@ def test_auto_mask_uses_color_to_remove_gray_notebook_rule() -> None:
     draw.line((42, 50, 50, 43), fill=(20, 70, 220), width=5)
     draw.line((50, 43, 58, 50), fill=(20, 70, 220), width=5)
 
-    result = extract_ink_mask(image)
+    result = foreground_mask(image)
 
     assert result.method == "color"
     assert result.mask[50, 30]
     assert not result.mask[35, 30]
     assert result.confidence > 0.5
-    assert result.warnings == []
+    assert result.warnings == ()
 
 
 def test_auto_mask_uses_grayscale_for_black_ink() -> None:
     image = Image.new("RGB", (50, 50), "white")
     ImageDraw.Draw(image).line((25, 5, 25, 44), fill="black", width=3)
 
-    result = extract_ink_mask(image)
+    result = foreground_mask(image)
 
     assert result.method == "grayscale"
     assert result.mask[5:45, 25].all()
@@ -64,7 +65,7 @@ def test_dark_mode_finds_ink_on_a_gray_paper_background() -> None:
     image = np.full((40, 40), 180, dtype=np.uint8)
     image[8:32, 19:22] = 20
 
-    result = extract_ink_mask(image, mode="dark")
+    result = foreground_mask(image, mode="dark")
 
     assert result.method == "dark"
     assert result.mask[8:32, 20].all()
@@ -98,9 +99,66 @@ def test_skeleton_diagnostics_preserve_a_cycle() -> None:
 
 
 def test_empty_mask_is_reported_without_fake_topology() -> None:
-    result = extract_ink_mask(Image.new("RGB", (12, 12), "white"))
+    result = foreground_mask(Image.new("RGB", (12, 12), "white"))
     diagnostics = analyze_skeleton(result.mask)
 
-    assert result.warnings == ["No ink pixels were detected."]
+    assert result.warnings == ("No foreground pixels were detected.",)
     assert diagnostics.topology.component_count == 0
     assert diagnostics.topology.endpoint_count == 0
+
+
+def test_transparent_rgba_mask_uses_rasterregions_compositing():
+    rgba = np.zeros((20, 20, 4), dtype=np.uint8)
+    rgba[:, :, :3] = 0
+    rgba[:, :, 3] = 0
+    rgba[5:15, 5:15] = (0, 0, 0, 255)
+
+    result = foreground_mask(rgba, mode="grayscale")
+
+    assert isinstance(result, MaskResult)
+    assert not result.mask[0, 0]
+    assert result.mask[10, 10]
+
+
+def test_inkgrammar_mask_names_are_external_aliases():
+    from rasterregions import MaskMode as RasterMaskMode
+    from rasterregions import MaskResult as RasterMaskResult
+
+    from inkgrammar.comparison.models import InkMaskResult, InkMode
+
+    assert InkMaskResult is RasterMaskResult
+    assert InkMode is RasterMaskMode
+    assert MaskMode is RasterMaskMode
+
+
+def test_comparison_api_passes_mask_mode_to_rasterregions(tmp_path, monkeypatch):
+    from inkgrammar.comparison import api
+
+    mask = np.zeros((20, 20), dtype=bool)
+    mask[3:17, 10] = True
+    external_result = MaskResult(mask, 1.0, "grayscale", ())
+    received_modes = []
+
+    def foreground_mask_stub(image, *, mode):
+        received_modes.append(mode)
+        return external_result
+
+    monkeypatch.setattr(api, "foreground_mask", foreground_mask_stub)
+    image_path = tmp_path / "crop.png"
+    Image.new("RGB", (20, 20), "white").save(image_path)
+
+    extracted = api.extract_letter(image_path, (0, 0, 20, 20), ink_mode="color")
+
+    assert received_modes == ["color"]
+    assert extracted.mask_result is external_result
+
+
+def test_crop_to_ink_uses_rasterregions_bbox_and_preserves_empty_policy():
+    mask = np.zeros((30, 40), dtype=bool)
+    mask[10:15, 20:25] = True
+
+    cropped = crop_to_ink(mask, pad=2)
+    bbox = tighten_bbox(mask, BBox(0, 0, mask.shape[1], mask.shape[0]), pad=2)
+
+    assert np.array_equal(cropped, mask[bbox.y0 : bbox.y1, bbox.x0 : bbox.x1])
+    assert crop_to_ink(np.zeros((3, 5), dtype=bool)).shape == (1, 1)

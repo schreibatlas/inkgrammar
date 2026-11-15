@@ -8,8 +8,8 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from rasterregions import foreground_mask
 
-from inkgrammar.raster import threshold_image
 from tools.measure_sas_seed import connected_ink
 
 ROOT = Path("work/sas-1968")
@@ -30,7 +30,7 @@ def main():
     samples = {}
     for item in detections["detections"]:
         with Image.open(ROOT / "observations/alphabet" / item["crop"]) as image:
-            mask = threshold_image(image)
+            mask = foreground_mask(image, mode="grayscale").mask
         body = connected_ink(mask)[0]
         ys, xs = zip(*body, strict=True)
         x0, y0, _, _ = item["bbox"]

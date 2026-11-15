@@ -1045,6 +1045,7 @@ def optimize_primitive_family_v4(
 ):
     import json
 
+    from planarcurve.spline import control_roughness_matrix
     from scipy.optimize import differential_evolution, dual_annealing
     from scipy.spatial import cKDTree
 
@@ -1068,7 +1069,7 @@ def optimize_primitive_family_v4(
     )
     from .family_fit_v3 import _prepare_occurrences
     from .models import SplineWidthModel
-    from .spline import control_roughness_matrix, evaluate_primitive_curve
+    from .spline import evaluate_primitive_curve
 
     _safe_fit_id(primitive_id)
     family = next(
@@ -2005,6 +2006,7 @@ def optimize_primitive_family_v4(
         occurrence_deltas=occurrence_deltas,
         include_nominal=True,
         diagnostic_curves=review_curves,
+        use_skeletonpaths_diagnostics=True,
     )
     final_geometry_values = list(final_metrics.values())
     max_candidate_p95 = max(item["candidate_to_target_p95_px"] for item in final_geometry_values)

@@ -5,10 +5,7 @@ import math
 import pytest
 from planarcurve import CubicPath, CubicSegment
 from strokeoutline import (
-    OutlineConfig as StrokeOutlineConfig,
-)
-from strokeoutline import (
-    OutlineResult,
+    OutlineConfig,
     combine_outlines,
     outline_disc,
     signed_area,
@@ -17,9 +14,6 @@ from strokeoutline import outline as strokeoutline_outline
 from strokeoutline.svg import outline_svg_path
 
 from inkgrammar.outline import (
-    ExpandedOutline,
-    OutlineConfig,
-    _signed_area,
     expand_path,
     expand_shaped_text,
     expand_tap,
@@ -75,7 +69,7 @@ def test_closed_loop_has_oppositely_wound_inner_and_outer_contours():
 
     assert len(result.contours) == 2
     assert_closed_and_finite(result)
-    assert _signed_area(result.contours[0]) * _signed_area(result.contours[1]) < 0
+    assert signed_area(result.contours[0]) * signed_area(result.contours[1]) < 0
 
 
 def test_tap_becomes_a_closed_repeatable_circle():
@@ -139,10 +133,10 @@ def test_expand_path_matches_strokeoutline_svg_adapter(path, width):
     assert expand_path(path, width) == outline_svg_path(path, width)
 
 
-@pytest.mark.parametrize(("round_caps", "cap"), [(True, "round"), (False, "square")])
-def test_legacy_round_caps_map_to_strokeoutline_caps(round_caps, cap):
-    config = OutlineConfig(round_caps=round_caps)
-    expected = outline_svg_path("M 0 0 L 10 0", 2.0, config=StrokeOutlineConfig(cap=cap))
+@pytest.mark.parametrize("cap", ["round", "square"])
+def test_strokeoutline_cap_config_is_passed_through(cap):
+    config = OutlineConfig(cap=cap)
+    expected = outline_svg_path("M 0 0 L 10 0", 2.0, config=config)
 
     assert expand_path("M 0 0 L 10 0", 2.0, config=config) == expected
 
@@ -151,11 +145,6 @@ def test_expand_tap_matches_strokeoutline_with_midpoint_width_profile():
     profile = [(0.0, 2.0), (0.5, 8.0), (1.0, 4.0)]
 
     assert expand_tap((4, -3), profile) == outline_disc((4, -3), profile)
-
-
-def test_inkgrammar_outline_reuses_strokeoutline_result_and_area_types():
-    assert ExpandedOutline is OutlineResult
-    assert _signed_area is signed_area
 
 
 def test_shaped_text_uses_per_stroke_tap_profile_and_combines_bounds():
@@ -194,5 +183,5 @@ def test_typed_cubic_path_uses_strokeoutline_native_api():
 
     result = expand_path(path, 4.0, config=config)
 
-    assert result == strokeoutline_outline(path, 4.0, config=config.to_strokeoutline())
+    assert result == strokeoutline_outline(path, 4.0, config=config)
     assert_closed_and_finite(result)

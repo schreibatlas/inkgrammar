@@ -5,56 +5,25 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import rasterregions as rr
 from PIL import Image, ImageDraw
+from planarcurve.svg import sample_path
 
-from .geometry import sample_path
 from .model import compile_text
 from .models import RuntimeWritingModel, WritingModelV3
 from .shaping import shape_text
 
 
-def otsu_mask(gray: np.ndarray) -> np.ndarray:
-    """Binarize a grayscale array with a 256-level Otsu threshold."""
-    histogram = np.bincount(gray.ravel(), minlength=256).astype(np.float64)
-    total = gray.size
-    sum_total = np.dot(np.arange(256), histogram)
-    sum_background = 0.0
-    weight_background = 0.0
-    best_variance = -1.0
-    threshold = 127
-
-    for level in range(256):
-        weight_background += histogram[level]
-        if weight_background == 0:
-            continue
-        weight_foreground = total - weight_background
-        if weight_foreground == 0:
-            break
-        sum_background += level * histogram[level]
-        mean_background = sum_background / weight_background
-        mean_foreground = (sum_total - sum_background) / weight_foreground
-        variance = weight_background * weight_foreground * (mean_background - mean_foreground) ** 2
-        if variance > best_variance:
-            best_variance = variance
-            threshold = level
-
-    return gray <= threshold
-
-
-def threshold_image(image: Image.Image) -> np.ndarray:
-    gray = np.asarray(image.convert("L"), dtype=np.uint8)
-    return otsu_mask(gray)
-
-
 def crop_to_ink(mask: np.ndarray, pad: int = 2) -> np.ndarray:
-    ys, xs = np.nonzero(mask)
-    if len(xs) == 0:
+    binary = np.asarray(mask, dtype=bool)
+    if not np.any(binary):
         return np.zeros((1, 1), dtype=bool)
-    x0 = max(0, int(xs.min()) - pad)
-    x1 = min(mask.shape[1], int(xs.max()) + pad + 1)
-    y0 = max(0, int(ys.min()) - pad)
-    y1 = min(mask.shape[0], int(ys.max()) + pad + 1)
-    return mask[y0:y1, x0:x1]
+    bbox = rr.tighten_bbox(
+        binary,
+        rr.BBox(0, 0, binary.shape[1], binary.shape[0]),
+        pad=pad,
+    )
+    return binary[bbox.y0 : bbox.y1, bbox.x0 : bbox.x1]
 
 
 def normalize_mask(mask: np.ndarray, size: int = 256, margin: int = 16) -> np.ndarray:
@@ -294,12 +263,12 @@ def compare_text_to_image(
     gap_override: float | None = None,
     tension_override: float | None = None,
 ) -> dict[str, float]:
-    reference = threshold_image(Image.open(reference_path))
+    reference = rr.foreground_mask(Image.open(reference_path), mode="grayscale").mask
     generated_image = render_text_mask(
         model,
         text,
         gap_override=gap_override,
         tension_override=tension_override,
     )
-    generated = threshold_image(generated_image)
+    generated = rr.foreground_mask(generated_image, mode="grayscale").mask
     return compare_masks(reference, generated)

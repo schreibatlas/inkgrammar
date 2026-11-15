@@ -12,16 +12,31 @@ def _draw_glyph(draw: ImageDraw.ImageDraw, x: int, kind: str) -> None:
     y = 25
     if kind == "e":
         draw.line(
-            [(x, y + 15), (x + 19, y + 15), (x + 21, y + 10), (x + 18, y + 4),
-             (x + 10, y + 2), (x + 3, y + 6), (x, y + 14), (x + 2, y + 22),
-             (x + 9, y + 26), (x + 18, y + 25)],
+            [
+                (x, y + 15),
+                (x + 19, y + 15),
+                (x + 21, y + 10),
+                (x + 18, y + 4),
+                (x + 10, y + 2),
+                (x + 3, y + 6),
+                (x, y + 14),
+                (x + 2, y + 22),
+                (x + 9, y + 26),
+                (x + 18, y + 25),
+            ],
             fill="black",
             width=4,
         )
     elif kind == "n":
         draw.line(
-            [(x, y + 26), (x, y + 5), (x + 6, y + 2), (x + 15, y + 4),
-             (x + 20, y + 11), (x + 20, y + 26)],
+            [
+                (x, y + 26),
+                (x, y + 5),
+                (x + 6, y + 2),
+                (x + 15, y + 4),
+                (x + 20, y + 11),
+                (x + 20, y + 26),
+            ],
             fill="black",
             width=4,
         )

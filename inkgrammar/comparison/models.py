@@ -8,11 +8,13 @@ import numpy as np
 from PIL import Image
 from planarcurve.transforms import Similarity2D
 from pydantic import Field
+from rasterregions import MaskMode, MaskResult
 from skeletonpaths import SkeletonGraph
 
 from ..models import StrictModel
 
-InkMode = Literal["auto", "grayscale", "dark", "color"]
+InkMode = MaskMode
+InkMaskResult = MaskResult
 
 
 class CropRect(StrictModel):
@@ -25,7 +27,7 @@ class CropRect(StrictModel):
 class LetterImageInput(StrictModel):
     path: Path
     crop: CropRect
-    ink_mode: InkMode = "auto"
+    ink_mode: MaskMode = "auto"
 
 
 class TopologySummary(StrictModel):
@@ -81,27 +83,6 @@ class AlignmentResult:
         points.setflags(write=False)
         object.__setattr__(self, "aligned_sample_xy", points)
 
-@dataclass(frozen=True)
-class InkMaskResult:
-    mask: np.ndarray
-    confidence: float
-    method: str
-    warnings: list[str]
-
-    def __post_init__(self) -> None:
-        mask = np.asarray(self.mask, dtype=bool)
-        if mask.ndim != 2:
-            raise ValueError("ink mask must be a 2D array")
-        if not np.isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
-            raise ValueError("mask confidence must be between zero and one")
-        if not self.method:
-            raise ValueError("mask method must not be empty")
-        mask = np.array(mask, copy=True)
-        mask.setflags(write=False)
-        object.__setattr__(self, "mask", mask)
-        object.__setattr__(self, "confidence", float(self.confidence))
-        object.__setattr__(self, "warnings", list(self.warnings))
-
 
 @dataclass(frozen=True)
 class SkeletonDiagnostics:
@@ -143,7 +124,7 @@ class ExtractedLetter:
     source_path: Path
     crop: CropRect
     image: Image.Image
-    mask_result: InkMaskResult
+    mask_result: MaskResult
     diagnostics: SkeletonDiagnostics
     ordered_path: OrderedPath | None
     resampled_xy: np.ndarray | None

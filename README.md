@@ -137,6 +137,7 @@ The reference image is segmented into an unlabeled gallery. Each sample glyph is
 A successful run writes `index.html`, `summary.md`, and `summary.json`; segmentation masks, numbered candidate overlays and manifests; reference candidate crops under `reference-index/`; and a `sample-NNN/` directory for each glyph. Each sample directory contains the selected reference, ranked-alternative thumbnails, match JSON, and the detailed pairwise report. If ordered-path extraction is unavailable, the pair report still contains raster and topology results. The reference gallery and derived descriptors/extractions are cached by source content hash inside the output directory, so rerunning with the same output directory can reuse them.
 
 The automatic mode does not change the manual crop workflow above. Use `--letter`, `--reference-crop`, and `--sample-crop` together for manual comparison; do not combine them with `--letters`.
+
 ## Fit a connection from actual output
 
 ```bash

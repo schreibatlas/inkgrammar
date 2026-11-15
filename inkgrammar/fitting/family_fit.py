@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageDraw
 from scipy.ndimage import convolve, distance_transform_edt
+from skeletonpaths import analyze_mask
 from skimage.morphology import skeletonize
 
 from .. import __version__
@@ -38,8 +39,8 @@ from .optimizer import (
     resume_optimization,
 )
 from .parameterization import ParameterSpace
+from .planarcurve_adapters import bspline_geometry_to_cubic_segments
 from .render import FittingRender, render_paths
-from .spline import spline_to_cubic_segments
 from .workspace import FitProjectBundle
 
 
@@ -80,7 +81,7 @@ def primitive_path(template: PrimitiveTemplate, transform: TopologyTransform) ->
         if template.spline is None:
             raise ValueError("bspline-centerline primitive has no spline geometry")
         start_point = tuple(template.spline.control_points[0])
-        segments = spline_to_cubic_segments(template.spline)
+        segments = bspline_geometry_to_cubic_segments(template.spline)
     elif template.kind == "curvature-profile":
         if template.curvature_stroke is None:
             raise ValueError("curvature-profile primitive has no curvature_stroke geometry")
@@ -260,15 +261,6 @@ def _evaluate_sample(
     )
 
 
-def _skeleton_endpoints(skeleton: np.ndarray) -> np.ndarray:
-    neighbors = convolve(
-        skeleton.astype(np.uint8),
-        np.ones((3, 3), dtype=np.uint8),
-        mode="constant",
-    )
-    return np.argwhere(skeleton & (neighbors - skeleton == 1))
-
-
 def _skeleton_tangents(skeleton: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     coordinates = np.argwhere(skeleton)
     tangent_map = np.zeros((*skeleton.shape, 2), dtype=np.float32)
@@ -301,12 +293,37 @@ def _skeleton_tangent_rms(target: np.ndarray, generated: np.ndarray) -> float | 
     return float(np.sqrt(np.mean(np.square(angles))))
 
 
+def _skeleton_endpoints(skeleton: np.ndarray) -> np.ndarray:
+    neighbors = convolve(
+        skeleton.astype(np.uint8),
+        np.ones((3, 3), dtype=np.uint8),
+        mode="constant",
+    )
+    return np.argwhere(skeleton & (neighbors - skeleton == 1))
+
+
 def _overlay_diagnostics(
     reference_ink: np.ndarray,
     generated_ink: np.ndarray,
+    *,
+    use_skeletonpaths: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float | None]]:
-    target_skeleton = skeletonize(reference_ink)
-    generated_skeleton = skeletonize(generated_ink)
+    if use_skeletonpaths:
+        target_analysis = analyze_mask(reference_ink)
+        generated_analysis = analyze_mask(generated_ink)
+        target_skeleton = target_analysis.skeleton
+        generated_skeleton = generated_analysis.skeleton
+        target_endpoints = np.asarray(
+            [node.xy for node in target_analysis.graph.nodes if node.degree == 1], dtype=float
+        ).reshape(-1, 2)
+        generated_endpoints = np.asarray(
+            [node.xy for node in generated_analysis.graph.nodes if node.degree == 1], dtype=float
+        ).reshape(-1, 2)
+    else:
+        target_skeleton = skeletonize(reference_ink)
+        generated_skeleton = skeletonize(generated_ink)
+        target_endpoints = _skeleton_endpoints(target_skeleton)
+        generated_endpoints = _skeleton_endpoints(generated_skeleton)
     if np.any(reference_ink) and np.any(generated_ink):
         candidate_distances = distance_transform_edt(~reference_ink)[generated_ink]
         target_distances = distance_transform_edt(~generated_ink)[reference_ink]
@@ -317,8 +334,6 @@ def _overlay_diagnostics(
         coverage = 0.0
         candidate_p95 = None
         target_p95 = None
-    target_endpoints = _skeleton_endpoints(target_skeleton)
-    generated_endpoints = _skeleton_endpoints(generated_skeleton)
     if len(target_endpoints) and len(generated_endpoints):
         distances = np.linalg.norm(
             target_endpoints[:, None, :] - generated_endpoints[None, :, :], axis=2
@@ -350,6 +365,7 @@ def _write_private_overlays(
     *,
     include_nominal: bool = False,
     diagnostic_curves: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+    use_skeletonpaths_diagnostics: bool = False,
 ) -> Path:
     overlays_root = bundle.private_work_dir / "overlays"
     if overlays_root.is_symlink():
@@ -383,7 +399,9 @@ def _write_private_overlays(
                 reference_ink = (region_reference > 0.05) & region_mask
                 generated_ink = (region_generated > 0.05) & region_mask
                 target_skeleton, generated_skeleton, metrics = _overlay_diagnostics(
-                    reference_ink, generated_ink
+                    reference_ink,
+                    generated_ink,
+                    use_skeletonpaths=use_skeletonpaths_diagnostics,
                 )
                 overlay = np.full((*region_reference.shape, 3), 255, dtype=np.uint8)
                 overlay[reference_ink] = (220, 40, 40)

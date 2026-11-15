@@ -163,9 +163,7 @@ def write_batch_report(
     rows = []
     for item in samples:
         alternatives = "".join(
-            "<li>"
-            f"#{entry['rank']} {html.escape(entry['reference_id'])}: "
-            f"{entry['cost']:.4f}</li>"
+            f"<li>#{entry['rank']} {html.escape(entry['reference_id'])}: {entry['cost']:.4f}</li>"
             for entry in item["alternatives"]
         )
         report_link = html.escape(item["report_dir"] + "/report.html", quote=True)
@@ -175,16 +173,16 @@ def write_batch_report(
         sample_id = html.escape(item["sample_id"])
         rows.append(
             "<tr>"
-            f"<td><a href=\"{sample_link}\"><img src=\"{sample_link}\" width=\"100\" "
-            f"alt=\"{sample_id}\"></a></td>"
-            f"<td><a href=\"{matched_link}\"><img src=\"{matched_link}\" width=\"100\" "
-            f"alt=\"{html.escape(item['reference_id'])}\"></a><br>"
+            f'<td><a href="{sample_link}"><img src="{sample_link}" width="100" '
+            f'alt="{sample_id}"></a></td>'
+            f'<td><a href="{matched_link}"><img src="{matched_link}" width="100" '
+            f'alt="{html.escape(item["reference_id"])}"></a><br>'
             f"{html.escape(item['reference_id'])}</td>"
             f"<td>{html.escape(item['status'])}</td>"
             f"<td>{item['cost']:.4f}</td>"
-            f"<td><a href=\"{report_link}\">pair report</a></td>"
-            f"<td><a href=\"{alternatives_link}\"><img src=\"{alternatives_link}\" "
-            f"width=\"180\" alt=\"ranked alternatives\"></a>"
+            f'<td><a href="{report_link}">pair report</a></td>'
+            f'<td><a href="{alternatives_link}"><img src="{alternatives_link}" '
+            f'width="180" alt="ranked alternatives"></a>'
             f"<details><summary>scores</summary><ol>{alternatives}</ol></details></td>"
             "</tr>"
         )

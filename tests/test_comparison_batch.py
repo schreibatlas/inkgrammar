@@ -11,16 +11,31 @@ from inkgrammar.comparison.batch import compare_letter_page
 def _draw_glyph(draw: ImageDraw.ImageDraw, x: int, y: int, kind: str) -> None:
     if kind == "e":
         draw.line(
-            [(x, y + 15), (x + 19, y + 15), (x + 21, y + 10), (x + 18, y + 4),
-             (x + 10, y + 2), (x + 3, y + 6), (x, y + 14), (x + 2, y + 22),
-             (x + 9, y + 26), (x + 18, y + 25)],
+            [
+                (x, y + 15),
+                (x + 19, y + 15),
+                (x + 21, y + 10),
+                (x + 18, y + 4),
+                (x + 10, y + 2),
+                (x + 3, y + 6),
+                (x, y + 14),
+                (x + 2, y + 22),
+                (x + 9, y + 26),
+                (x + 18, y + 25),
+            ],
             fill="black",
             width=4,
         )
     elif kind == "n":
         draw.line(
-            [(x, y + 26), (x, y + 5), (x + 6, y + 2), (x + 15, y + 4),
-             (x + 20, y + 11), (x + 20, y + 26)],
+            [
+                (x, y + 26),
+                (x, y + 5),
+                (x + 6, y + 2),
+                (x + 15, y + 4),
+                (x + 20, y + 11),
+                (x + 20, y + 26),
+            ],
             fill="black",
             width=4,
         )
@@ -68,8 +83,7 @@ def test_batch_writes_pair_reports_summaries_and_reuses_hash_keyed_reference_cac
         assert (output / "segmentation" / filename).is_file()
     assert (output / "reference-index" / "gallery.json").is_file()
     assert all(
-        (output / "reference-index" / f"ref-{index:03d}.png").is_file()
-        for index in range(3)
+        (output / "reference-index" / f"ref-{index:03d}.png").is_file() for index in range(3)
     )
 
     summary = json.loads(first.json_path.read_text())

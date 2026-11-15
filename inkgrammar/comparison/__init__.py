@@ -1,11 +1,14 @@
 """Tools for comparing manually selected letter crops."""
+
+from rasterregions import MaskMode, MaskResult
+from rasterregions import foreground_mask as extract_ink_mask
+
 from .api import compare_extracted_letters, compare_letter_images, extract_letter
 from .batch import compare_letter_page
 from .batch_report import BatchComparisonReport, BatchSampleResult
 from .crop import coerce_crop_rect, crop_image, load_crop
 from .descriptors import GlyphDescriptor, canonicalize_mask, glyph_descriptor
 from .geometry import DifferentialGeometry, differential_geometry
-from .mask import extract_ink_mask
 from .matching import (
     MatchScore,
     ReferenceIndex,
@@ -64,6 +67,8 @@ __all__ = [
     "extract_letter",
     "InkMaskResult",
     "InkMode",
+    "MaskMode",
+    "MaskResult",
     "LetterImageInput",
     "OrderedPath",
     "PathExtractionError",

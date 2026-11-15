@@ -17,8 +17,22 @@ def _write_letter_images(directory):
         if path == sample_path:
             draw.line((2, 40, 77, 40), fill=(180, 180, 180), width=1)
         draw.line(
-            [(16, 36), (30, 36), (43, 36), (41, 31), (37, 27), (31, 25), (25, 26),
-             (20, 30), (18, 36), (20, 43), (25, 48), (32, 50), (39, 49), (45, 45)],
+            [
+                (16, 36),
+                (30, 36),
+                (43, 36),
+                (41, 31),
+                (37, 27),
+                (31, 25),
+                (25, 26),
+                (20, 30),
+                (18, 36),
+                (20, 43),
+                (25, 48),
+                (32, 50),
+                (39, 49),
+                (45, 45),
+            ],
             fill=ink,
             width=5,
         )
@@ -55,9 +69,10 @@ def test_compare_letter_images_api_writes_complete_report_and_keeps_crop_pixels(
     assert report.payload["geometry"]["sample_count"] == 256
     assert report.payload["metrics"]["path"]["mean_error"] < 1e-12
 
-    with Image.open(reference_path) as source, Image.open(
-        output_dir / "input-reference.png"
-    ) as retained:
+    with (
+        Image.open(reference_path) as source,
+        Image.open(output_dir / "input-reference.png") as retained,
+    ):
         expected = source.crop((5, 5, 75, 67))
         assert ImageChops.difference(expected, retained).getbbox() is None
 
@@ -125,10 +140,7 @@ def test_compare_letter_cli_rejects_malformed_crop_coordinates(tmp_path):
     assert "--reference-crop must be x,y,width,height" in result.output
 
 
-
-def test_label_free_comparison_writes_raster_report_when_path_recovery_fails(
-    tmp_path, monkeypatch
-):
+def test_label_free_comparison_writes_raster_report_when_path_recovery_fails(tmp_path, monkeypatch):
     import inkgrammar.comparison.api as comparison_api
     from inkgrammar.comparison import (
         ComparisonIdentity,
@@ -165,9 +177,7 @@ def test_label_free_comparison_writes_raster_report_when_path_recovery_fails(
         "topology": True,
         "ordered_path": False,
         "curvature": False,
-        "unavailable_reason": (
-            "Ordered-path recovery failed; trajectory metrics are unavailable."
-        ),
+        "unavailable_reason": ("Ordered-path recovery failed; trajectory metrics are unavailable."),
     }
     assert report.html_path.is_file()
     assert report.markdown_path.is_file()

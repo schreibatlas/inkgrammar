@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+import rasterregions as rr
 from PIL import Image
 
-from ..dataset.preprocess import label_components
 from .segmentation import SegmentedGlyph
 
 
@@ -76,5 +76,5 @@ def glyph_descriptor(candidate: SegmentedGlyph, *, size: int = 96) -> GlyphDescr
         normalized_mask=canonicalize_mask(tight, size=size),
         aspect_ratio=float(tight.shape[1] / tight.shape[0]),
         ink_fill=float(tight.mean()),
-        component_count=len(label_components(tight)),
+        component_count=len(rr.components(tight)),
     )

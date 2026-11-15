@@ -9,11 +9,12 @@ from pathlib import Path
 import numpy as np
 import yaml
 from PIL import Image, ImageDraw
+from rasterregions import foreground_mask
 
 from inkgrammar.component_fit import fit_component_candidates
-from inkgrammar.geometry import transform_path
 from inkgrammar.models import Transform, WritingModel
-from inkgrammar.raster import compare_anchored_masks, render_text_frame, threshold_image
+from inkgrammar.raster import compare_anchored_masks, render_text_frame
+from inkgrammar.svg_adapters import transform_svg_path
 from tools.measure_sas_seed import connected_ink
 
 ROOT = Path("work/sas-1968")
@@ -24,7 +25,7 @@ def _part(part):
     result = (
         {"component": part["component"]}
         if "component" in part
-        else {"d": transform_path(part["d"], Transform(scale_x=UNIT, scale_y=UNIT))}
+        else {"d": transform_svg_path(part["d"], Transform(scale_x=UNIT, scale_y=UNIT))}
     )
     if "transform" in part:
         values = part["transform"].copy()
@@ -44,7 +45,7 @@ def build_seed(recipes):
     }
     components = {
         name: {
-            "d": transform_path(value["d"], Transform(scale_x=UNIT, scale_y=UNIT)),
+            "d": transform_svg_path(value["d"], Transform(scale_x=UNIT, scale_y=UNIT)),
             "description": value["description"],
             "provenance": provenance,
         }
@@ -91,7 +92,7 @@ def build_seed(recipes):
 def fit_family(model, component_id, family, references):
     candidates = [model.components[component_id].d]
     for path in family.get("candidates", []):
-        candidates.append(transform_path(path, Transform(scale_x=UNIT, scale_y=UNIT)))
+        candidates.append(transform_svg_path(path, Transform(scale_x=UNIT, scale_y=UNIT)))
     result = fit_component_candidates(
         model,
         component_id,
@@ -147,8 +148,8 @@ def write_review(model, recipes, alphabet, references, family_reports):
         origin = recipe.get("source_origin", observation["source_bbox"][0] + 4)
         anchor_x = origin - observation["source_bbox"][0]
         metrics = compare_anchored_masks(
-            threshold_image(ref),
-            threshold_image(generated),
+            foreground_mask(ref, mode="grayscale").mask,
+            foreground_mask(generated, mode="grayscale").mask,
             reference_anchor=(anchor_x, baseline),
             generated_anchor=frame.origin,
         )
@@ -167,8 +168,8 @@ def write_review(model, recipes, alphabet, references, family_reports):
         sheet.paste(
             generated.resize((generated.width * 3, generated.height * 3)), (300, index * 360 + 25)
         )
-        reference_mask = threshold_image(ref)
-        generated_mask = threshold_image(generated)
+        reference_mask = foreground_mask(ref, mode="grayscale").mask
+        generated_mask = foreground_mask(generated, mode="grayscale").mask
         aligned = Image.fromarray(generated_mask.astype(np.uint8) * 255).transform(
             ref.size,
             Image.Transform.AFFINE,
@@ -204,7 +205,7 @@ def isolate_references(references, recipes, alphabet):
     records = []
     for character, path in references.items():
         with Image.open(path) as image:
-            mask = threshold_image(image)
+            mask = foreground_mask(image, mode="grayscale").mask
         components = connected_ink(mask)
         keep = recipes["glyphs"][character].get("keep_ink_components", 1)
         clean = np.zeros_like(mask)

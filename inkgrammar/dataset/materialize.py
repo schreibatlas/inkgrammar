@@ -21,9 +21,16 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from rasterregions import components as raster_components
+from skeletonpaths import (
+    SkeletonGraph,
+    SkeletonWalk,
+    analyze_mask,
+    covering_walk,
+    graph_from_skeleton,
+)
 
 from ..io import load_layout
-from ..skeleton_walk import _euler_path, _pixel_neighbors
 from .layouts import load_region_layout
 from .models import ObservationKind, ObservationManifest
 from .preprocess import (
@@ -40,9 +47,9 @@ DATASET_INDEX_FORMAT = "inkgrammar-materialized-dataset"
 EXTRACTION_VERSION = 1
 SOURCE_VERIFICATION_FORMAT = "inkgrammar-source-verification"
 DERIVE_ALGORITHMS = {
-    "skeleton": "zhang-suen-v1+spur-prune-v1",
-    "centerline": "edge-covering-walk-v1",
-    "topology": "pixel-graph-v1",
+    "skeleton": "skeletonpaths-analyze-mask-v1+spur-prune-3px-v1",
+    "centerline": "skeletonpaths-covering-walk-v1+leftmost-latin-v1",
+    "topology": "skeletonpaths-pixel-graph-v1",
 }
 MIN_SPUR_LENGTH_PX = 3
 
@@ -80,198 +87,22 @@ def _write_mask(path: Path, mask: np.ndarray) -> str:
 # --- derived artifacts (section 28: candidates, not source truth) ---
 
 
-def _neighbor_count(mask: np.ndarray) -> np.ndarray:
-    padded = np.pad(mask, 1)
-    count = np.zeros(mask.shape, dtype=int)
-    for dy in (-1, 0, 1):
-        for dx in (-1, 0, 1):
-            if dy == 0 and dx == 0:
-                continue
-            count += padded[1 + dy : 1 + dy + mask.shape[0], 1 + dx : 1 + dx + mask.shape[1]]
-    return count * mask
-
-
-def _thin_zhang_suen(mask: np.ndarray) -> np.ndarray:
-    image = mask.astype(bool).copy()
-    changed = True
-    while changed:
-        changed = False
-        for phase in (0, 1):
-            padded = np.pad(image, 1)
-            offsets = {
-                "p2": (-1, 0),
-                "p3": (-1, 1),
-                "p4": (0, 1),
-                "p5": (1, 1),
-                "p6": (1, 0),
-                "p7": (1, -1),
-                "p8": (0, -1),
-                "p9": (-1, -1),
-            }
-            p = {
-                name: padded[1 + dy : 1 + dy + image.shape[0], 1 + dx : 1 + dx + image.shape[1]]
-                for name, (dy, dx) in offsets.items()
-            }
-            neighbors = sum(p.values())
-            transitions = sum(
-                (~p[a] & p[b]).astype(int)
-                for a, b in (
-                    ("p2", "p3"),
-                    ("p3", "p4"),
-                    ("p4", "p5"),
-                    ("p5", "p6"),
-                    ("p6", "p7"),
-                    ("p7", "p8"),
-                    ("p8", "p9"),
-                    ("p9", "p2"),
-                )
-            )
-            if phase == 0:
-                condition = ~(p["p2"] & p["p4"] & p["p6"]) & ~(p["p4"] & p["p6"] & p["p8"])
-            else:
-                condition = ~(p["p2"] & p["p4"] & p["p8"]) & ~(p["p2"] & p["p6"] & p["p8"])
-            remove = image & (neighbors >= 2) & (neighbors <= 6) & (transitions == 1) & condition
-            if remove.any():
-                image[remove] = False
-                changed = True
-    return image
-
-
-def _spur_prune(skeleton: np.ndarray, *, min_length: int) -> np.ndarray:
-    pruned = skeleton.copy()
-    while True:
-        endpoints = sorted(zip(*np.nonzero(_neighbor_count(pruned) == 1), strict=True))
-        removed_any = False
-        for start in endpoints:
-            if not pruned[start]:
-                continue
-            branch = [start]
-            previous, current = None, start
-            while True:
-                y, x = current
-                height, width = pruned.shape
-                next_pixels = [
-                    (ny, nx)
-                    for ny in range(max(0, y - 1), min(height, y + 2))
-                    for nx in range(max(0, x - 1), min(width, x + 2))
-                    if pruned[ny, nx] and (ny, nx) != current and (ny, nx) != previous
-                ]
-                if len(next_pixels) != 1:
-                    break
-                previous, current = current, next_pixels[0]
-                if _neighbor_count(pruned)[current] != 2:
-                    break
-                branch.append(current)
-            if len(branch) < min_length and _neighbor_count(pruned)[branch[-1]] >= 3:
-                for pixel in branch[:-1]:
-                    pruned[pixel] = False
-                removed_any = True
-        if not removed_any:
-            return pruned
-
-
 def _npy_bytes(array: np.ndarray) -> bytes:
     buffer = io.BytesIO()
     np.save(buffer, array)
     return buffer.getvalue()
 
 
-def _component_count(skeleton: np.ndarray) -> int:
-    """Number of connected components in the skeleton pixel graph."""
-    ys, xs = np.nonzero(skeleton)
-    remaining = set(zip(ys.tolist(), xs.tolist(), strict=True))
-    components = 0
-    while remaining:
-        components += 1
-        stack = [min(remaining)]
-        remaining.discard(stack[0])
-        while stack:
-            y, x = stack.pop()
-            for ny in (y - 1, y, y + 1):
-                for nx in (x - 1, x, x + 1):
-                    if (ny, nx) in remaining:
-                        remaining.discard((ny, nx))
-                        stack.append((ny, nx))
-    return components
-
-
-
-def _chain_cost(chain: list[tuple[int, int]]) -> float:
-    """Jump energy plus direction-change energy of an ordered pixel chain."""
-    cost = 0.0
-    previous_direction = None
-    for first, second in zip(chain, chain[1:], strict=False):
-        cost += (second[0] - first[0]) ** 2 + (second[1] - first[1]) ** 2
-        direction = np.asarray((second[0] - first[0], second[1] - first[1]), dtype=float)
-        norm = float(np.linalg.norm(direction))
-        if norm > 0:
-            direction = direction / norm
-        if previous_direction is not None:
-            cost += 4.0 * (1.0 - float(previous_direction @ direction))
-        previous_direction = direction
-    return cost
-
-
-def _best_chain(pieces: list[list[tuple[int, int]]]) -> list[tuple[int, int]]:
-    """Full-coverage chain with the smallest jumps and smoothest turns.
-
-    The true pen order is the ordering of the walk pieces that minimizes
-    junction jumps and direction changes, so for up to five pieces every order
-    and orientation is tried. More pieces fall back to greedy chaining.
-    """
-    if len(pieces) <= 5:
-        from itertools import permutations
-
-        best_cost = None
-        best_chain = None
-        for order in permutations(range(len(pieces))):
-            for mask in range(2 ** len(pieces)):
-                chain: list[tuple[int, int]] = []
-                for position, index in enumerate(order):
-                    piece = pieces[index]
-                    if mask & (1 << position):
-                        piece = list(reversed(piece))
-                    chain.extend(piece)
-                cost = _chain_cost(chain)
-                if best_cost is None or cost < best_cost:
-                    best_cost = cost
-                    best_chain = chain
-        return best_chain
-
-    chain = list(pieces[0])
-    remaining = list(pieces[1:])
-    while remaining:
-        best_cost = None
-        best_index = None
-        best_flipped = None
-        for index, piece in enumerate(remaining):
-            for flipped in (piece, list(reversed(piece))):
-                jump = (chain[-1][0] - flipped[0][0]) ** 2 + (chain[-1][1] - flipped[0][1]) ** 2
-                if best_cost is None or jump < best_cost:
-                    best_cost = jump
-                    best_index = index
-                    best_flipped = flipped
-        chain.extend(best_flipped)
-        remaining.pop(best_index)
-    return chain
-
-
-def _stitch_candidates(candidates: list[dict]) -> list[list[int]] | None:
-    """Chain walk pieces into one ordered polyline for the fitter.
-
-    The chain is oriented to start at its leftmost endpoint (Latin writing
-    starts at the left). Pieces shorter than the caller's threshold are
-    junction clutter and must already be filtered out.
-    """
-    pieces = [[tuple(point) for point in candidate["points"]] for candidate in candidates]
-    if not pieces:
-        return None
-    if len(pieces) == 1:
-        return [list(point) for point in pieces[0]]
-    chain = _best_chain(pieces)
-    if chain[0][0] > chain[-1][0]:
-        chain = list(reversed(chain))
-    return [list(point) for point in chain]
+def _left_to_right_covering_walk(graph: SkeletonGraph) -> SkeletonWalk:
+    endpoints = sorted(
+        (node for node in graph.nodes if node.degree == 1),
+        key=lambda node: (node.xy[0], node.xy[1]),
+    )
+    if len(endpoints) >= 2:
+        start, end = endpoints[0], endpoints[-1]
+    else:
+        start = end = min(graph.nodes, key=lambda node: (node.xy[0], node.xy[1]))
+    return covering_walk(graph, start_node=start.id, end_node=end.id)
 
 
 def derive_artifacts(clean_mask: np.ndarray) -> dict[str, dict]:
@@ -280,103 +111,35 @@ def derive_artifacts(clean_mask: np.ndarray) -> dict[str, dict]:
     These are derived computational candidates, never source truth; each
     artifact records the algorithm and version that produced it.
     """
-    skeleton = _spur_prune(_thin_zhang_suen(clean_mask), min_length=MIN_SPUR_LENGTH_PX)
+    analysis = analyze_mask(clean_mask, min_spur_length=MIN_SPUR_LENGTH_PX)
+    skeleton = analysis.skeleton
+    graph = analysis.graph
+    pixel_count = int(skeleton.sum())
+    endpoints = [[int(node.xy[0]), int(node.xy[1])] for node in graph.nodes if node.degree == 1]
+    junctions = [[int(node.xy[0]), int(node.xy[1])] for node in graph.nodes if node.degree > 2]
 
-    ys, xs = np.nonzero(skeleton)
-    pixels = sorted(zip(ys.tolist(), xs.tolist(), strict=True))
-    pixel_set = set(pixels)
-    counts = _neighbor_count(skeleton)
-    endpoints = [[int(x), int(y)] for (y, x) in pixels if counts[y, x] == 1]
-    junctions = [[int(x), int(y)] for (y, x) in pixels if counts[y, x] >= 3]
-    edge_count = sum(
-        1
-        for (y, x) in pixels
-        for ny in (y - 1, y, y + 1)
-        for nx in (x - 1, x, x + 1)
-        if (ny, nx) in pixel_set and (ny, nx) > (y, x)
-    )
-
-    traversed: set[frozenset[tuple[int, int]]] = set()
-
-    def neighbors(pixel: tuple[int, int]) -> list[tuple[int, int]]:
-        y, x = pixel
-        return [
-            (ny, nx)
-            for ny in range(max(0, y - 1), min(skeleton.shape[0], y + 2))
-            for nx in range(max(0, x - 1), min(skeleton.shape[1], x + 2))
-            if (ny, nx) in pixel_set and (ny, nx) != pixel
-        ]
-
-    starts = sorted(pixel_set, key=lambda px: (counts[px] != 1, px))
     candidates = []
-    for start in starts:
-        if all(frozenset((start, other)) in traversed for other in neighbors(start)):
+    components = raster_components(skeleton)
+    for component in components:
+        component_skeleton = np.zeros_like(skeleton)
+        component_skeleton[component.ys, component.xs] = True
+        component_graph = graph_from_skeleton(component_skeleton, radius=analysis.radius)
+        if not component_graph.edges:
             continue
-        walk = [start]
-        previous = None
-        current = start
-        while True:
-            options = [
-                other
-                for other in neighbors(current)
-                if frozenset((current, other)) not in traversed
-            ]
-            if not options:
-                break
-            if previous is not None:
-                step_y, step_x = current[0] - previous[0], current[1] - previous[1]
-                options.sort(
-                    key=lambda other: (
-                        -((other[0] - current[0]) * step_y + (other[1] - current[1]) * step_x)
-                    )
-                )
-            next_pixel = options[0]
-            traversed.add(frozenset((current, next_pixel)))
-            walk.append(next_pixel)
-            previous, current = current, next_pixel
-        if len(walk) >= 2:
-            length = sum(
-                float(np.hypot(b[0] - a[0], b[1] - a[1]))
-                for a, b in zip(walk, walk[1:], strict=False)
-            )
-            candidates.append(
-                {
-                    "points": [[int(x), int(y)] for (y, x) in walk],
-                    "start": [int(walk[0][1]), int(walk[0][0])],
-                    "end": [int(walk[-1][1]), int(walk[-1][0])],
-                    "length_px": round(length, 4),
-                }
-            )
-    candidates.sort(key=lambda candidate: candidate["length_px"], reverse=True)
-    adjacency = {pixel: _pixel_neighbors(pixel_set, pixel) for pixel in pixel_set}
-    euler_walk = _euler_path(pixel_set, adjacency)
-    if euler_walk is not None:
-        stitched_points = [[int(x), int(y)] for (y, x) in euler_walk]
-    else:
-        stitchable = [c for c in candidates if c["length_px"] >= 4.0]
-        stitched_points = _stitch_candidates(stitchable) if stitchable else None
-    if stitched_points is not None:
-        stitched_length = sum(
-            float(np.hypot(b[0] - a[0], b[1] - a[1]))
-            for a, b in zip(stitched_points, stitched_points[1:], strict=False)
-        )
-        for candidate in candidates:
-            candidate["stitched"] = False
-        candidates.insert(
-            0,
+        walk = _left_to_right_covering_walk(component_graph)
+        points = [[int(x), int(y)] for x, y in walk.xy]
+        length = float(np.linalg.norm(np.diff(walk.xy, axis=0), axis=1).sum())
+        candidates.append(
             {
-                "points": stitched_points,
-                "start": stitched_points[0],
-                "end": stitched_points[-1],
-                "length_px": round(stitched_length, 4),
-                "stitched": True,
-            },
+                "points": points,
+                "start": points[0],
+                "end": points[-1],
+                "length_px": round(length, 4),
+                "stitched": graph.component_count == 1,
+            }
         )
-    else:
-        for candidate in candidates:
-            candidate["stitched"] = False
+    candidates.sort(key=lambda candidate: candidate["length_px"], reverse=True)
 
-    components = _component_count(skeleton)
     return {
         "skeleton": {
             "data": _npy_bytes(skeleton),
@@ -391,11 +154,11 @@ def derive_artifacts(clean_mask: np.ndarray) -> dict[str, dict]:
         "topology": {
             "data": {
                 "algorithm": DERIVE_ALGORITHMS["topology"],
-                "pixel_count": len(pixels),
-                "components": components,
+                "pixel_count": pixel_count,
+                "components": graph.component_count,
                 "endpoints": endpoints,
                 "junctions": junctions,
-                "cycle_rank": edge_count - len(pixels) + components,
+                "cycle_rank": graph.cycle_count,
             },
             "format": "json",
             "algorithm": DERIVE_ALGORITHMS["topology"],
@@ -765,6 +528,7 @@ def _observation_record(
         "extraction": {
             "extractor": page.extractor,
             "extractor_version": EXTRACTION_VERSION,
+            "threshold_policy": params.threshold_policy,
             "source_bbox_policy": "declared-row-sequence" if "row" in detection else "declared",
             "layout_id": layout.id,
             "layout_region_id": region_id,

@@ -33,6 +33,7 @@ def differential_geometry(
         raise ValueError("polynomial order must be positive and less than the smoothing window")
 
     from scipy.signal import savgol_filter
+
     smoothed = savgol_filter(points, window_length, polynomial_order, axis=0, mode="interp")
     tangents = unit_tangents(smoothed)
     if not np.isfinite(tangents).all() or np.any(np.linalg.norm(tangents, axis=1) <= 1e-12):

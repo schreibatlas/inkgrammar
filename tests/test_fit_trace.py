@@ -1,5 +1,6 @@
+from planarcurve.svg import analyze_path
+
 from inkgrammar.fitting.trace import compile_glyph_trace
-from inkgrammar.geometry import analyze_path
 from inkgrammar.models import WritingModel
 
 

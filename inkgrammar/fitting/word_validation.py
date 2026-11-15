@@ -8,9 +8,10 @@ from typing import Any
 
 import numpy as np
 from PIL import Image
+from planarcurve.svg import analyze_path
 
-from ..geometry import analyze_path, transform_path
 from ..models import Transform
+from ..svg_adapters import transform_svg_path
 from .glyph_fit import _composed_paths, _primitive_templates
 from .models import OccurrenceDelta
 from .objective import soft_mask_loss, symmetric_distance_loss
@@ -132,7 +133,7 @@ def _word_paths(bundle: FitProjectBundle, sample, templates, glyph_sources):
         local_paths = _composed_paths(topology, templates, deltas)
         checks.extend(_attachment_checks(topology, local_paths, index))
         for instance_id in sorted(active_ids):
-            paths[f"{index}:{instance_id}"] = transform_path(
+            paths[f"{index}:{instance_id}"] = transform_svg_path(
                 local_paths[instance_id], Transform(dx=pen_x)
             )
         pen_x += topology.advance_width

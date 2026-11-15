@@ -8,9 +8,10 @@ from typing import Any
 
 import numpy as np
 from PIL import Image
+from planarcurve.svg import analyze_path, transform_path
+from planarcurve.transforms import Affine2D
 from scipy.ndimage import distance_transform_edt
 
-from ..geometry import analyze_path, translate_path
 from .alignment import path_points_in_image
 from .family_fit import _prepare_sample, _PreparedSample, primitive_path
 from .models import (
@@ -142,7 +143,10 @@ def _composed_paths(
                         f"attached topology part has no preceding endpoint: {part.instance}"
                     )
                 start = analyze_path(path).start
-                path = translate_path(path, current_end[0] - start[0], current_end[1] - start[1])
+                path = transform_path(
+                    path,
+                    Affine2D.translation_only(current_end[0] - start[0], current_end[1] - start[1]),
+                )
             if active_instances is None or part.instance in active_instances:
                 paths[part.instance] = path
             current_end = analyze_path(path).end

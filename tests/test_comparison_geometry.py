@@ -107,6 +107,16 @@ def test_ordered_path_covers_loop_and_entry_branch() -> None:
     assert np.linalg.norm(np.diff(path.xy, axis=0), axis=1).sum() > 0.0
 
 
+def test_ordered_path_starts_at_the_leftmost_endpoint() -> None:
+    mask = np.zeros((20, 30), dtype=bool)
+    mask[10, 4:25] = True
+
+    path = recover_ordered_path(analyze_skeleton(mask))
+
+    assert tuple(path.xy[0]) == (4.0, 10.0)
+    assert tuple(path.xy[-1]) == (24.0, 10.0)
+
+
 def test_ordered_path_rejects_disconnected_skeletons() -> None:
     mask = np.zeros((30, 40), dtype=bool)
     mask[5:13, 5] = True

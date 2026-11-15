@@ -3,14 +3,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
+from rasterregions import MaskMode, foreground_mask
+
 from .crop import coerce_crop_rect, load_crop
-from .mask import extract_ink_mask
 from .models import (
     ComparisonIdentity,
     ComparisonResult,
     CropRect,
     ExtractedLetter,
-    InkMode,
 )
 from .path import (
     PathExtractionError,
@@ -26,14 +26,14 @@ def extract_letter(
     image_path: str | Path,
     crop: CropRect | Sequence[int],
     *,
-    ink_mode: InkMode = "auto",
+    ink_mode: MaskMode = "auto",
     allow_path_failure: bool = False,
 ) -> ExtractedLetter:
     """Crop an image and recover its mask, topology, and optional ordered path."""
     source_path = Path(image_path)
     crop_rect = coerce_crop_rect(crop)
     image = load_crop(source_path, crop_rect)
-    mask_result = extract_ink_mask(image, mode=ink_mode)
+    mask_result = foreground_mask(image, mode=ink_mode)
     diagnostics = analyze_skeleton(mask_result.mask)
     try:
         ordered_path = recover_ordered_path(diagnostics)
@@ -102,8 +102,8 @@ def compare_letter_images(
     reference_crop: CropRect | Sequence[int],
     sample_crop: CropRect | Sequence[int],
     output_dir: str | Path,
-    reference_ink_mode: InkMode = "auto",
-    sample_ink_mode: InkMode = "auto",
+    reference_ink_mode: MaskMode = "auto",
+    sample_ink_mode: MaskMode = "auto",
     smoothing_window: int = 11,
     smoothing_polynomial_order: int = 2,
 ) -> WrittenComparisonReport:

@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 from PIL import Image, ImageDraw
+from rasterregions import MaskMode, MaskResult
 
 from .api import compare_extracted_letters, extract_letter
 from .batch_report import (
@@ -31,8 +32,6 @@ from .models import (
     ComparisonIdentity,
     CropRect,
     ExtractedLetter,
-    InkMaskResult,
-    InkMode,
     OrderedPath,
 )
 from .report import write_comparison_report
@@ -74,7 +73,7 @@ def _copy_reference_diagnostics(cache_dir: Path, output_dir: Path) -> None:
 def _cache_metadata(
     gallery: ReferenceGallery,
     index: ReferenceIndex,
-    ink_mode: InkMode,
+    ink_mode: MaskMode,
 ) -> dict[str, Any]:
     return {
         "cache_version": _REFERENCE_CACHE_VERSION,
@@ -121,7 +120,7 @@ def _save_reference_cache(
     cache_dir: Path,
     gallery: ReferenceGallery,
     index: ReferenceIndex,
-    ink_mode: InkMode,
+    ink_mode: MaskMode,
 ) -> dict[str, Any]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     crops_dir = cache_dir / "crops"
@@ -155,7 +154,7 @@ def _load_reference_cache(
     cache_dir: Path,
     source_path: Path,
     source_sha256: str,
-    ink_mode: InkMode,
+    ink_mode: MaskMode,
 ) -> tuple[ReferenceGallery, ReferenceIndex, dict[str, Any]]:
     metadata = json.loads((cache_dir / "gallery.json").read_text(encoding="utf-8"))
     if (
@@ -193,7 +192,7 @@ def _load_reference_cache(
 
     with Image.open(cache_dir / "segmentation" / "reference-mask.png") as mask_image:
         page_mask = np.asarray(mask_image.convert("L"), dtype=np.uint8) > 0
-    mask_result = InkMaskResult(
+    mask_result = MaskResult(
         mask=page_mask,
         confidence=metadata["mask_confidence"],
         method=metadata["mask_method"],
@@ -247,7 +246,6 @@ def _load_reference_cache(
     return gallery, index, metadata
 
 
-
 def _reference_extraction_paths(cache_dir: Path, glyph_id: str) -> tuple[Path, Path, Path]:
     extraction_dir = cache_dir / "extractions"
     return (
@@ -262,7 +260,7 @@ def _load_reference_extraction(
     source_path: Path,
     source_sha256: str,
     candidate: SegmentedGlyph,
-    ink_mode: InkMode,
+    ink_mode: MaskMode,
 ) -> ExtractedLetter:
     metadata_path, arrays_path, image_path = _reference_extraction_paths(
         cache_dir, candidate.glyph_id
@@ -298,7 +296,7 @@ def _load_reference_extraction(
         source_path=source_path,
         crop=candidate.bbox,
         image=image,
-        mask_result=InkMaskResult(
+        mask_result=MaskResult(
             mask=mask,
             confidence=metadata["mask_confidence"],
             method=metadata["mask_method"],
@@ -313,13 +311,11 @@ def _load_reference_extraction(
 def _save_reference_extraction(
     cache_dir: Path,
     source_sha256: str,
-    ink_mode: InkMode,
+    ink_mode: MaskMode,
     glyph_id: str,
     extraction: ExtractedLetter,
 ) -> None:
-    metadata_path, arrays_path, image_path = _reference_extraction_paths(
-        cache_dir, glyph_id
-    )
+    metadata_path, arrays_path, image_path = _reference_extraction_paths(cache_dir, glyph_id)
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     ordered_path = extraction.ordered_path
     np.savez_compressed(
@@ -329,9 +325,7 @@ def _save_reference_extraction(
         radius=extraction.diagnostics.radius,
         path_xy=(ordered_path.xy if ordered_path is not None else np.zeros((0, 2))),
         resampled_xy=(
-            extraction.resampled_xy
-            if extraction.resampled_xy is not None
-            else np.zeros((0, 2))
+            extraction.resampled_xy if extraction.resampled_xy is not None else np.zeros((0, 2))
         ),
     )
     extraction.image.save(image_path, format="PNG")
@@ -363,7 +357,7 @@ def _get_reference_extraction(
     source_path: Path,
     source_sha256: str,
     candidate: SegmentedGlyph,
-    ink_mode: InkMode,
+    ink_mode: MaskMode,
 ) -> ExtractedLetter:
     try:
         return _load_reference_extraction(
@@ -506,8 +500,8 @@ def compare_letter_page(
     *,
     expected_letters: int,
     output_dir: str | Path,
-    reference_ink_mode: InkMode = "auto",
-    sample_ink_mode: InkMode = "auto",
+    reference_ink_mode: MaskMode = "auto",
+    sample_ink_mode: MaskMode = "auto",
     top_k: int = DEFAULT_TOP_K,
 ) -> BatchComparisonReport:
     """Segment, retrieve, compare, and report a page of standalone sample glyphs."""

@@ -5,8 +5,8 @@ from dataclasses import dataclass
 import numpy as np
 from planarcurve.polyline import resample_polyline_by_arclength
 from planarcurve.polyline import unit_tangents as planar_unit_tangents
+from planarcurve.svg import sample_path
 
-from ..geometry import sample_path
 from .models import OccurrenceDelta, TopologyTransform, compose_occurrence_transform
 
 

@@ -85,7 +85,7 @@ def test_trajectory_to_cubic_compilation_parity():
 
 
 def test_primitive_path_dispatches_curvature_profile():
-    from inkgrammar.geometry import analyze_path
+    from planarcurve.svg import analyze_path
 
     template = PrimitiveTemplate.model_validate(
         {

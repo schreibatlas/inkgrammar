@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import rasterregions as rr
 from PIL import Image, ImageDraw
 
 from inkgrammar.dataset.preprocess import (
@@ -14,7 +15,6 @@ from inkgrammar.dataset.preprocess import (
     clean_mask,
     detect_speck_candidates,
     estimate_metric_guides,
-    label_components,
     normalize_background,
     pad_bbox,
     preprocess_crop,
@@ -56,15 +56,15 @@ def test_detect_speck_candidates_only_reports_small_components():
     assert candidates[0].reviewed is False
 
 
-def test_label_components_finds_8_connected_groups():
+def test_rasterregions_components_find_8_connected_groups():
     mask = np.zeros((5, 5), dtype=bool)
     mask[1, 1] = True
     mask[2, 2] = True  # diagonal neighbor of the first
     mask[4, 0] = True
 
-    components = label_components(mask)
+    components = rr.components(mask)
 
-    assert sorted(component[0].size for component in components) == [1, 2]
+    assert sorted(component.area for component in components) == [1, 2]
 
 
 def test_estimate_metric_guides_lowercase_and_uppercase():
@@ -127,11 +127,20 @@ def test_preprocess_crop_returns_versioned_result():
     result = preprocess_crop(image, params, glyph_class="lowercase")
 
     assert result.params == params
-    assert result.params.version == 1
+    assert result.params.version == 2
+    assert result.params.threshold_policy == "rasterregions-grayscale-v2"
+    repeated = preprocess_crop(image, params, glyph_class="lowercase")
+    assert np.array_equal(result.raw_mask, repeated.raw_mask)
+    assert np.array_equal(result.clean_mask, repeated.clean_mask)
     assert result.raw_mask[25, 25]
     assert not result.clean_mask[25, 25]
     assert [removed.area for removed in result.cleanup.removed_components] == [1]
     assert result.metrics.metric_status == "automatic-candidate"
+
+
+def test_preprocess_params_rejects_legacy_v1_contract():
+    with pytest.raises(ValueError):
+        PreprocessParams.model_validate({"version": 1, "threshold_policy": "otsu-256-v1"})
 
 
 def _synthetic_project(tmp_path, *, source_bytes=None, width=4, height=3):
@@ -335,6 +344,9 @@ def test_materialize_records_artifacts_and_derived(tmp_path):
     index = materialize_dataset(bundle, tmp_path / "run" / "out")
 
     matched = index["observations"]["sas1968-alpha-01"]
+    assert index["preprocess"]["version"] == 2
+    assert index["preprocess"]["threshold_policy"] == "rasterregions-grayscale-v2"
+    assert matched["extraction"]["threshold_policy"] == "rasterregions-grayscale-v2"
     generated = index["observations"]["synthetic-pair-01"]
     assert matched["kind"] == "glyph-isolated"
     assert matched["review_status"] == "accepted"
@@ -349,15 +361,38 @@ def test_materialize_records_artifacts_and_derived(tmp_path):
             "cleanup",
             "normalized",
         }
-        assert record["derived"]["skeleton"]["algorithm"].startswith("zhang-suen")
-        assert record["derived"]["centerline"]["algorithm"] == "edge-covering-walk-v1"
-        assert record["derived"]["topology"]["algorithm"] == "pixel-graph-v1"
+        assert record["derived"]["skeleton"]["algorithm"] == (
+            "skeletonpaths-analyze-mask-v1+spur-prune-3px-v1"
+        )
+        assert record["derived"]["centerline"]["algorithm"] == (
+            "skeletonpaths-covering-walk-v1+leftmost-latin-v1"
+        )
+        assert record["derived"]["topology"]["algorithm"] == "skeletonpaths-pixel-graph-v1"
         for name in ("skeleton", "centerline", "topology"):
             assert (tmp_path / "run" / "out" / record["derived"][name]["path"]).is_file()
     assert (
         index["source_hashes"]["src-1"]
         == hashlib.sha256((tmp_path / "run" / "private" / "source.png").read_bytes()).hexdigest()
     )
+
+
+def test_derived_artifacts_use_skeletonpaths_and_leftmost_orientation():
+    from inkgrammar.dataset.materialize import DERIVE_ALGORITHMS, derive_artifacts
+
+    mask = np.zeros((20, 30), dtype=bool)
+    mask[10, 4:25] = True
+    artifacts = derive_artifacts(mask)
+    candidate = artifacts["centerline"]["data"]["candidates"][0]
+
+    assert candidate["start"] == [4, 10]
+    assert candidate["end"] == [24, 10]
+    assert candidate["stitched"]
+    assert artifacts["skeleton"]["algorithm"] == DERIVE_ALGORITHMS["skeleton"]
+
+    mask[3, 20:25] = True
+    disconnected = derive_artifacts(mask)["centerline"]["data"]["candidates"]
+    assert len(disconnected) == 2
+    assert all(not item["stitched"] for item in disconnected)
 
 
 def test_materialize_composes_review_patches(tmp_path):

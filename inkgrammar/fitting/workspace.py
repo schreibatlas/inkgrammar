@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import rasterregions as rr
 import yaml
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import Field, model_validator
@@ -18,7 +19,6 @@ from skeletonpaths import PathRankingPolicy, PathSearchLimits
 
 from ..models import StrictModel
 from ..observations import ObservationManifest
-from ..raster import threshold_image
 from .models import (
     FitAnchorsFile,
     FitCorpus,
@@ -472,7 +472,7 @@ def materialize_fit_project(
             observation = observations_by_id[sample.observation_id]
             source = verified_sources[observation.source_id]
             crop = source.crop(observation.source_bbox).convert("L")
-            mask = threshold_image(crop)
+            mask = rr.foreground_mask(crop, mode="grayscale").mask
             if not mask.any():
                 raise ValueError(f"materialized crop contains no ink: {sample.id}")
             crop_name = f"{sample.id}.png"

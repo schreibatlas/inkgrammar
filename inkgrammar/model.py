@@ -2,13 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .geometry import (
-    analyze_path,
-    cubic_bridge,
-    path_without_initial_move,
-    transform_path,
-    translate_path,
-)
+from planarcurve.svg import analyze_path, cubic_bridge, path_without_initial_move, transform_path
+from planarcurve.transforms import Affine2D
+
 from .models import (
     ComponentPart,
     GlyphForm,
@@ -21,6 +17,7 @@ from .models import (
     WritingModelV3,
 )
 from .shaping import shape_glyph, shape_text
+from .svg_adapters import transform_svg_path
 
 
 @dataclass(frozen=True)
@@ -73,7 +70,7 @@ def _part_path(model: WritingModel, part: ComponentPart | RawPathPart) -> str:
         d = model.components[part.component].d
     else:
         d = part.d
-    return transform_path(d, part.transform)
+    return transform_svg_path(d, part.transform)
 
 
 def _compiled_part_paths(model: WritingModel, recipe: PathStrokeRecipe) -> tuple[str, ...]:
@@ -89,7 +86,7 @@ def _compiled_part_paths(model: WritingModel, recipe: PathStrokeRecipe) -> tuple
             assert current_end is not None
             dx = current_end[0] - info.start[0]
             dy = current_end[1] - info.start[1]
-            compiled_d = translate_path(part_d, dx, dy)
+            compiled_d = transform_path(part_d, Affine2D.translation_only(dx, dy))
         else:
             raise ValueError(
                 "a single pen-down stroke cannot contain a detached component; "
@@ -264,7 +261,7 @@ def compile_text(
                     CompiledStroke(
                         id=f"{index}:{stroke.id}",
                         role=stroke.role,
-                        d=translate_path(stroke.d, x_origin, 0),
+                        d=transform_path(stroke.d, Affine2D.translation_only(x_origin, 0)),
                     )
                 )
             elif stroke.tap is not None:
@@ -287,8 +284,12 @@ def compile_text(
         if left_stroke.d is None or right_stroke.d is None:
             continue
 
-        left_info = analyze_path(translate_path(left_stroke.d, x_origins[index], 0))
-        right_info = analyze_path(translate_path(right_stroke.d, next_origin, 0))
+        left_info = analyze_path(
+            transform_path(left_stroke.d, Affine2D.translation_only(x_origins[index], 0))
+        )
+        right_info = analyze_path(
+            transform_path(right_stroke.d, Affine2D.translation_only(next_origin, 0))
+        )
 
         p0 = left_info.start if left.exit[1] == "start" else left_info.end
         t0 = left_info.tangent_start if left.exit[1] == "start" else left_info.tangent_end

@@ -5,8 +5,8 @@ from dataclasses import dataclass
 
 import numpy as np
 from PIL import Image, ImageDraw
+from planarcurve.svg import sample_path
 
-from ..geometry import sample_path
 from .trace import CompiledPartTrace
 
 

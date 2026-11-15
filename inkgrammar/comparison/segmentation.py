@@ -9,45 +9,9 @@ from typing import Literal
 import numpy as np
 import rasterregions as rr
 from PIL import Image, ImageDraw
+from rasterregions import Component, MaskMode, MaskResult
 
-from .models import CropRect, InkMaskResult, InkMode
-
-
-@dataclass(frozen=True)
-class Component:
-    index: int
-    x0: int
-    y0: int
-    x1: int
-    y1: int
-    area: int
-    ys: np.ndarray
-    xs: np.ndarray
-
-    @property
-    def width(self) -> int:
-        return self.x1 - self.x0
-
-    @property
-    def height(self) -> int:
-        return self.y1 - self.y0
-
-    @property
-    def center_x(self) -> float:
-        return (self.x0 + self.x1) / 2.0
-
-    @property
-    def center_y(self) -> float:
-        return (self.y0 + self.y1) / 2.0
-
-
-@dataclass(frozen=True)
-class RowBand:
-    x0: int
-    y0: int
-    x1: int
-    y1: int
-    component_indices: tuple[int, ...]
+from .models import CropRect
 
 
 @dataclass(frozen=True)
@@ -89,7 +53,7 @@ class ReferenceGallery:
     source_path: Path
     source_sha256: str
     candidates: tuple[SegmentedGlyph, ...]
-    mask_result: InkMaskResult
+    mask_result: MaskResult
     segmentation: PageSegmentation
 
 
@@ -99,48 +63,9 @@ class SegmentationError(ValueError):
         self.diagnostic_path = diagnostic_path
 
 
-def extract_page_ink_mask(image: Image.Image, *, mode: InkMode = "auto") -> InkMaskResult:
-    """Adapt rasterregions mask output to InkGrammar's warnings-list result."""
-    result = rr.foreground_mask(image, mode=mode)
-    return InkMaskResult(
-        mask=result.mask,
-        confidence=result.confidence,
-        method=result.method,
-        warnings=list(result.warnings),
-    )
-
-
-def _components(mask: np.ndarray) -> list[Component]:
-    return [
-        Component(
-            index=component.index,
-            x0=component.bbox.x0,
-            y0=component.bbox.y0,
-            x1=component.bbox.x1,
-            y1=component.bbox.y1,
-            area=component.area,
-            ys=component.ys,
-            xs=component.xs,
-        )
-        for component in rr.components(mask)
-    ]
-
-
-def detect_ink_rows(mask: np.ndarray) -> list[RowBand]:
-    """Adapt rasterregions row bands to InkGrammar's direct-coordinate model."""
-    ink = np.asarray(mask, dtype=bool)
-    if ink.ndim != 2:
-        raise ValueError("page ink mask must be two-dimensional")
-    return [
-        RowBand(
-            x0=row.bbox.x0,
-            y0=row.bbox.y0,
-            x1=row.bbox.x1,
-            y1=row.bbox.y1,
-            component_indices=row.component_indices,
-        )
-        for row in rr.detect_rows(ink)
-    ]
+extract_page_ink_mask = rr.foreground_mask
+RowBand = rr.RowBand
+detect_ink_rows = rr.detect_rows
 
 
 def _adapt_candidates(result: rr.DetectionResult, prefix: str) -> tuple[SegmentedGlyph, ...]:
@@ -227,7 +152,7 @@ def _write_reference_diagnostics(
 def segment_reference_gallery(
     image_path: str | Path,
     *,
-    ink_mode: InkMode = "auto",
+    ink_mode: MaskMode = "auto",
     output_dir: str | Path | None = None,
 ) -> ReferenceGallery:
     """Adapt generic raster-region detections into a source-ordered gallery."""
@@ -250,7 +175,7 @@ def segment_reference_gallery(
         source_path=source_path,
         source_sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
         candidates=candidates,
-        mask_result=InkMaskResult(
+        mask_result=MaskResult(
             mask=result.clean_mask,
             confidence=result.mask_result.confidence,
             method=result.mask_result.method,
@@ -280,7 +205,7 @@ def _write_sample_diagnostics(
     component_draw = ImageDraw.Draw(component_preview)
     for component in components:
         component_draw.rectangle(
-            (component.x0, component.y0, component.x1 - 1, component.y1 - 1),
+            (component.bbox.x0, component.bbox.y0, component.bbox.x1 - 1, component.bbox.y1 - 1),
             outline=(30, 130, 210),
             width=1,
         )
@@ -311,7 +236,7 @@ def segment_sample_glyphs(
     image_path: str | Path,
     *,
     expected_count: int,
-    ink_mode: InkMode = "auto",
+    ink_mode: MaskMode = "auto",
     output_dir: str | Path | None = None,
 ) -> list[SegmentedGlyph]:
     """Recover exactly ``expected_count`` glyph regions or raise for failure."""
@@ -335,7 +260,7 @@ def segment_sample_glyphs(
                 *(boundary.x for boundary in result.diagnostics.partition_boundaries),
                 result.image.width,
             ]
-        components = _components(result.clean_mask)
+        components = rr.components(result.clean_mask)
         _write_sample_diagnostics(
             result.image,
             source_path.name,

@@ -53,12 +53,8 @@ def compare_letter_command(
     reference: Path = typer.Argument(..., exists=True),  # noqa: B008
     sample: Path = typer.Argument(..., exists=True),  # noqa: B008
     letter: str | None = typer.Option(None, "--letter"),  # noqa: B008
-    reference_crop: str | None = typer.Option(
-        None, "--reference-crop", help="x,y,width,height"
-    ),  # noqa: B008
-    sample_crop: str | None = typer.Option(
-        None, "--sample-crop", help="x,y,width,height"
-    ),  # noqa: B008
+    reference_crop: str | None = typer.Option(None, "--reference-crop", help="x,y,width,height"),  # noqa: B008
+    sample_crop: str | None = typer.Option(None, "--sample-crop", help="x,y,width,height"),  # noqa: B008
     output: Path = typer.Option(..., "--output"),  # noqa: B008
     letters: int | None = typer.Option(
         None,
@@ -85,6 +81,7 @@ def compare_letter_command(
 
     try:
         from .comparison.segmentation import SegmentationError
+
         if automatic:
             from .comparison.batch import compare_letter_page
 
@@ -124,6 +121,8 @@ def compare_letter_command(
     else:
         typer.echo(f"HTML report: {report.html_path}")
         typer.echo(f"JSON report: {report.json_path}")
+
+
 @page_app.command("extract")
 def page_extract(
     image: Path = typer.Argument(..., exists=True),  # noqa: B008

@@ -142,7 +142,9 @@ def test_wrong_sample_count_fails_with_segmentation_diagnostics(tmp_path):
     assert manifest["status"] == "failed"
 
 
-def test_page_mask_adapter_preserves_inkgrammar_result_contract():
+def test_page_mask_adapter_is_rasterregions_foreground_mask():
+    from rasterregions import MaskResult, foreground_mask
+
     from inkgrammar.comparison.segmentation import extract_page_ink_mask
 
     image = Image.new("RGB", (80, 60), "white")
@@ -150,6 +152,8 @@ def test_page_mask_adapter_preserves_inkgrammar_result_contract():
 
     result = extract_page_ink_mask(image, mode="dark")
 
+    assert extract_page_ink_mask is foreground_mask
+    assert isinstance(result, MaskResult)
     assert result.method == "dark"
     assert result.mask[25, 25]
-    assert isinstance(result.warnings, list)
+    assert isinstance(result.warnings, tuple)

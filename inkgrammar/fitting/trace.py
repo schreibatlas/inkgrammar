@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..geometry import analyze_path
+from planarcurve.svg import analyze_path
+
 from ..model import (
     CompiledGlyph,
     _compiled_part_paths,

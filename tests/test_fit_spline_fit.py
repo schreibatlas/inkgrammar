@@ -1,8 +1,9 @@
 import numpy as np
 import pytest
+from planarcurve.spline import spline_design_matrix
 
 from inkgrammar.fitting.models import BSplineGeometry, SplineEndpointPolicy
-from inkgrammar.fitting.spline import spline_design_matrix
+from inkgrammar.fitting.planarcurve_adapters import to_planar_bspline
 from inkgrammar.fitting.spline_fit import SplineObservation, solve_shared_spline_coefficients
 
 
@@ -30,7 +31,7 @@ def canonical_observations(geometry):
         (43, np.array([[0.85, -0.1], [0.0, 1.1]]), np.array([-4.0, 8.0])),
     ):
         u = np.linspace(0.0, 1.0, count)
-        xy = spline_design_matrix(u, geometry) @ controls
+        xy = spline_design_matrix(u, to_planar_bspline(geometry)) @ controls
         observed = xy @ matrix.T + offset + rng.normal(0.0, 0.005, xy.shape)
         if count == 51:
             observed[count // 2] += [8.0, -6.0]
@@ -70,7 +71,7 @@ def test_sparse_irls_solver_recovers_shared_spline_with_fixed_transforms():
     np.testing.assert_allclose(fitted, fitted_again, atol=0.0)
     assert np.max(np.linalg.norm(fitted[1:-1] - truth[1:-1], axis=1)) < 0.1
     u = np.linspace(0.0, 1.0, 201)
-    design = spline_design_matrix(u, geometry)
+    design = spline_design_matrix(u, to_planar_bspline(geometry))
     curve_error = np.linalg.norm(design @ fitted - design @ truth, axis=1)
     assert np.percentile(curve_error, 95) < 0.05
 

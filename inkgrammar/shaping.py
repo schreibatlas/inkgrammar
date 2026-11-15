@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .geometry import analyze_path, path_without_initial_move, transform_path, translate_path
+from planarcurve.svg import analyze_path, path_without_initial_move, transform_path
+from planarcurve.transforms import Affine2D
+
 from .models import (
     GlyphContext,
     PathStrokeRecipe,
@@ -14,6 +16,7 @@ from .models import (
     TapStrokeRecipe,
     WritingModelV3,
 )
+from .svg_adapters import transform_svg_path
 
 MAX_CONTEXT_ITERATIONS = 8
 
@@ -189,17 +192,18 @@ def _stroke_paths(stroke: PathStrokeRecipe) -> list[tuple[str, str]]:
     for part in stroke.parts:
         if not isinstance(part, RawPathPart):
             raise ValueError("runtime schema v3 glyph strokes must contain flattened paths")
-        path = transform_path(part.d, part.transform)
+        path = transform_svg_path(part.d, part.transform)
         info = analyze_path(path)
         if parts and not part.attach:
             finish()
             current_end = None
         if parts:
             assert current_end is not None
-            path = translate_path(
+            path = transform_path(
                 path,
-                current_end[0] - info.start[0],
-                current_end[1] - info.start[1],
+                Affine2D.translation_only(
+                    current_end[0] - info.start[0], current_end[1] - info.start[1]
+                ),
             )
             parts.append(path_without_initial_move(path))
         else:
@@ -233,7 +237,7 @@ def _place_glyph(
                     ShapedStroke(
                         id=f"{index}:{stroke_id}",
                         role=stroke.role,
-                        d=translate_path(path, x, y),
+                        d=transform_path(path, Affine2D.translation_only(x, y)),
                     )
                 )
     entry = (

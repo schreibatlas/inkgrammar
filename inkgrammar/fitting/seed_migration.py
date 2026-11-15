@@ -6,9 +6,11 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from planarcurve.spline import spline_design_matrix
 
 from .models import BSplineGeometry, PrimitiveTemplate, SplineEndpointPolicy, TopologyTransform
-from .spline import sample_curve_by_arclength, spline_design_matrix
+from .planarcurve_adapters import to_planar_bspline
+from .spline import sample_curve_by_arclength
 
 
 @dataclass(frozen=True)
@@ -46,7 +48,7 @@ def migrate_legacy_seed(
         control_points=[tuple(point) for point in initial_points],
         endpoint_policy=SplineEndpointPolicy(start="locked", end="locked"),
     )
-    design = spline_design_matrix(source.u, geometry).toarray()
+    design = spline_design_matrix(source.u, to_planar_bspline(geometry)).toarray()
     fixed = np.asarray([0, control_point_count - 1])
     free = np.arange(1, control_point_count - 1)
     residual = source.xy - design[:, fixed] @ initial_points[fixed]

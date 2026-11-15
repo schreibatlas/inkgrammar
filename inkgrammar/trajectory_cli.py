@@ -17,6 +17,7 @@ import numpy as np
 import typer
 import yaml
 from PIL import Image
+from skeletonpaths import select_path
 
 from .dataset.project import load_dataset_project
 from .dataset.transforms import source_px_to_glyph_units
@@ -29,7 +30,6 @@ from .fitting.curvature_fit import (
     resample_by_arclength,
 )
 from .fitting.family_fit_v4 import prepare_topology_target
-from .fitting.skeleton_graph import select_path
 
 DEFAULT_DATASET_ROOT = Path("work/sas-1968/dataset")
 DEFAULT_FIT_ROOT = Path("work/sas-1968/trajectory")

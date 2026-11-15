@@ -10,13 +10,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import rasterregions as rr
 from PIL import Image
 from pydantic import Field
 
 from ..io import load_layout
 from ..models import StrictModel
 from .layouts import load_region_layout
-from .preprocess import label_components
 from .project import DatasetProjectBundle, SourceVerification
 
 FITTING_USABLE = ("usable", "usable-reviewed")
@@ -96,8 +96,8 @@ def _mask_warnings(record: dict, dataset_root: Path) -> list[ValidationIssue]:
                 message="clean mask touches the crop edge",
             )
         )
-    components = label_components(mask)
-    areas = [int(ys.size) for ys, _ in components]
+    components = rr.components(mask)
+    areas = [component.area for component in components]
     total = sum(areas)
     large = [area for area in areas if total and area > 0.1 * total]
     if len(large) >= 2:

@@ -140,10 +140,7 @@ def rank_reference_candidates(
     index = gallery if isinstance(gallery, ReferenceIndex) else build_reference_index(gallery)
     sample_descriptor = glyph_descriptor(sample)
     ranked = sorted(
-        (
-            coarse_match_cost(sample_descriptor, descriptor)
-            for descriptor in index.descriptors
-        ),
+        (coarse_match_cost(sample_descriptor, descriptor) for descriptor in index.descriptors),
         key=lambda score: (score.coarse_cost, score.reference_id),
     )
     return [replace(score, rank=rank) for rank, score in enumerate(ranked[:top_k], start=1)]
@@ -215,6 +212,7 @@ def refine_match(
         turn_rate_cost=turn_rate,
     )
 
+
 def refine_top_k_matches(
     sample: SegmentedGlyph,
     gallery: ReferenceGallery,
@@ -238,6 +236,7 @@ def refine_top_k_matches(
     refined.sort(key=lambda score: (score.cost, score.reference_id))
     return [replace(score, rank=rank) for rank, score in enumerate(refined, start=1)]
 
+
 def match_status(scores: list[MatchScore]) -> Literal["clear", "ambiguous"]:
     """Classify best-match ambiguity from the gap to the second-ranked candidate."""
     if len(scores) < 2:
@@ -246,9 +245,6 @@ def match_status(scores: list[MatchScore]) -> Literal["clear", "ambiguous"]:
     best, second = ranked[:2]
     margin = second.cost - best.cost
     relative_margin = margin / max(abs(best.cost), 1e-9)
-    if (
-        margin <= AMBIGUITY_ABSOLUTE_MARGIN
-        or relative_margin <= AMBIGUITY_RELATIVE_MARGIN
-    ):
+    if margin <= AMBIGUITY_ABSOLUTE_MARGIN or relative_margin <= AMBIGUITY_RELATIVE_MARGIN:
         return "ambiguous"
     return "clear"

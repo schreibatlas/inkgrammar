@@ -108,6 +108,8 @@ skeleton/centerline/topology artifacts with algorithm versions, and a
 canonical `index.json`). Two clean runs produce byte-identical semantic
 artifacts.
 
+Dataset preprocessing version 2 uses RasterRegions grayscale foreground extraction under the explicit `rasterregions-grayscale-v2` policy. Version 1 materializations remain historical version 1 outputs and are never relabeled as version 2. Re-materialize with version 2 when new canonical masks are required; the RasterRegions result and version are recorded in the index and observation extraction metadata.
+
 ### Annotation and review-patch policy
 
 Reviewed semantic annotations and review patches live in the private tree

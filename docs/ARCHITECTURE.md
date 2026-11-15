@@ -158,10 +158,19 @@ The current canonical SAS calibration is 31 fit units per x-height. It is measur
 
 ## External geometry ownership
 
-| Responsibility                                                 | Owning package | InkGrammar-owned boundary                           |
-| -------------------------------------------------------------- | -------------- | --------------------------------------------------- |
-| SVG parsing, generic curve and polyline operations, transforms | PlanarCurve    | Coordinate-frame adapters and fitting-domain models |
-| Raster skeleton graphs, route enumeration, ranking, ambiguity  | SkeletonPaths  | Topology candidates and evidence provenance         |
-| Variable-width expansion, caps, joins, closed contours         | StrokeOutline  | Shaped-text traversal and width-profile selection   |
+| Responsibility                                                                                           | Owning package | InkGrammar-owned boundary                                             |
+| -------------------------------------------------------------------------------------------------------- | -------------- | --------------------------------------------------------------------- |
+| Foreground masks, connected components, rows, and anonymous regions                                      | RasterRegions  | Dataset review records and labelled glyph semantics                   |
+| SVG parsing, curve and polyline algorithms, spline math, transforms, and paired-point similarity fitting | PlanarCurve    | Coordinate-frame adapters and fitting-domain schemas                  |
+| Skeleton mask analysis, pixel graphs, edge coverage, and generic routing                                 | SkeletonPaths  | Candidate selection, handwriting orientation, and evidence provenance |
+| Variable-width expansion, caps, joins, and closed contours                                               | StrokeOutline  | Shaped-text traversal and width-profile selection                     |
 
 SkeletonPaths routes remain inferred topology candidates. Only reviewed trajectory annotations support physical stroke-order or direction claims. Pass typed `planarcurve.CubicPath` values to StrokeOutline when available; retain the SVG-string adapter for shaped-text compatibility.
+
+PlanarCurve's `fit_similarity_transform(reference_points, sample_points)` maps paired samples to references with an orientation-preserving positive-scale transform. InkGrammar keeps the forward and reversed route comparison policy in `comparison.path`. `inkgrammar.svg_adapters.to_planar_affine` translates the InkGrammar `Transform` coefficient convention, while `fitting.planarcurve_adapters` converts fitting schemas to PlanarCurve models. Generic SVG and spline functions are imported from PlanarCurve directly. The removed `inkgrammar/geometry.py` facade is distinct from the retained, comparison-specific `inkgrammar/comparison/geometry.py`.
+
+### Fitting-generation compatibility
+
+The compatibility inventory found eight shipped objective-v2/v3 checkpoint or report records, even though the checked-in fitting configurations use objective v4. Keep v2 and v3 dispatch and schemas. No retirement window or supported migration has been approved. Objective-v3 centerline tracing remains frozen. Objective-v4 review-overlay topology diagnostics use SkeletonPaths, while existing objective-v2/v3 diagnostics remain unchanged.
+
+The package metadata requires PlanarCurve and SkeletonPaths releases that provide the APIs used here. The 0.1.2 minimums identify the next compatible release line. InkGrammar's fitting extra retains SciPy and scikit-image because InkGrammar still imports both directly.

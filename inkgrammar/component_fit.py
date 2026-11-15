@@ -6,10 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import rasterregions as rr
 from PIL import Image
 
 from .models import ComponentPart, PathStrokeRecipe, WritingModel
-from .raster import compare_masks, render_text_mask, threshold_image
+from .raster import compare_masks, render_text_mask
 
 
 @dataclass(frozen=True)
@@ -62,10 +63,13 @@ def fit_component_candidates(
     masks = {}
     for character, path in references.items():
         with Image.open(path) as image:
-            masks[character] = threshold_image(image)
+            masks[character] = rr.foreground_mask(image, mode="grayscale").mask
 
     def score(candidate_model, character):
-        generated = threshold_image(render_text_mask(candidate_model, character, scale=0.25))
+        generated = rr.foreground_mask(
+            render_text_mask(candidate_model, character, scale=0.25),
+            mode="grayscale",
+        ).mask
         return compare_masks(masks[character], generated)["iou"]
 
     best_model = None

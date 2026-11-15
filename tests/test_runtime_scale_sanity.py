@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import pytest
+from planarcurve.svg import analyze_path
 
-from inkgrammar.geometry import analyze_path
 from inkgrammar.io import load_model
 from inkgrammar.raster import scale_sanity
 

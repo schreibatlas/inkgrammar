@@ -9,9 +9,10 @@ from typing import Literal
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+from planarcurve.svg import analyze_path, transform_path
+from planarcurve.transforms import Affine2D
 
 from ..compiler import compile_fit_project
-from ..geometry import analyze_path, translate_path
 from ..models import RuntimeContextRule
 from ..raster import render_text_frame
 from .connection_fit import connection_observation_coverage
@@ -71,7 +72,10 @@ def _glyph_paths(
                 if current_end is None:
                     raise ValueError(f"attached part has no preceding endpoint: {part.instance}")
                 start = analyze_path(path).start
-                path = translate_path(path, current_end[0] - start[0], current_end[1] - start[1])
+                path = transform_path(
+                    path,
+                    Affine2D.translation_only(current_end[0] - start[0], current_end[1] - start[1]),
+                )
             paths[f"{stroke.id}:{part.instance}"] = path
             current_end = analyze_path(path).end
     return paths

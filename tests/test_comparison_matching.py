@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw
+from rasterregions import MaskResult
 
 from inkgrammar.comparison.descriptors import canonicalize_mask, glyph_descriptor
 from inkgrammar.comparison.matching import (
@@ -19,7 +20,7 @@ from inkgrammar.comparison.matching import (
     refine_match,
     refine_top_k_matches,
 )
-from inkgrammar.comparison.models import CropRect, InkMaskResult
+from inkgrammar.comparison.models import CropRect
 from inkgrammar.comparison.segmentation import PageSegmentation, ReferenceGallery, SegmentedGlyph
 
 
@@ -29,9 +30,18 @@ def _shape(kind: str, *, size: int = 64, offset: tuple[int, int] = (0, 0)) -> Se
     x, y = offset
     if kind == "e":
         draw.line(
-            [(x + 12, y + 31), (x + 33, y + 31), (x + 36, y + 24), (x + 32, y + 17),
-             (x + 24, y + 15), (x + 16, y + 19), (x + 12, y + 28), (x + 14, y + 38),
-             (x + 21, y + 43), (x + 32, y + 42)],
+            [
+                (x + 12, y + 31),
+                (x + 33, y + 31),
+                (x + 36, y + 24),
+                (x + 32, y + 17),
+                (x + 24, y + 15),
+                (x + 16, y + 19),
+                (x + 12, y + 28),
+                (x + 14, y + 38),
+                (x + 21, y + 43),
+                (x + 32, y + 42),
+            ],
             fill="black",
             width=4,
         )
@@ -39,8 +49,14 @@ def _shape(kind: str, *, size: int = 64, offset: tuple[int, int] = (0, 0)) -> Se
         draw.line((x + 25, y + 12, x + 25, y + 45), fill="black", width=4)
     elif kind == "n":
         draw.line(
-            [(x + 13, y + 45), (x + 13, y + 18), (x + 20, y + 15),
-             (x + 31, y + 18), (x + 35, y + 25), (x + 35, y + 45)],
+            [
+                (x + 13, y + 45),
+                (x + 13, y + 18),
+                (x + 20, y + 15),
+                (x + 31, y + 18),
+                (x + 35, y + 25),
+                (x + 35, y + 45),
+            ],
             fill="black",
             width=4,
         )
@@ -67,7 +83,7 @@ def _gallery(*candidates: SegmentedGlyph) -> ReferenceGallery:
         source_path=Path("reference.png"),
         source_sha256="a" * 64,
         candidates=tuple(candidates),
-        mask_result=InkMaskResult(page_mask, 1.0, "grayscale", []),
+        mask_result=MaskResult(page_mask, 1.0, "grayscale", []),
         segmentation=segmentation,
     )
 
@@ -121,7 +137,6 @@ def test_transformed_query_ranks_its_reference_first_without_unique_assignment()
     assert TOPOLOGY_WEIGHT == 0.15
 
 
-
 def test_refinement_is_limited_to_the_coarse_top_k_candidates():
     gallery = _gallery(_shape("e"), _shape("n"), _shape("l"))
     coarse = rank_reference_candidates(_shape("e"), gallery, top_k=2)
@@ -130,9 +145,7 @@ def test_refinement_is_limited_to_the_coarse_top_k_candidates():
 
     assert len(refined) == 2
     assert [score.rank for score in refined] == [1, 2]
-    assert {score.reference_id for score in refined} <= {
-        score.reference_id for score in coarse
-    }
+    assert {score.reference_id for score in refined} <= {score.reference_id for score in coarse}
 
 
 def test_ambiguity_uses_a_deterministic_best_second_margin():

@@ -281,15 +281,13 @@ def _json_series(analysis: ComparisonAnalysis) -> dict[str, list]:
     return {name: np.asarray(values).tolist() for name, values in analysis.series.items()}
 
 
-
 def _crop_description(crop: dict[str, int]) -> str:
-    return (
-        f"x={crop['x']}, y={crop['y']}, "
-        f"width={crop['width']}, height={crop['height']}"
-    )
+    return f"x={crop['x']}, y={crop['y']}, width={crop['width']}, height={crop['height']}"
+
 
 def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> dict[str, Any]:
     transform = result.alignment.transform
+
     def input_payload(letter: ExtractedLetter, side: str) -> dict[str, Any]:
         return {
             "source_name": letter.source_path.name,
@@ -531,9 +529,9 @@ def _html(result: ComparisonResult, payload: dict[str, Any]) -> str:
         "</tbody></table>",
         "<p>No composite correctness score is calculated. Raw length ratio is not physical size. "
         "Width is an unscored diagnostic.</p>",
-        "<h2>8. Machine-readable output</h2><p><a href=\"report.json\">report.json</a>"
+        '<h2>8. Machine-readable output</h2><p><a href="report.json">report.json</a>'
         " contains full coordinates, progress series, metrics, and artifact names. "
-        "<a href=\"report.md\">report.md</a> provides a portable summary.</p>",
+        '<a href="report.md">report.md</a> provides a portable summary.</p>',
         "</body></html>",
     ]
     return "\n".join(rows)
@@ -584,9 +582,7 @@ def _write_raster_only_report(
 
     identity = result.identity
     assert identity is not None
-    unavailable = (
-        "Ordered-path recovery failed; trajectory metrics are unavailable."
-    )
+    unavailable = "Ordered-path recovery failed; trajectory metrics are unavailable."
     inputs = {}
     for side, extracted in (("reference", reference), ("sample", sample)):
         inputs[side] = {

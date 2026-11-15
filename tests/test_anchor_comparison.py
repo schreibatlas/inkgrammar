@@ -1,14 +1,15 @@
 import numpy as np
 import pytest
 from PIL import Image
+from rasterregions import foreground_mask
 
-from inkgrammar.raster import compare_anchored_masks, threshold_image
+from inkgrammar.raster import compare_anchored_masks
 
 
 def test_binary_threshold_retains_black_ink():
     image = Image.new("L", (10, 10), 255)
     image.putpixel((4, 5), 0)
-    mask = threshold_image(image)
+    mask = foreground_mask(image, mode="grayscale").mask
     assert mask.sum() == 1
     assert mask[5, 4]
 
@@ -74,7 +75,7 @@ def test_render_frame_preserves_negative_bearings_and_vertical_overshoot():
     model = load_model("data/models/demo-looped.yaml")
     model.components["underturn"].d = "M -100 1000 L 100 -400"
     frame = render_text_frame(model, "i", scale=0.2)
-    mask = threshold_image(frame.image)
+    mask = foreground_mask(frame.image, mode="grayscale").mask
     assert frame.origin[0] > 0
     assert frame.origin[1] > model.metrics.ascender * frame.scale
     assert mask.any()

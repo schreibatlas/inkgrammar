@@ -1,19 +1,16 @@
 from __future__ import annotations
 
 import numpy as np
-from skeletonpaths import graph_from_skeleton
+from skeletonpaths import SkeletonGraph, analyze_mask, graph_from_skeleton
 
 from .models import SkeletonDiagnostics, TopologySummary
 
 
-def diagnostics_from_skeleton(
+def _diagnostics_from_graph(
     skeleton: np.ndarray,
     radius: np.ndarray,
+    graph: SkeletonGraph,
 ) -> SkeletonDiagnostics:
-    """Build topology diagnostics from persisted skeleton and radius rasters."""
-    skeleton = np.asarray(skeleton, dtype=bool)
-    radius = np.asarray(radius, dtype=float)
-    graph = graph_from_skeleton(skeleton, radius=radius)
     endpoints = [node.xy for node in graph.nodes if node.degree == 1]
     junctions = [node.xy for node in graph.nodes if node.degree > 2]
     topology = TopologySummary(
@@ -29,13 +26,20 @@ def diagnostics_from_skeleton(
     return SkeletonDiagnostics(skeleton, radius, graph, topology)
 
 
+def diagnostics_from_skeleton(
+    skeleton: np.ndarray,
+    radius: np.ndarray,
+) -> SkeletonDiagnostics:
+    """Build topology diagnostics from persisted skeleton and radius rasters."""
+    skeleton = np.asarray(skeleton, dtype=bool)
+    radius = np.asarray(radius, dtype=float)
+    graph = graph_from_skeleton(skeleton, radius=radius)
+    return _diagnostics_from_graph(skeleton, radius, graph)
+
+
 def analyze_skeleton(mask: np.ndarray) -> SkeletonDiagnostics:
     ink = np.array(mask, dtype=bool, copy=True)
     if ink.ndim != 2:
         raise ValueError("ink mask must be a 2D array")
-    from scipy.ndimage import distance_transform_edt
-    from skimage.morphology import skeletonize
-
-    radius = distance_transform_edt(ink)
-    skeleton = skeletonize(ink) if np.any(ink) else np.zeros_like(ink)
-    return diagnostics_from_skeleton(skeleton, radius)
+    analysis = analyze_mask(ink)
+    return _diagnostics_from_graph(analysis.skeleton, analysis.radius, analysis.graph)

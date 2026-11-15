@@ -9,12 +9,14 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps  # noqa: E402
+from planarcurve.svg import analyze_path, sample_path  # noqa: E402
 
-from inkgrammar.geometry import analyze_path, sample_path  # noqa: E402
 from inkgrammar.io import load_model  # noqa: E402
 from inkgrammar.models import WritingModelV3  # noqa: E402
 from inkgrammar.raster import render_text_frame, scale_sanity  # noqa: E402
@@ -98,14 +100,14 @@ def _target_status(model: WritingModelV3, text: str, purpose: str) -> dict[str, 
 
 def _centerline_paths(
     model: WritingModelV3, text: str
-) -> tuple[list[list[tuple[float, float]]], list[tuple[float, float]]]:
+) -> tuple[list[np.ndarray], list[tuple[float, float]]]:
     shaped = shape_text(model, text, allow_synthetic_bridges=True)
-    paths = []
+    paths: list[np.ndarray] = []
     taps = []
     for stroke in shaped.strokes:
         if stroke.d is not None:
             points = sample_path(stroke.d, 64)
-            if points:
+            if len(points):
                 paths.append(points)
         elif stroke.tap is not None:
             taps.append(stroke.tap)

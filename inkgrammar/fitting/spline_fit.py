@@ -14,7 +14,7 @@ from planarcurve.fitting.spline import (
 )
 
 from .models import BSplineGeometry
-from .spline import to_planar_bspline
+from .planarcurve_adapters import to_planar_bspline
 
 
 @dataclass(frozen=True)

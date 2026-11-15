@@ -3,7 +3,8 @@ from __future__ import annotations
 from html import escape
 from pathlib import Path
 
-from .geometry import sample_path
+from planarcurve.svg import sample_path
+
 from .model import compile_glyph, compile_text
 from .models import RuntimeWritingModel, WritingModelV3
 from .outline import expand_shaped_text

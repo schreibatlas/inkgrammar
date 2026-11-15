@@ -28,14 +28,13 @@ from .dataset.layouts import (
     RegionLayout,
 )
 from .models import PageLayout
-from .raster import threshold_image
 
 DETECTIONS_FORMAT = "inkgrammar-page-detections"
 
 
 def threshold_source(image: Image.Image) -> np.ndarray:
     """Binarize a source image into a boolean ink mask."""
-    return threshold_image(image)
+    return rr.foreground_mask(image, mode="grayscale").mask
 
 
 def crop_region(image: Image.Image, bbox: tuple[int, int, int, int]) -> Image.Image:

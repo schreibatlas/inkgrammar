@@ -1,12 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
-from planarcurve.spline import (
-    evaluate_bspline,
-)
-from planarcurve.spline import (
-    spline_design_matrix as planar_spline_design_matrix,
-)
+from planarcurve.spline import evaluate_bspline
 from planarcurve.transforms import Affine2D
 
 from inkgrammar.fitting.curvature import evaluate_curvature_stroke
@@ -19,13 +14,10 @@ from inkgrammar.fitting.models import (
 )
 from inkgrammar.fitting.planarcurve_adapters import (
     from_planar_trajectory,
+    to_planar_bspline,
     to_planar_trajectory,
 )
-from inkgrammar.fitting.spline import (
-    evaluate_primitive_curve,
-    spline_design_matrix,
-    to_planar_bspline,
-)
+from inkgrammar.fitting.spline import evaluate_primitive_curve
 
 
 def test_curvature_model_adapter_preserves_schema_and_delegates_evaluation():
@@ -54,7 +46,7 @@ def test_curvature_model_adapter_preserves_schema_and_delegates_evaluation():
     assert round_trip == geometry
 
 
-def test_spline_adapter_uses_planarcurve_design_and_evaluation():
+def test_spline_model_adapter_uses_planarcurve_evaluation():
     spline = BSplineGeometry(
         knots=[0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
         control_points=[(0.0, 0.0), (1.0, 1.8), (2.3, 2.2), (4.0, 0.0)],
@@ -79,62 +71,21 @@ def test_spline_adapter_uses_planarcurve_design_and_evaluation():
     np.testing.assert_allclose(adapted.xy, direct.xy)
     np.testing.assert_allclose(adapted.tangent, direct.tangent)
     np.testing.assert_allclose(adapted.curvature, direct.curvature)
-    np.testing.assert_allclose(
-        spline_design_matrix(u, spline).toarray(),
-        planar_spline_design_matrix(u, to_planar_bspline(spline)).toarray(),
-    )
 
 
-def test_svg_geometry_adapter_preserves_subpaths_curves_and_closure():
-    import pytest
-    from planarcurve.svg import analyze_path as planar_analyze_path
-    from planarcurve.svg import sample_path as planar_sample_path
+def test_model_transform_adapter_preserves_inkgrammar_transform_order():
+    from planarcurve.svg import transform_path
 
-    from inkgrammar.geometry import analyze_path, sample_path
-
-    path = "M 0 0 Q 1 2 2 0 C 2 0 3 0 3 1 Z M 5 5 L 6 5"
-    info = analyze_path(path, samples_per_curve=8)
-    direct = planar_analyze_path(path, samples_per_curve=8)
-
-    assert info == direct
-    assert info.subpath_closed == (True, False)
-    assert info.closed is False
-    with pytest.raises(ValueError, match="multiple subpaths"):
-        sample_path(path, samples_per_curve=8)
-
-    single_path = "M 0 0 Q 1 2 2 0 C 2 0 3 0 3 1 Z"
-    np.testing.assert_allclose(
-        sample_path(single_path, samples_per_curve=8),
-        planar_sample_path(single_path, samples_per_curve=8),
-    )
-
-
-def test_svg_geometry_adapter_delegates_transforms_and_path_helpers():
-    from planarcurve.svg import cubic_bridge as planar_cubic_bridge
-    from planarcurve.svg import path_without_initial_move as planar_path_without_initial_move
-    from planarcurve.svg import transform_path as planar_transform_path
-
-    from inkgrammar.geometry import (
-        cubic_bridge,
-        path_without_initial_move,
-        transform_path,
-        translate_path,
-    )
     from inkgrammar.models import Transform
+    from inkgrammar.svg_adapters import to_planar_affine, transform_svg_path
 
     path = "M 1 2 Q 2 3 4 5 Z"
     transform = Transform(scale_x=1.2, scale_y=0.8, shear_x=0.15, dx=3.0, dy=-2.0)
     affine = Affine2D(1.2, 0.15 * 0.8, 0.0, 0.8, 3.0, -2.0)
 
-    assert transform_path(path, transform) == planar_transform_path(path, affine)
-    assert transform_path(path, transform).endswith("Z")
-    assert translate_path(path, 2.0, -4.0) == planar_transform_path(
-        path, Affine2D.translation_only(2.0, -4.0)
-    )
-    assert path_without_initial_move(path) == planar_path_without_initial_move(path)
-    assert cubic_bridge((0, 0), (1, 0), (3, 2), (0, 1), 0.5) == planar_cubic_bridge(
-        (0, 0), (1, 0), (3, 2), (0, 1), 0.5
-    )
+    assert to_planar_affine(transform) == affine
+    assert transform_svg_path(path, transform) == transform_path(path, affine)
+    assert transform_svg_path(path, transform).endswith("Z")
 
 
 def test_fitting_polyline_helpers_delegate_to_planarcurve():

@@ -7,6 +7,8 @@ import numpy as np
 import yaml
 from fontTools.pens.recordingPen import RecordingPen
 from fontTools.svgLib.path import parse_path
+from planarcurve.svg import analyze_path, path_without_initial_move, sample_path, transform_path
+from planarcurve.transforms import Affine2D
 
 from .fitting.family_fit import load_fit_reports, primitive_path
 from .fitting.models import (
@@ -17,16 +19,7 @@ from .fitting.models import (
     TopologyTransform,
 )
 from .fitting.workspace import FitProjectBundle
-from .geometry import (
-    analyze_path,
-    path_without_initial_move,
-    sample_path,
-    transform_path,
-    translate_path,
-)
-from .models import (
-    ConnectionClass as RuntimeConnectionClass,
-)
+from .models import ConnectionClass as RuntimeConnectionClass
 from .models import (
     ConnectionRule,
     GlyphForm,
@@ -45,6 +38,7 @@ from .models import (
     WritingModelV3,
 )
 from .raster import scale_sanity
+from .svg_adapters import transform_svg_path
 
 
 def _validate_units(value: float, name: str) -> None:
@@ -156,7 +150,7 @@ def _compile_strokes(
                 if instances is None
                 else _occurrence_transform(instances[occurrence.instance])
             )
-            path = transform_path(
+            path = transform_svg_path(
                 primitive_path(template, transform),
                 Transform(scale_x=coordinate_scale, scale_y=coordinate_scale),
             )
@@ -166,8 +160,11 @@ def _compile_strokes(
                 current_end = None
             if current_parts:
                 assert current_end is not None
-                path = translate_path(
-                    path, current_end[0] - info.start[0], current_end[1] - info.start[1]
+                path = transform_path(
+                    path,
+                    Affine2D.translation_only(
+                        current_end[0] - info.start[0], current_end[1] - info.start[1]
+                    ),
                 )
             current_parts.append(path if not current_parts else path_without_initial_move(path))
             instance_paths[occurrence.instance] = path

@@ -5,8 +5,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
-
-from inkgrammar.raster import threshold_image
+from rasterregions import foreground_mask
 
 
 def connected_ink(mask):
@@ -51,7 +50,7 @@ def main():
             continue
         path = Path("work/sas-1968/observations") / item["crop_locator"].split(":", 1)[1]
         with Image.open(path) as image:
-            components = ink_components(threshold_image(image))
+            components = ink_components(foreground_mask(image, mode="grayscale").mask)
         rows.append(
             {
                 "character": item["label"],

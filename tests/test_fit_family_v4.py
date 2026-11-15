@@ -1,6 +1,13 @@
 import numpy as np
 import pytest
-from skeletonpaths import PathRankingPolicy, PathSearchLimits
+from skeletonpaths import (
+    PathRankingPolicy,
+    PathSearchLimits,
+    SkeletonEdge,
+    SkeletonGraph,
+    SkeletonNode,
+    prepare_topology_paths,
+)
 
 from inkgrammar.fitting.family_fit_v4 import (
     MonotoneCurveCorrespondence,
@@ -27,12 +34,6 @@ from inkgrammar.fitting.models import (
     TopologyTransform,
 )
 from inkgrammar.fitting.objective import SplineCorrespondenceConfig, SplineCurveConfig
-from inkgrammar.fitting.skeleton_graph import (
-    SkeletonEdge,
-    SkeletonGraph,
-    SkeletonNode,
-    prepare_topology_paths,
-)
 from inkgrammar.fitting.spline import sample_curve_by_arclength
 
 

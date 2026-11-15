@@ -8,9 +8,10 @@ from fontTools.feaLib.builder import addOpenTypeFeaturesFromString
 from fontTools.fontBuilder import FontBuilder
 from fontTools.pens.ttGlyphPen import TTGlyphPen
 from fontTools.ttLib import TTFont
+from strokeoutline import OutlineConfig
 
 from ..models import WritingModelV3
-from ..outline import OutlineConfig, expand_shaped_text
+from ..outline import expand_shaped_text
 from ..shaping import ShapedText, shape_glyph
 from .features import generate_feature_source
 from .models import (
@@ -63,6 +64,7 @@ def create_font_plan(
     outline_config = OutlineConfig(
         max_centerline_error=config.quadratic_error,
         max_width_error=config.quadratic_error,
+        cap="round",
     )
 
     characters = sorted(model.glyphs, key=lambda character: ord(character[0]))

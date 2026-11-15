@@ -239,7 +239,7 @@ def _angle_difference(first: float, second: float) -> float:
 
 
 def _curvature_loss(paths: Sequence[str]) -> float:
-    from ..geometry import sample_path
+    from planarcurve.svg import sample_path
 
     terms = []
     for path in paths:

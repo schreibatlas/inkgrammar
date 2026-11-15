@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Literal
 
-from .geometry import analyze_path
+from planarcurve.svg import analyze_path
+
 from .model import compile_glyph
 from .models import (
     ComponentPart,
