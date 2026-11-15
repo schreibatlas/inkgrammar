@@ -46,6 +46,31 @@ def test_layout_aware_page_extraction(tmp_path):
     assert (output / "detections.json").is_file()
 
 
+def test_labeled_rows_partition_inside_declared_roi(tmp_path):
+    image = Image.new("RGB", (260, 150), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((25, 20, 49, 49), fill="black")
+    draw.rectangle((155, 20, 179, 49), fill="black")
+    draw.rectangle((25, 100, 49, 129), fill="black")
+    draw.rectangle((155, 100, 179, 129), fill="black")
+    source = tmp_path / "page.png"
+    image.save(source)
+    layout = PageLayout(
+        schema_version=1,
+        id="roi-layout",
+        rows=[LayoutRow(id="upper", y=(0.05, 0.55), x=(0.05, 0.85), labels=["a", "b"])],
+    )
+
+    manifest = extract_labeled_page(source, layout, tmp_path / "out")
+    boxes = [item["bbox"] for item in manifest["detections"]]
+    roi = (round(0.05 * 260), round(0.05 * 150), round(0.85 * 260), round(0.55 * 150))
+
+    assert len(boxes) == 2
+    assert all(roi[0] <= x0 < x1 <= roi[2] for x0, _, x1, _ in boxes)
+    assert all(roi[1] <= y0 < y1 <= roi[3] for _, y0, _, y1 in boxes)
+    assert all(y1 < 80 for _, _, _, y1 in boxes)
+
+
 def test_region_layout_extraction(tmp_path):
     image = Image.new("RGB", (200, 100), "white")
     draw = ImageDraw.Draw(image)

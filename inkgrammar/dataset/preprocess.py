@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
+import rasterregions as rr
 from PIL import Image
 from pydantic import Field
 
@@ -66,45 +67,27 @@ def isolate_target_ink(
     center: tuple[float, float],
     neighbor_centers: tuple[tuple[float, float], ...] = (),
 ) -> tuple[np.ndarray, IsolationProposal]:
-    """Propose the target ink as the connected component nearest ``center``.
-
-    The center is the reviewed layout center; the proposal is only a
-    candidate. Components that sit closer to a neighboring label center
-    likely belong to the neighbor (cursive letters touch), and all rejected
-    components are recorded with their reason so review can accept or
-    override the isolation.
-    """
-    components = label_components(mask)
-    if not components:
-        return mask.copy(), IsolationProposal(center=center)
-
-    def min_distance_squared(component: tuple[np.ndarray, np.ndarray], point) -> float:
-        ys, xs = component
-        return float(((ys - point[1]) ** 2 + (xs - point[0]) ** 2).min())
-
-    kept_component = min(components, key=lambda c: min_distance_squared(c, center))
-    candidate = np.zeros(mask.shape, dtype=bool)
-    records = []
-    for ys, xs in components:
-        is_kept = ys is kept_component[0] and xs is kept_component[1]
-        reason = "nearest-to-reviewed-center"
-        if is_kept:
-            candidate[ys, xs] = True
-        elif neighbor_centers and min(
-            min_distance_squared((ys, xs), neighbor) for neighbor in neighbor_centers
-        ) < min_distance_squared((ys, xs), center):
-            reason = "nearest-to-neighbor-center"
-        else:
-            reason = "not-nearest-component"
-        records.append(
-            IsolationComponent(
-                bbox=(int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1),
-                area=int(ys.size),
-                kept=is_kept,
-                reason=reason,
-            )
+    """Adapt generic component isolation to the reviewed dataset proposal model."""
+    result = rr.isolate_component(
+        mask,
+        center=center,
+        competing_centers=neighbor_centers,
+    )
+    reason_map = {
+        "nearest-to-center": "nearest-to-reviewed-center",
+        "nearest-to-competing-center": "nearest-to-neighbor-center",
+        "not-nearest-component": "not-nearest-component",
+    }
+    records = [
+        IsolationComponent(
+            bbox=candidate.bbox.as_tuple(),
+            area=candidate.area,
+            kept=candidate.kept,
+            reason=reason_map[candidate.reason],
         )
-    return candidate, IsolationProposal(center=center, components=records)
+        for candidate in result.candidates
+    ]
+    return result.mask.copy(), IsolationProposal(center=center, components=records)
 
 
 @dataclass(frozen=True)
@@ -136,28 +119,8 @@ def threshold_mask(gray: np.ndarray) -> np.ndarray:
 
 
 def label_components(mask: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Label 8-connected ink components as (ys, xs) index arrays."""
-    visited = np.zeros(mask.shape, dtype=bool)
-    height, width = mask.shape
-    components = []
-    for start_y, start_x in zip(*np.nonzero(mask), strict=True):
-        if visited[start_y, start_x]:
-            continue
-        visited[start_y, start_x] = True
-        stack = [(start_y, start_x)]
-        ys = []
-        xs = []
-        while stack:
-            y, x = stack.pop()
-            ys.append(y)
-            xs.append(x)
-            for ny in range(max(0, y - 1), min(height, y + 2)):
-                for nx in range(max(0, x - 1), min(width, x + 2)):
-                    if mask[ny, nx] and not visited[ny, nx]:
-                        visited[ny, nx] = True
-                        stack.append((ny, nx))
-        components.append((np.asarray(ys), np.asarray(xs)))
-    return components
+    """Label 8-connected ink components as writable ``(ys, xs)`` arrays."""
+    return [(component.ys.copy(), component.xs.copy()) for component in rr.components(mask)]
 
 
 def detect_speck_candidates(mask: np.ndarray, *, min_area: int) -> list[RemovedComponent]:

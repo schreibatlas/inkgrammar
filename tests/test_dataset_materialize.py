@@ -439,6 +439,30 @@ def test_isolate_target_ink_picks_component_nearest_center():
     assert proposal.components[0].reason == "not-nearest-component"
 
 
+def test_isolate_target_ink_maps_rasterregions_reasons() -> None:
+    import numpy as np
+
+    from inkgrammar.dataset.preprocess import isolate_target_ink
+
+    mask = np.zeros((12, 40), dtype=bool)
+    mask[4:7, 0:3] = True
+    mask[4:7, 14:17] = True
+    mask[4:7, 29:32] = True
+
+    _, proposal = isolate_target_ink(
+        mask,
+        center=(15.0, 5.0),
+        neighbor_centers=((30.0, 5.0),),
+    )
+    reasons = {component.bbox[0]: component.reason for component in proposal.components}
+
+    assert reasons == {
+        0: "not-nearest-component",
+        14: "nearest-to-reviewed-center",
+        29: "nearest-to-neighbor-center",
+    }
+
+
 def test_materialize_labeled_rows_get_isolation_frame_and_dot_exclusion(tmp_path):
     from inkgrammar.dataset.materialize import materialize_dataset
 

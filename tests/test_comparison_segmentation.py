@@ -15,17 +15,40 @@ from inkgrammar.comparison.segmentation import (
 
 def _draw_shape(draw: ImageDraw.ImageDraw, x: int, y: int, kind: str) -> None:
     if kind == "e":
-        draw.line([(x, y + 14), (x + 18, y + 14), (x + 20, y + 9), (x + 17, y + 4),
-                   (x + 10, y + 2), (x + 4, y + 5), (x + 1, y + 12), (x + 3, y + 20),
-                   (x + 9, y + 25), (x + 17, y + 24)], fill="black", width=4)
+        draw.line(
+            [
+                (x, y + 14),
+                (x + 18, y + 14),
+                (x + 20, y + 9),
+                (x + 17, y + 4),
+                (x + 10, y + 2),
+                (x + 4, y + 5),
+                (x + 1, y + 12),
+                (x + 3, y + 20),
+                (x + 9, y + 25),
+                (x + 17, y + 24),
+            ],
+            fill="black",
+            width=4,
+        )
     elif kind == "l":
         draw.line((x + 8, y, x + 8, y + 26), fill="black", width=4)
     elif kind == "i":
         draw.line((x + 8, y + 9, x + 8, y + 26), fill="black", width=4)
         draw.ellipse((x + 6, y, x + 10, y + 4), fill="black")
     elif kind == "n":
-        draw.line([(x, y + 26), (x, y + 5), (x + 6, y + 2), (x + 15, y + 4),
-                   (x + 19, y + 10), (x + 19, y + 26)], fill="black", width=4)
+        draw.line(
+            [
+                (x, y + 26),
+                (x, y + 5),
+                (x + 6, y + 2),
+                (x + 15, y + 4),
+                (x + 19, y + 10),
+                (x + 19, y + 26),
+            ],
+            fill="black",
+            width=4,
+        )
 
 
 def _reference_page(path):
@@ -117,3 +140,16 @@ def test_wrong_sample_count_fails_with_segmentation_diagnostics(tmp_path):
     manifest = json.loads((output / "sample-segmentation.json").read_text())
     assert manifest["expected_count"] == 4
     assert manifest["status"] == "failed"
+
+
+def test_page_mask_adapter_preserves_inkgrammar_result_contract():
+    from inkgrammar.comparison.segmentation import extract_page_ink_mask
+
+    image = Image.new("RGB", (80, 60), "white")
+    ImageDraw.Draw(image).rectangle((20, 15, 39, 44), fill="black")
+
+    result = extract_page_ink_mask(image, mode="dark")
+
+    assert result.method == "dark"
+    assert result.mask[25, 25]
+    assert isinstance(result.warnings, list)

@@ -18,6 +18,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import rasterregions as rr
 from PIL import Image, ImageDraw
 
 from .dataset.layouts import (
@@ -30,14 +31,6 @@ from .models import PageLayout
 from .raster import threshold_image
 
 DETECTIONS_FORMAT = "inkgrammar-page-detections"
-
-
-def _smooth(values: np.ndarray, radius: int) -> np.ndarray:
-    if radius <= 0:
-        return values.astype(float)
-    kernel = np.ones(radius * 2 + 1, dtype=float)
-    kernel /= kernel.sum()
-    return np.convolve(values.astype(float), kernel, mode="same")
 
 
 def threshold_source(image: Image.Image) -> np.ndarray:
@@ -55,45 +48,8 @@ def tighten_to_ink(
     bbox: tuple[int, int, int, int],
     pad: int = 4,
 ) -> tuple[int, int, int, int]:
-    """Shrink a pixel-space bounding box to the ink inside it."""
-    x0, y0, x1, y1 = bbox
-    crop = mask[y0:y1, x0:x1]
-    ys, xs = np.nonzero(crop)
-    if len(xs) == 0:
-        return bbox
-    left = max(x0, x0 + int(xs.min()) - pad)
-    right = min(x1, x0 + int(xs.max()) + pad + 1)
-    top = max(y0, y0 + int(ys.min()) - pad)
-    bottom = min(y1, y0 + int(ys.max()) + pad + 1)
-    return (left, top, right, bottom)
-
-
-def segment_row(projection: np.ndarray, count: int) -> list[int]:
-    """Split a row ink projection into ``count`` cells by low-ink boundaries."""
-    if count <= 1:
-        return [0, len(projection)]
-    width = len(projection)
-    smoothed = _smooth(projection, max(1, width // 600))
-    boundaries = [0]
-
-    for index in range(1, count):
-        expected = width * index / count
-        half_window = max(4, int(width / count * 0.38))
-        lo = max(boundaries[-1] + 2, int(expected - half_window))
-        hi = min(width - (count - index) * 2, int(expected + half_window))
-        if hi <= lo:
-            cut = int(expected)
-        else:
-            positions = np.arange(lo, hi)
-            local = smoothed[lo:hi]
-            local_scale = float(np.percentile(local, 85)) + 1e-9
-            ink_cost = local / local_scale
-            distance_cost = np.abs(positions - expected) / max(1.0, half_window)
-            score = ink_cost + 0.45 * distance_cost
-            cut = lo + int(np.argmin(score))
-        boundaries.append(cut)
-    boundaries.append(width)
-    return boundaries
+    """Shrink a pixel-space bbox to ink using rasterregions' containment contract."""
+    return rr.tighten_bbox(mask, rr.BBox(*bbox), pad=pad).as_tuple()
 
 
 def render_review(
@@ -145,7 +101,7 @@ def extract_labeled_page(
     (output_dir / "crops").mkdir(exist_ok=True)
 
     image, mask, width, height = _load_source(image_path)
-
+    segmentation_source = np.where(mask, 0, 255).astype(np.uint8)
     detections = []
     review_boxes = []
 
@@ -164,16 +120,45 @@ def extract_labeled_page(
             )
             absolute_boundaries.append(row_x1)
             boundaries = [value - row_x0 for value in absolute_boundaries]
+            boxes = [
+                tighten_to_ink(
+                    mask,
+                    (
+                        row_x0 + boundaries[index],
+                        row_y0,
+                        row_x0 + boundaries[index + 1],
+                        row_y1,
+                    ),
+                )
+                for index in range(len(row.labels))
+            ]
         else:
-            boundaries = segment_row(projection, len(row.labels))
+            detection = rr.detect_regions(
+                segmentation_source,
+                expected_count=len(row.labels),
+                expected_count_scope="row",
+                mode="dark",
+                padding=4,
+                roi=rr.BBox(row_x0, row_y0, row_x1, row_y1),
+            )
+            if detection.status != "ok":
+                raise ValueError(
+                    f"Unable to segment {len(row.labels)} regions in layout row {row.id}."
+                )
+            boxes = [region.bbox.as_tuple() for region in detection.regions]
+            partition_boundaries = (
+                detection.diagnostics.partition_boundaries
+                if detection.diagnostics is not None
+                else ()
+            )
+            boundaries = [
+                0,
+                *(item.x - row_x0 for item in partition_boundaries),
+                row_x1 - row_x0,
+            ]
 
         for index, label in enumerate(row.labels):
-            raw_x0 = row_x0 + boundaries[index]
-            raw_x1 = row_x0 + boundaries[index + 1]
-            bbox = tighten_to_ink(
-                mask,
-                (raw_x0, row_y0, raw_x1, row_y1),
-            )
+            bbox = boxes[index]
             x0, y0, x1, y1 = bbox
             crop = crop_region(image, bbox)
 
