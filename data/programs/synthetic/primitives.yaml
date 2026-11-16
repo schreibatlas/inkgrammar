@@ -1,0 +1,62 @@
+id: synthetic-lowercase-a-primitives
+primitives:
+  synthetic-entry:
+    id: synthetic-entry
+    kind: curvature-profile
+    frame:
+      start: [0.0, 0.0]
+      nominal_end: [0.25, 0.0]
+    curvature_stroke:
+      length: 0.25
+      start_angle_deg: 0.0
+      curvature:
+        interpolation: cubic-hermite
+        start_rate_deg: 0.0
+        changes: []
+        end_rate_deg: 35.0
+  synthetic-bowl:
+    id: synthetic-bowl
+    kind: curvature-profile
+    frame:
+      start: [0.0, 0.0]
+      nominal_end: [0.8, 0.0]
+    curvature_stroke:
+      length: 0.8
+      start_angle_deg: 0.0
+      curvature:
+        interpolation: cubic-hermite
+        start_rate_deg: 0.0
+        changes:
+          - at: 0.5
+            rate_deg: -340.0
+        end_rate_deg: 0.0
+  synthetic-stem:
+    id: synthetic-stem
+    kind: curvature-profile
+    frame:
+      start: [0.0, 0.0]
+      nominal_end: [0.8, 0.0]
+    curvature_stroke:
+      length: 0.8
+      start_angle_deg: 0.0
+      curvature:
+        interpolation: cubic-hermite
+        start_rate_deg: 0.0
+        changes:
+          - at: 0.5
+            rate_deg: 80.0
+        end_rate_deg: 0.0
+  synthetic-exit:
+    id: synthetic-exit
+    kind: curvature-profile
+    frame:
+      start: [0.0, 0.0]
+      nominal_end: [0.25, 0.0]
+    curvature_stroke:
+      length: 0.25
+      start_angle_deg: 0.0
+      curvature:
+        interpolation: cubic-hermite
+        start_rate_deg: 0.0
+        changes: []
+        end_rate_deg: -20.0

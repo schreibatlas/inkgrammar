@@ -1,0 +1,152 @@
+format: inkgrammar-directed-glyph
+format_version: 1
+id: synthetic-lowercase-a-v1
+character: a
+variant: synthetic
+entry_landmark: start
+exit_landmark: end
+landmarks:
+  start:
+    id: start
+    kind: start
+  entry-turn:
+    id: entry-turn
+    kind: turn
+  bowl-stem-contact:
+    id: bowl-stem-contact
+    kind: contact
+  baseline-turn:
+    id: baseline-turn
+    kind: turn
+  end:
+    id: end
+    kind: end
+movements:
+  entry:
+    id: entry
+    primitive: synthetic-entry
+    direction: forward
+    from_landmark: start
+    to_landmark: entry-turn
+    role: entry
+    attach: false
+  bowl:
+    id: bowl
+    primitive: synthetic-bowl
+    direction: forward
+    from_landmark: entry-turn
+    to_landmark: bowl-stem-contact
+    role: body
+    attach: true
+  stem:
+    id: stem
+    primitive: synthetic-stem
+    direction: forward
+    from_landmark: bowl-stem-contact
+    to_landmark: baseline-turn
+    role: stem
+    attach: true
+  exit:
+    id: exit
+    primitive: synthetic-exit
+    direction: forward
+    from_landmark: baseline-turn
+    to_landmark: end
+    role: exit
+    attach: true
+strokes:
+  - id: main
+    movements: [entry, bowl, stem, exit]
+contacts:
+  - id: bowl-stem
+    first_movement: bowl
+    first_u: 0.9
+    second_movement: stem
+    second_u: 0.1
+    mode: must-touch
+    tolerance: 0.04
+constraints:
+  - id: preserve-bowl-stem-contact
+    kind: contact
+    contact_id: bowl-stem
+    hard: false
+    weight: 1.0
+  - id: writing-order
+    kind: ordering
+    before_movement: entry
+    after_movement: exit
+    hard: true
+parameters:
+  - id: alignment-scale
+    target: alignment.scale
+    category: global-alignment
+    initial: 1.0
+    lower: 0.5
+    upper: 2.0
+    prior_mean: 1.0
+    prior_sigma: 0.25
+  - id: alignment-rotation
+    target: alignment.rotation
+    category: global-alignment
+    initial: 0.0
+    lower: -20.0
+    upper: 20.0
+    prior_mean: 0.0
+    prior_sigma: 5.0
+  - id: alignment-translation-x
+    target: alignment.translation.x
+    category: global-alignment
+    initial: 0.0
+    lower: -0.5
+    upper: 0.5
+  - id: alignment-translation-y
+    target: alignment.translation.y
+    category: global-alignment
+    initial: 0.0
+    lower: -0.5
+    upper: 0.5
+  - id: entry-length
+    target: movement.entry.length
+    category: movement-geometry
+    initial: 0.25
+    lower: 0.1
+    upper: 0.5
+    shared_group: terminal-length
+  - id: exit-length
+    target: movement.exit.length
+    category: movement-geometry
+    initial: 0.25
+    lower: 0.1
+    upper: 0.5
+    shared_group: terminal-length
+  - id: bowl-length
+    target: movement.bowl.length
+    category: movement-geometry
+    initial: 0.8
+    lower: 0.5
+    upper: 1.2
+  - id: stem-angle
+    target: movement.stem.start_angle
+    category: movement-geometry
+    initial: 0.0
+    lower: -20.0
+    upper: 20.0
+  - id: slant
+    target: style.slant
+    category: style-shared
+    initial: 0.0
+    lower: -20.0
+    upper: 20.0
+  - id: stroke-width
+    target: style.stroke_width
+    category: width
+    initial: 0.12
+    lower: 0.06
+    upper: 0.24
+    prior_mean: 0.12
+    prior_sigma: 0.03
+provenance:
+  construction: synthetic
+  trajectory: synthetic
+  sources: []
+  notes: Synthetic engineering program, not a historical claim about SAS writing order.
