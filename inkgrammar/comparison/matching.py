@@ -151,6 +151,7 @@ def refine_match(
     reference: SegmentedGlyph,
     coarse_score: MatchScore,
     *,
+    sample_extracted: ExtractedLetter | None = None,
     reference_extracted: ExtractedLetter | None = None,
 ) -> MatchScore:
     """Add optional ordered-path geometry evidence without rejecting raster matches."""
@@ -164,9 +165,17 @@ def refine_match(
             reference_xy = reference_extracted.resampled_xy
             if reference_path is None or reference_xy is None:
                 return replace(coarse_score, refined_cost=coarse_score.coarse_cost)
-        sample_diagnostics = analyze_skeleton(sample.mask)
-        sample_path = recover_ordered_path(sample_diagnostics)
-        sample_xy = resample_path(sample_path.xy)
+
+        if sample_extracted is None:
+            sample_diagnostics = analyze_skeleton(sample.mask)
+            sample_path = recover_ordered_path(sample_diagnostics)
+            sample_xy = resample_path(sample_path.xy)
+        else:
+            sample_path = sample_extracted.ordered_path
+            sample_xy = sample_extracted.resampled_xy
+            if sample_path is None or sample_xy is None:
+                return replace(coarse_score, refined_cost=coarse_score.coarse_cost)
+
         alignment = align_ordered_paths(reference_xy, sample_xy)
         reference_geometry = differential_geometry(reference_xy)
         sample_geometry = differential_geometry(alignment.aligned_sample_xy)
@@ -218,9 +227,10 @@ def refine_top_k_matches(
     gallery: ReferenceGallery,
     ranked: list[MatchScore],
     *,
+    sample_extracted: ExtractedLetter | None = None,
     reference_extractions: Mapping[str, ExtractedLetter] | None = None,
 ) -> list[MatchScore]:
-    """Refine only the supplied coarse top-K candidates and rerank them."""
+    """Refine coarse top-K candidates with prepared sample and reference paths."""
     candidates = {candidate.glyph_id: candidate for candidate in gallery.candidates}
     refined = []
     for score in ranked:
@@ -232,7 +242,15 @@ def refine_top_k_matches(
             if reference_extractions is not None
             else None
         )
-        refined.append(refine_match(sample, candidate, score, reference_extracted=extracted))
+        refined.append(
+            refine_match(
+                sample,
+                candidate,
+                score,
+                sample_extracted=sample_extracted,
+                reference_extracted=extracted,
+            )
+        )
     refined.sort(key=lambda score: (score.cost, score.reference_id))
     return [replace(score, rank=rank) for rank, score in enumerate(refined, start=1)]
 

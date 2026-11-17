@@ -3,7 +3,12 @@
 from rasterregions import MaskMode, MaskResult
 from rasterregions import foreground_mask as extract_ink_mask
 
-from .api import compare_extracted_letters, compare_letter_images, extract_letter
+from .api import (
+    compare_extracted_letters,
+    compare_letter_images,
+    extract_letter,
+    extract_segmented_glyph,
+)
 from .batch import compare_letter_page
 from .batch_report import BatchComparisonReport, BatchSampleResult
 from .crop import coerce_crop_rect, crop_image, load_crop
@@ -44,6 +49,8 @@ from .report import WrittenComparisonReport, write_comparison_report
 from .segmentation import (
     PageSegmentation,
     ReferenceGallery,
+    ReferenceRowDiagnostic,
+    ReferenceSheetProfile,
     RowBand,
     SegmentationError,
     SegmentedGlyph,
@@ -65,6 +72,7 @@ __all__ = [
     "DifferentialGeometry",
     "ExtractedLetter",
     "extract_letter",
+    "extract_segmented_glyph",
     "InkMaskResult",
     "InkMode",
     "MaskMode",
@@ -89,6 +97,8 @@ __all__ = [
     "write_comparison_report",
     "PageSegmentation",
     "ReferenceGallery",
+    "ReferenceRowDiagnostic",
+    "ReferenceSheetProfile",
     "RowBand",
     "SegmentationError",
     "SegmentedGlyph",

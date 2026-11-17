@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
-from rasterregions import MaskMode, foreground_mask
+from rasterregions import MaskMode, MaskResult, foreground_mask
 
 from .crop import coerce_crop_rect, load_crop
 from .models import (
@@ -19,6 +19,7 @@ from .path import (
     resample_path,
 )
 from .report import WrittenComparisonReport, write_comparison_report
+from .segmentation import SegmentedGlyph
 from .skeleton import analyze_skeleton
 
 
@@ -46,6 +47,36 @@ def extract_letter(
         crop=crop_rect,
         image=image,
         mask_result=mask_result,
+        diagnostics=diagnostics,
+        ordered_path=ordered_path,
+        resampled_xy=resample_path(ordered_path.xy) if ordered_path is not None else None,
+    )
+
+
+def extract_segmented_glyph(
+    candidate: SegmentedGlyph,
+    *,
+    source_path: str | Path,
+    allow_path_failure: bool = True,
+) -> ExtractedLetter:
+    """Analyze a segmented candidate without reloading or thresholding its source crop."""
+    diagnostics = analyze_skeleton(candidate.mask)
+    try:
+        ordered_path = recover_ordered_path(diagnostics)
+    except PathExtractionError:
+        if not allow_path_failure:
+            raise
+        ordered_path = None
+    return ExtractedLetter(
+        source_path=Path(source_path),
+        crop=candidate.bbox,
+        image=candidate.image.copy(),
+        mask_result=MaskResult(
+            mask=candidate.mask,
+            confidence=candidate.segmentation_confidence,
+            method=candidate.mask_method,
+            warnings=candidate.warnings,
+        ),
         diagnostics=diagnostics,
         ordered_path=ordered_path,
         resampled_xy=resample_path(ordered_path.xy) if ordered_path is not None else None,

@@ -61,6 +61,26 @@ def compare_letter_command(
         "--letters",
         help="Automatically match exactly N visibly separated standalone glyphs.",
     ),  # noqa: B008
+    top_k: int | None = typer.Option(
+        None,
+        "--top-k",
+        min=1,
+        help="Number of ranked reference candidates to refine (automatic mode; default: 5).",
+    ),  # noqa: B008
+    reference_profile: str | None = typer.Option(
+        None,
+        "--reference-profile",
+        help="Reference row profile: alphabet (default) or generic (automatic mode).",
+    ),  # noqa: B008
+    no_progress: bool = typer.Option(
+        False, "--no-progress", help="Suppress progress output on stderr."
+    ),  # noqa: B008
+    verbose: bool = typer.Option(
+        False, "--verbose", help="Include per-candidate extraction timings."
+    ),  # noqa: B008
+    segment_only: bool = typer.Option(
+        False, "--segment-only", help="Write segmentation diagnostics without matching."
+    ),  # noqa: B008
 ) -> None:
     """Compare manual crops or automatically match a multi-glyph sample page."""
     manual_options = (letter, reference_crop, sample_crop)
@@ -77,6 +97,14 @@ def compare_letter_command(
             raise typer.BadParameter(
                 "choose --letters N or provide --letter, --reference-crop, and --sample-crop"
             )
+        if (
+            top_k is not None
+            or reference_profile is not None
+            or no_progress
+            or verbose
+            or segment_only
+        ):
+            raise typer.BadParameter("automatic-comparison options require --letters N")
         automatic = False
 
     try:
@@ -90,6 +118,11 @@ def compare_letter_command(
                 sample,
                 expected_letters=letters,
                 output_dir=output,
+                top_k=5 if top_k is None else top_k,
+                reference_profile="alphabet" if reference_profile is None else reference_profile,
+                no_progress=no_progress,
+                verbose=verbose,
+                segment_only=segment_only,
             )
         else:
             from .comparison.api import compare_letter_images
@@ -115,13 +148,16 @@ def compare_letter_command(
         raise typer.BadParameter(str(exc)) from exc
 
     if automatic:
-        typer.echo(f"HTML summary: {report.html_path}")
-        typer.echo(f"Markdown summary: {report.markdown_path}")
-        typer.echo(f"JSON summary: {report.json_path}")
+        if segment_only:
+            typer.echo(f"HTML diagnostics: {output / 'index.html'}")
+            typer.echo(f"JSON summary: {output / 'summary.json'}")
+        else:
+            typer.echo(f"HTML summary: {report.html_path}")
+            typer.echo(f"Markdown summary: {report.markdown_path}")
+            typer.echo(f"JSON summary: {report.json_path}")
     else:
         typer.echo(f"HTML report: {report.html_path}")
         typer.echo(f"JSON report: {report.json_path}")
-
 
 @page_app.command("extract")
 def page_extract(

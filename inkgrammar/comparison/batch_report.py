@@ -26,6 +26,8 @@ class BatchSampleResult:
     reference_id: str
     reference_label: str | None
     status: str
+    segmentation_status: str
+    segmentation_warnings: tuple[str, ...]
     score: MatchScore
     alternatives: tuple[MatchScore, ...]
     report_dir: Path
@@ -75,6 +77,9 @@ def _sample_payload(result: BatchSampleResult, output_dir: Path) -> dict[str, An
         "reference_id": result.reference_id,
         "reference_label": result.reference_label,
         "status": result.status,
+        "match_status": result.status,
+        "segmentation_status": result.segmentation_status,
+        "segmentation_warnings": list(result.segmentation_warnings),
         "cost": result.score.cost,
         "alternatives": [match_score_payload(score) for score in result.alternatives],
         "report_dir": result.report_dir.relative_to(output_dir).as_posix(),
@@ -99,9 +104,16 @@ def write_batch_report(
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
     samples = [_sample_payload(result, root) for result in results]
-    ambiguous_count = sum(item["status"] == "ambiguous" for item in samples)
+    match_ambiguous_count = sum(item["status"] == "ambiguous" for item in samples)
+    segmentation_ambiguous_count = sum(
+        item["segmentation_status"] == "ambiguous" for item in samples
+    )
     payload: dict[str, Any] = {
-        "status": "ambiguous" if ambiguous_count else "ok",
+        "status": (
+            "ambiguous"
+            if match_ambiguous_count or segmentation_ambiguous_count
+            else "ok"
+        ),
         "reference": {
             "path": Path(reference_path).name,
             "sha256": reference_sha256,
@@ -111,7 +123,9 @@ def write_batch_report(
             "expected_count": expected_count,
             "detected_count": len(samples),
         },
-        "ambiguous_count": ambiguous_count,
+        "ambiguous_count": match_ambiguous_count,
+        "match_ambiguous_count": match_ambiguous_count,
+        "segmentation_ambiguous_count": segmentation_ambiguous_count,
         "reference_cache": {"hit": reference_cache_hit, "key": reference_sha256},
         "matching": {
             "cost_interpretation": "lower retrieval cost ranks ahead; it is not a probability",
@@ -137,17 +151,18 @@ def write_batch_report(
         "",
         f"Reference: `{Path(reference_path).name}`",
         f"Sample: `{Path(sample_path).name}` ({expected_count} glyphs requested)",
-        f"Status: **{payload['status']}**. Ambiguous matches: {ambiguous_count}.",
+        f"Status: **{payload['status']}**. Match ambiguities: {match_ambiguous_count}. "
+        f"Segmentation-ambiguous samples: {segmentation_ambiguous_count}.",
         "Retrieval costs rank candidates and are not correctness probabilities.",
         "",
-        "| Sample | Best reference | Status | Cost | Pair report |",
-        "|---|---|---:|---:|---|",
+        "| Sample | Best reference | Match status | Segmentation status | Cost | Pair report |",
+        "|---|---|---:|---:|---:|---|",
     ]
     for item in samples:
         markdown.append(
             f"| {item['sample_id']} | {item['reference_id']} | {item['status']} "
-            f"| {item['cost']:.4f} | [{item['report_dir']}/report.html]"
-            f"({item['report_dir']}/report.html) |"
+            f"| {item['segmentation_status']} | {item['cost']:.4f} "
+            f"| [{item['report_dir']}/report.html]({item['report_dir']}/report.html) |"
         )
     markdown.extend(["", "## Ranked alternatives", ""])
     for item in samples:
@@ -179,6 +194,7 @@ def write_batch_report(
             f'alt="{html.escape(item["reference_id"])}"></a><br>'
             f"{html.escape(item['reference_id'])}</td>"
             f"<td>{html.escape(item['status'])}</td>"
+            f"<td>{html.escape(item['segmentation_status'])}</td>"
             f"<td>{item['cost']:.4f}</td>"
             f'<td><a href="{report_link}">pair report</a></td>'
             f'<td><a href="{alternatives_link}"><img src="{alternatives_link}" '
@@ -196,8 +212,10 @@ def write_batch_report(
             f"<p>Reference: {html.escape(Path(reference_path).name)}</p>",
             f"<p>Sample: {html.escape(Path(sample_path).name)}; "
             f"{expected_count} glyphs requested; status {payload['status']}.</p>",
-            f"<p>Ambiguous matches: {ambiguous_count}</p>",
-            "<table><thead><tr><th>Sample</th><th>Best reference</th><th>Status</th>"
+            f"<p>Match ambiguities: {match_ambiguous_count}; "
+            f"segmentation-ambiguous samples: {segmentation_ambiguous_count}</p>",
+            "<table><thead><tr><th>Sample</th><th>Best reference</th>"
+            "<th>Match status</th><th>Segmentation status</th>"
             "<th>Cost</th><th>Report</th><th>Alternatives</th></tr></thead>",
             f"<tbody>{''.join(rows)}</tbody></table>",
             "</body></html>",

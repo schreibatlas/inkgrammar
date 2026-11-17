@@ -53,8 +53,18 @@ def _page(path, glyphs: tuple[str, ...]):
     return path
 
 
+
+
+def _reference_page(path):
+    image = Image.new("RGB", (280, 90), "white")
+    draw = ImageDraw.Draw(image)
+    for x, kind in zip((10, 55, 100, 145, 190, 235), ("e", "n", "l") * 2, strict=True):
+        _draw_glyph(draw, x, kind)
+    image.save(path)
+    return path
+
 def test_compare_letter_cli_automatic_mode_writes_batch_summary(tmp_path):
-    reference = _page(tmp_path / "reference.png", ("e", "n", "l"))
+    reference = _reference_page(tmp_path / "reference.png")
     sample = _page(tmp_path / "sample.png", ("e", "n", "l"))
     output = tmp_path / "automatic"
 
@@ -66,17 +76,32 @@ def test_compare_letter_cli_automatic_mode_writes_batch_summary(tmp_path):
             str(sample),
             "--letters",
             "3",
+            "--top-k",
+            "4",
+            "--reference-profile",
+            "generic",
+            "--verbose",
             "--output",
             str(output),
         ],
     )
 
     assert result.exit_code == 0, result.output
+    assert "[compare-letter] 01/13" in result.output
+    assert "[compare-letter] 13/13" in result.output
     assert "HTML summary:" in result.output
     assert "JSON summary:" in result.output
     summary = json.loads((output / "summary.json").read_text())
     assert summary["sample"]["detected_count"] == 3
 
+    gallery = json.loads((output / "reference-index" / "gallery.json").read_text())
+    assert gallery["reference_profile"] == "generic"
+    assert all(len(match["alternatives"]) == 3 for match in summary["matches"])
+    events = [
+        json.loads(line) for line in (output / "progress.jsonl").read_text().splitlines()
+    ]
+    extraction = [event for event in events if event["stage"] == "reference_extraction"]
+    assert extraction and all("elapsed_seconds" in event["details"] for event in extraction)
 
 def test_compare_letter_cli_reports_exact_count_diagnostics(tmp_path):
     reference = _page(tmp_path / "reference.png", ("e", "n", "l"))
@@ -126,3 +151,53 @@ def test_compare_letter_cli_rejects_missing_mixed_and_incomplete_modes(tmp_path)
     assert "cannot be combined" in mixed.output
     assert incomplete.exit_code == 2
     assert "provide --letter" in incomplete.output
+
+
+
+def test_compare_letter_help_describes_automatic_controls():
+    result = CliRunner().invoke(app, ["compare-letter", "--help"])
+
+    assert result.exit_code == 0
+    assert "exactly N visibly" in result.output
+    assert "standalone" in result.output
+    for option in (
+        "--top-k",
+        "--reference-profile",
+        "--no-progress",
+        "--verbose",
+        "--segment-only",
+    ):
+        assert option in result.output
+
+
+def test_compare_letter_cli_segment_only_honors_quiet_mode_and_profiles(tmp_path):
+    reference = _page(tmp_path / "reference.png", ("e", "n", "l"))
+    sample = _page(tmp_path / "sample.png", ("e", "n", "l"))
+    output = tmp_path / "segment-only"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "compare-letter",
+            str(reference),
+            str(sample),
+            "--letters",
+            "3",
+            "--top-k",
+            "4",
+            "--reference-profile",
+            "generic",
+            "--segment-only",
+            "--no-progress",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "[compare-letter]" not in result.output
+    assert "HTML diagnostics:" in result.output
+    summary = json.loads((output / "summary.json").read_text())
+    assert summary["operation"] == "segment-only"
+    assert summary["reference"]["reference_profile"] == "generic"
+    assert json.loads((output / "run.json").read_text())["status"] == "completed"

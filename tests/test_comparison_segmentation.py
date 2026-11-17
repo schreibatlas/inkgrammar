@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 
@@ -157,3 +158,130 @@ def test_page_mask_adapter_is_rasterregions_foreground_mask():
     assert result.method == "dark"
     assert result.mask[25, 25]
     assert isinstance(result.warnings, tuple)
+
+
+
+def _alphabet_like_page(path):
+    image = Image.new("RGB", (820, 530), "white")
+    draw = ImageDraw.Draw(image)
+    draw.line(
+        [(20, 30), (55, 15), (90, 32), (125, 15), (160, 32), (195, 15), (230, 30)],
+        fill="black",
+        width=5,
+    )
+    for x in (300, 330, 360, 390):
+        draw.line((x, 65, x + 12, 65, x + 4, 82), fill="black", width=3)
+
+    row_counts = (12, 8, 6, 11, 10, 5, 10)
+    for row_index, count in enumerate(row_counts):
+        y = 120 + row_index * 55
+        for column in range(count):
+            x = 20 + column * 58
+            width = 14 + column % 3 * 3
+            draw.rectangle((x, y, x + width, y + 25), fill="black")
+    image.save(path)
+    return path
+
+
+def test_alphabet_profile_excludes_title_and_year_and_isolates_all_glyph_rows(tmp_path):
+    path = _alphabet_like_page(tmp_path / "synthetic-alphabet.png")
+    output = tmp_path / "reference-diagnostics"
+
+    gallery = segment_reference_gallery(path, ink_mode="dark", output_dir=output)
+
+    assert [row.candidate_count for row in gallery.segmentation.rows] == [
+        1,
+        4,
+        12,
+        8,
+        6,
+        11,
+        10,
+        5,
+        10,
+    ]
+    assert [row.candidate_count for row in gallery.segmentation.rows if row.included] == [
+        12,
+        8,
+        6,
+        11,
+        10,
+        5,
+        10,
+    ]
+    assert [row.classification for row in gallery.segmentation.rows[:2]] == ["title", "metadata"]
+    assert len(gallery.candidates) == 62
+    assert [candidate.glyph_id for candidate in gallery.candidates] == [
+        f"ref-{index:03d}" for index in range(62)
+    ]
+    assert all(candidate.label is None for candidate in gallery.candidates)
+    assert all(candidate.component_indices for candidate in gallery.candidates)
+
+    source = np.asarray(Image.open(path).convert("RGB"))
+    page_masks = []
+    for candidate in gallery.candidates:
+        x0, y0 = candidate.bbox.x, candidate.bbox.y
+        crop = source[y0 : y0 + candidate.bbox.height, x0 : x0 + candidate.bbox.width]
+        candidate_image = np.asarray(candidate.image.convert("RGB"))
+        assert np.all(candidate_image[~candidate.mask] == 255)
+        assert np.array_equal(candidate_image[candidate.mask], crop[candidate.mask])
+        full_mask = np.zeros(source.shape[:2], dtype=bool)
+        full_mask[y0 : y0 + candidate.bbox.height, x0 : x0 + candidate.bbox.width] = candidate.mask
+        page_masks.append(full_mask)
+    assert all(
+        not np.any(page_masks[left] & page_masks[right])
+        for left in range(len(page_masks))
+        for right in range(left + 1, len(page_masks))
+    )
+
+    manifest = json.loads((output / "reference-candidates.json").read_text())
+    assert manifest["reference_profile"] == "alphabet"
+    assert manifest["row_count"] == 9
+    assert [row["row"] for row in manifest["excluded_rows"]] == [0, 1]
+    assert manifest["candidate_count"] == 62
+
+
+    from inkgrammar.comparison.segmentation import ReferenceSheetProfile
+
+    generic = segment_reference_gallery(path, ink_mode="dark", reference_profile="generic")
+    assert len(generic.candidates) == 67
+    assert all(row.included for row in generic.segmentation.rows)
+
+    overridden = segment_reference_gallery(
+        path,
+        ink_mode="dark",
+        reference_profile=ReferenceSheetProfile(name="alphabet", include_rows=(2, 4)),
+    )
+    assert [candidate.row_index for candidate in overridden.candidates] == [2] * 12 + [4] * 6
+    for filename in (
+        "reference-mask.png",
+        "reference-rows.png",
+        "reference-components.png",
+        "reference-candidates.png",
+        "reference-gallery.png",
+        "ref-000.png",
+        "ref-000-mask.png",
+    ):
+        assert (output / filename).is_file()
+
+
+def test_isolated_candidate_image_whitens_other_ink_in_overlapping_boxes():
+    from inkgrammar.comparison.segmentation import _isolated_candidate_image
+
+    source = Image.new("RGB", (12, 8), "white")
+    draw = ImageDraw.Draw(source)
+    draw.rectangle((4, 3, 5, 4), fill="black")
+    draw.rectangle((6, 3, 7, 4), fill="black")
+    left_crop = source.crop((0, 0, 8, 8))
+    right_crop = source.crop((4, 0, 12, 8))
+    left_mask = np.zeros((8, 8), dtype=bool)
+    right_mask = np.zeros((8, 8), dtype=bool)
+    left_mask[3:5, 4:6] = True
+    right_mask[3:5, 2:4] = True
+
+    left = np.asarray(_isolated_candidate_image(left_crop, left_mask))
+    right = np.asarray(_isolated_candidate_image(right_crop, right_mask))
+
+    assert left_crop.size == right_crop.size
+    assert not np.any(np.min(left, axis=2)[~left_mask] < 128)
+    assert not np.any(np.min(right, axis=2)[~right_mask] < 128)

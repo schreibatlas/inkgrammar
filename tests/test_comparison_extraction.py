@@ -162,3 +162,46 @@ def test_crop_to_ink_uses_rasterregions_bbox_and_preserves_empty_policy():
 
     assert np.array_equal(cropped, mask[bbox.y0 : bbox.y1, bbox.x0 : bbox.x1])
     assert crop_to_ink(np.zeros((3, 5), dtype=bool)).shape == (1, 1)
+
+
+
+def test_extract_segmented_glyph_reuses_exact_candidate_mask(tmp_path, monkeypatch):
+    from inkgrammar.comparison import api
+    from inkgrammar.comparison.segmentation import SegmentedGlyph
+
+    mask = np.zeros((24, 24), dtype=bool)
+    mask[3:21, 11:14] = True
+    image = Image.new("RGB", (24, 24), "white")
+    ImageDraw.Draw(image).rectangle((11, 3, 13, 20), fill="black")
+    candidate = SegmentedGlyph(
+        glyph_id="sample-000",
+        bbox=CropRect(x=4, y=5, width=24, height=24),
+        row_index=0,
+        column_index=0,
+        reading_order=0,
+        segmentation_confidence=0.9,
+        image=image,
+        mask=mask,
+        mask_method="dark",
+    )
+    analysis_calls = 0
+    analyze_skeleton = api.analyze_skeleton
+
+    def count_analysis(candidate_mask):
+        nonlocal analysis_calls
+        analysis_calls += 1
+        return analyze_skeleton(candidate_mask)
+
+    def fail_foreground_mask(*args, **kwargs):
+        raise AssertionError("segmented extraction must not threshold the candidate image")
+
+    monkeypatch.setattr(api, "analyze_skeleton", count_analysis)
+    monkeypatch.setattr(api, "foreground_mask", fail_foreground_mask)
+
+    extracted = api.extract_segmented_glyph(candidate, source_path=tmp_path / "sample.png")
+
+    assert analysis_calls == 1
+    assert np.array_equal(extracted.mask_result.mask, candidate.mask)
+    assert extracted.mask_result.method == "dark"
+    assert extracted.image is not candidate.image
+    assert extracted.ordered_path is not None
