@@ -143,7 +143,11 @@ def compare_letter_command(
         ) from exc
     except SegmentationError as exc:
         message = str(exc)
-        if exc.diagnostic_path is not None:
+        if (
+            automatic
+            and exc.diagnostic_path is not None
+            and str(exc.diagnostic_path) not in message
+        ):
             message += f" Diagnostics: {exc.diagnostic_path}"
         raise typer.BadParameter(message) from exc
     except (OSError, RuntimeError, TypeError, ValueError) as exc:

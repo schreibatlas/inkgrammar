@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, replace
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import rasterregions as rr
 from PIL import Image, ImageDraw
-from rasterregions import Component, MaskMethod, MaskMode, MaskResult
+from rasterregions import Component, MaskMethod, MaskMode, MaskResult, SpacedSegmentationHypotheses
 from rasterregions.io import spaced_hypotheses_payload, write_spaced_hypotheses
 
 from .models import CropRect
@@ -98,6 +99,8 @@ class PageSegmentation:
     unassigned_ink_fraction: float = 0.0
     hypothesis_count: int = 1
     search_truncated: bool = False
+    search_limit: str | None = None
+    anchor_region_count: int | None = None
 
 
 
@@ -111,9 +114,16 @@ class ReferenceGallery:
 
 
 class SegmentationError(ValueError):
-    def __init__(self, message: str, diagnostic_path: Path | None = None):
+    def __init__(
+        self,
+        message: str,
+        diagnostic_path: Path | None = None,
+        *,
+        details: dict[str, Any] | None = None,
+    ):
         super().__init__(message)
         self.diagnostic_path = diagnostic_path
+        self.details = dict(details or {})
 
 
 extract_page_ink_mask = rr.foreground_mask
@@ -121,7 +131,7 @@ RowBand = rr.RowBand
 detect_ink_rows = rr.detect_rows
 
 
-REFERENCE_SEGMENTATION_VERSION = "3"
+REFERENCE_SEGMENTATION_VERSION = "4"
 
 
 def _coerce_reference_profile(
@@ -479,6 +489,8 @@ def _write_reference_diagnostics(
         "hypothesis_count": segmentation.hypothesis_count,
         "search_truncated": segmentation.search_truncated,
         "reference_profile": segmentation.reference_profile,
+        "search_limit": segmentation.search_limit,
+        "anchor_region_count": segmentation.anchor_region_count,
         "row_count": len(segmentation.rows),
         "rows": row_records,
         "per_row_candidate_count": {
@@ -498,6 +510,222 @@ def _write_reference_diagnostics(
         json.dumps(spaced_hypotheses_payload(hypotheses), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    write_spaced_hypotheses(hypotheses, output_dir / "reference-hypotheses")
+
+
+def _reference_ownership_error(result: rr.DetectionResult) -> str | None:
+    regions = result.regions
+    if result.status == "failed":
+        return "Rasterregions marked the reference segmentation as failed."
+    if not regions:
+        return "Rasterregions returned no reference regions."
+    reading_order = [region.reading_order for region in regions]
+    if reading_order != sorted(reading_order) or len(set(reading_order)) != len(reading_order):
+        return "Reference regions do not have stable reading-order identifiers."
+
+    owned = np.zeros_like(result.clean_mask, dtype=bool)
+    for region in regions:
+        if not 0 <= region.row_index < len(result.rows):
+            return "A reference region does not belong to a detected row."
+        if not np.any(region.mask):
+            return "A reference region has an empty foreground mask."
+        box = region.bbox
+        if box.x1 > owned.shape[1] or box.y1 > owned.shape[0]:
+            return "A reference region exceeds the page bounds."
+        view = owned[box.y0 : box.y1, box.x0 : box.x1]
+        if np.any(view & region.mask):
+            return "Reference regions have overlapping foreground ownership."
+        if np.any(region.mask & ~result.clean_mask[box.y0 : box.y1, box.x0 : box.x1]):
+            return "A reference region contains foreground outside the cleaned page mask."
+        view |= region.mask
+
+    unassigned = np.asarray(result.unassigned_mask, dtype=bool)
+    if np.any(owned & unassigned) or not np.array_equal(owned | unassigned, result.clean_mask):
+        return "Reference regions do not conserve cleaned foreground ownership."
+    if result.diagnostics is not None:
+        actual_fraction = float(unassigned.sum()) / max(1, int(result.clean_mask.sum()))
+        if not np.isclose(actual_fraction, result.diagnostics.unassigned_ink_fraction):
+            return "Cleaned foreground ownership disagrees with rasterregions diagnostics."
+    return None
+
+
+def _write_reference_failure_diagnostics(
+    source_path: Path,
+    error: Exception,
+    ink_mode: MaskMode,
+    reference_profile: str,
+    output_dir: Path,
+) -> tuple[str, Path, dict[str, Any]]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with Image.open(source_path) as source_image:
+        image = source_image.convert("RGB")
+    mask_result = rr.foreground_mask(source_path, mode=ink_mode)
+    rows = rr.detect_rows(mask_result.mask)
+    components = rr.components(mask_result.mask)
+    _write_page_mask(mask_result.mask, output_dir / "reference-mask.png")
+
+    rows_preview = image.copy()
+    rows_draw = ImageDraw.Draw(rows_preview)
+    for index, row in enumerate(rows):
+        box = row.bbox
+        rows_draw.rectangle(
+            (box.x0, box.y0, box.x1 - 1, box.y1 - 1),
+            outline=(35, 145, 55),
+            width=2,
+        )
+        rows_draw.text(
+            (box.x0, max(0, box.y0 - 12)),
+            f"row-{index:02d}",
+            fill=(35, 145, 55),
+        )
+    rows_preview.save(output_dir / "reference-rows.png", format="PNG")
+
+    components_preview = image.copy()
+    components_draw = ImageDraw.Draw(components_preview)
+    for component in components:
+        box = component.bbox
+        components_draw.rectangle(
+            (box.x0, box.y0, box.x1 - 1, box.y1 - 1), outline=(30, 130, 210), width=1
+        )
+    components_preview.save(output_dir / "reference-components.png", format="PNG")
+    _write_overlay(image, (), output_dir / "reference-candidates.png")
+    gallery_preview = image.copy()
+    ImageDraw.Draw(gallery_preview).text(
+        (8, 8), "Reference segmentation failed", fill=(200, 30, 30)
+    )
+    gallery_preview.save(output_dir / "reference-gallery.png", format="PNG")
+
+    dependency_diagnostics = getattr(error, "diagnostics", None)
+    search_limit = getattr(error, "search_limit", None) or getattr(
+        dependency_diagnostics, "search_limit", None
+    )
+    if search_limit is None and isinstance(error, rr.SegmentationSearchLimitError):
+        error_text = str(error).lower()
+        if "partition" in error_text:
+            search_limit = "row-partition-budget"
+        elif "count-candidate" in error_text:
+            search_limit = "count-candidate-budget"
+    search_truncated = isinstance(error, rr.SegmentationSearchLimitError) or bool(
+        getattr(error, "search_truncated", False)
+    )
+    region_count = getattr(error, "region_count", None)
+    anchor_region_count = getattr(error, "anchor_region_count", None)
+    if dependency_diagnostics is not None:
+        region_count = region_count or getattr(
+            dependency_diagnostics, "selected_region_count", None
+        )
+        anchor_rows = getattr(dependency_diagnostics, "row_segmentation", ())
+        if anchor_region_count is None and anchor_rows:
+            anchor_region_count = sum(getattr(row, "anchor_count", 0) for row in anchor_rows)
+
+    diagnostic_path = output_dir / "reference-segmentation-hypotheses.json"
+    message_lines = [
+        "Reference segmentation could not produce a safe gallery.",
+        f"Detected {len(rows)} rows and {len(components)} connected components.",
+    ]
+    if region_count is not None or anchor_region_count is not None:
+        message_lines.append(
+            f"Detected {region_count or 0} regions and {anchor_region_count or 0} anchor regions."
+        )
+    if search_truncated:
+        message_lines.append(
+            f"Search was truncated by {search_limit or 'an unknown search budget'}."
+        )
+    message_lines.append(f"Rasterregions failed: {error}.")
+    message_lines.append(f"Diagnostics: {diagnostic_path}")
+
+    error_record = {"type": type(error).__name__, "message": str(error)}
+    row_records = [
+        {"row": index, "bbox": row.bbox.as_tuple(), "candidate_count": 0}
+        for index, row in enumerate(rows)
+    ]
+    manifest = {
+        "source_image": source_path.name,
+        "algorithm_version": REFERENCE_SEGMENTATION_VERSION,
+        "reference_profile": reference_profile,
+        "status": "failed",
+        "candidate_count": 0,
+        "row_count": len(rows),
+        "rows": row_records,
+        "per_row_candidate_count": {str(index): 0 for index in range(len(rows))},
+        "search_truncated": search_truncated,
+        "search_limit": search_limit,
+        "anchor_region_count": anchor_region_count,
+        "unassigned_ink_fraction": None,
+        "component_count": len(components),
+        "warnings": [str(error)],
+        "dependency_error": error_record,
+        "candidates": [],
+    }
+    payload = {
+        "schema_version": 1,
+        "segmentation": "spaced",
+        "status": "failed",
+        "diagnostics": {
+            "row_count": len(rows),
+            "component_count": len(components),
+            "region_count": region_count,
+            "anchor_region_count": anchor_region_count,
+        },
+        "search": {
+            "truncated": search_truncated,
+            "limit": search_limit,
+            "failure_reason": str(error),
+        },
+        "error": error_record,
+    }
+    (output_dir / "reference-candidates.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    diagnostic_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    hypotheses_dir = output_dir / "reference-hypotheses"
+    hypotheses_dir.mkdir(parents=True, exist_ok=True)
+    (hypotheses_dir / "failure.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    return "\n".join(message_lines), diagnostic_path, {
+        "failure_phase": "rasterregions_detection",
+        "reference_profile": reference_profile,
+        "ink_mode": ink_mode,
+        "row_count": len(rows),
+        "component_count": len(components),
+        "region_count": region_count,
+        "anchor_region_count": anchor_region_count,
+        "search_truncated": search_truncated,
+        "search_limit": search_limit,
+    }
+
+
+def _detect_reference_hypotheses(
+    source_path: Path,
+    ink_mode: MaskMode,
+) -> tuple[SpacedSegmentationHypotheses, str | None]:
+    try:
+        return rr.detect_spaced_region_hypotheses(source_path, mode=ink_mode), None
+    except ValueError as error:
+        if str(error) != "row hypothesis count and boundaries must match its regions":
+            raise
+
+    anchor_result = rr.detect_spaced_regions(source_path, mode=ink_mode)
+    anchor_diagnostics = anchor_result.diagnostics
+    assert anchor_diagnostics is not None
+    row_counts = tuple(row.anchor_count for row in anchor_diagnostics.row_segmentation)
+    selected = rr.detect_spaced_regions(source_path, mode=ink_mode, row_counts=row_counts)
+    diagnostics = selected.diagnostics
+    assert diagnostics is not None
+    hypotheses = SpacedSegmentationHypotheses(
+        selected=selected,
+        row_hypotheses=tuple(() for _ in selected.rows),
+        page_hypotheses=(),
+        truncated=diagnostics.search_truncated,
+    )
+    warning = (
+        "Rasterregions hypothesis conversion failed its row-boundary invariant; "
+        "segmentation was rerun using detected anchor counts."
+    )
+    return hypotheses, warning
 
 
 def segment_reference_gallery(
@@ -510,7 +738,19 @@ def segment_reference_gallery(
     """Detect anonymous reference glyphs with an application-level row profile."""
     source_path = Path(image_path)
     profile = _coerce_reference_profile(reference_profile)
-    hypotheses = rr.detect_spaced_region_hypotheses(source_path, mode=ink_mode)
+    try:
+        hypotheses, fallback_warning = _detect_reference_hypotheses(source_path, ink_mode)
+    except Exception as error:
+        diagnostics_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else Path(tempfile.mkdtemp(prefix="inkgrammar-reference-segmentation-"))
+        )
+        message, diagnostic_path, details = _write_reference_failure_diagnostics(
+            source_path, error, ink_mode, profile.name, diagnostics_dir
+        )
+        raise SegmentationError(message, diagnostic_path, details=details) from error
+
     result = hypotheses.selected
     override_rows = (
         profile.include_rows if profile.include_rows is not None else profile.exclude_rows
@@ -518,44 +758,63 @@ def segment_reference_gallery(
     if override_rows and max(override_rows) >= len(result.rows):
         raise ValueError("reference profile names a row that was not detected")
 
+    ownership_error = _reference_ownership_error(result)
     row_diagnostics, included_regions, candidate_warnings, ambiguous = _classify_reference_rows(
         result, profile
     )
-    candidates = list(_adapt_candidates(result, "ref", included_regions, candidate_warnings))
+    candidates = (
+        []
+        if ownership_error
+        else list(_adapt_candidates(result, "ref", included_regions, candidate_warnings))
+    )
     warnings = list(result.warnings)
     warnings.extend(
         f"Reference row {row.row_index}: {warning}"
         for row in row_diagnostics
         for warning in row.warnings
     )
+    if fallback_warning:
+        ambiguous = True
+        warnings.append(fallback_warning)
     diagnostics = result.diagnostics
     unassigned_fraction = diagnostics.unassigned_ink_fraction if diagnostics else 0.0
+    search_truncated = hypotheses.truncated or bool(
+        diagnostics and diagnostics.search_truncated
+    )
+    search_limit = diagnostics.search_limit if diagnostics else None
+    if search_truncated:
+        ambiguous = True
+        warnings.append(
+            f"Reference segmentation search was truncated by "
+            f"{search_limit or 'a bounded search limit'}."
+        )
     if unassigned_fraction > 0.02:
         warnings.append(f"Unassigned reference ink fraction is {unassigned_fraction:.3f}.")
 
-    mask_shapes = []
-    for candidate in candidates:
-        page_mask = np.zeros(result.clean_mask.shape, dtype=bool)
-        x0, y0 = candidate.bbox.x, candidate.bbox.y
-        page_mask[y0 : y0 + candidate.bbox.height, x0 : x0 + candidate.bbox.width] = candidate.mask
-        mask_shapes.append(page_mask)
-    contaminated: set[int] = set()
-    for left in range(len(mask_shapes)):
-        for right in range(left + 1, len(mask_shapes)):
-            if np.any(mask_shapes[left] & mask_shapes[right]):
-                contaminated.update((left, right))
-    for index in contaminated:
-        message = "Candidate mask overlaps another candidate's assigned foreground."
-        candidates[index] = replace(
-            candidates[index], warnings=(*candidates[index].warnings, message)
-        )
-        warnings.append(f"{candidates[index].glyph_id}: {message}")
-    if contaminated:
-        ambiguous = True
+    if not candidates and ownership_error is None:
+        ownership_error = "No reference glyph candidates were detected."
+    if ownership_error is None:
+        mask_shapes = []
+        for candidate in candidates:
+            page_mask = np.zeros(result.clean_mask.shape, dtype=bool)
+            x0, y0 = candidate.bbox.x, candidate.bbox.y
+            page_mask[y0 : y0 + candidate.bbox.height, x0 : x0 + candidate.bbox.width] = (
+                candidate.mask
+            )
+            mask_shapes.append(page_mask)
+        for left in range(len(mask_shapes)):
+            if any(np.any(mask_shapes[left] & other) for other in mask_shapes[left + 1 :]):
+                ownership_error = "Candidate masks overlap another candidate's assigned foreground."
+                warnings.append(ownership_error)
+                break
 
+    anchor_region_count = (
+        sum(row.anchor_count for row in diagnostics.row_segmentation) if diagnostics else None
+    )
     status: Literal["ok", "ambiguous", "failed"]
-    if not candidates:
+    if ownership_error:
         status = "failed"
+        warnings.append(ownership_error)
     elif ambiguous:
         status = "ambiguous"
     else:
@@ -568,14 +827,46 @@ def segment_reference_gallery(
         reference_profile=profile.name,
         rows=row_diagnostics,
         unassigned_ink_fraction=unassigned_fraction,
-        hypothesis_count=len(hypotheses.page_hypotheses),
-        search_truncated=hypotheses.truncated,
+        hypothesis_count=max(len(hypotheses.page_hypotheses), int(fallback_warning is not None)),
+        search_truncated=search_truncated,
+        search_limit=search_limit,
+        anchor_region_count=anchor_region_count,
     )
-    if output_dir is not None:
-        _write_reference_diagnostics(result, segmentation, hypotheses, Path(output_dir))
-    if not candidates:
-        diagnostic = Path(output_dir) / "reference-candidates.png" if output_dir else None
-        raise SegmentationError("No reference glyph candidates were detected.", diagnostic)
+
+    diagnostics_dir = Path(output_dir) if output_dir is not None else None
+    if diagnostics_dir is None and status == "failed":
+        diagnostics_dir = Path(tempfile.mkdtemp(prefix="inkgrammar-reference-segmentation-"))
+    if diagnostics_dir is not None:
+        _write_reference_diagnostics(result, segmentation, hypotheses, diagnostics_dir)
+    if status == "failed":
+        assert diagnostics_dir is not None
+        diagnostic_path = diagnostics_dir / "reference-segmentation-hypotheses.json"
+        message_lines = [
+            "Reference segmentation could not produce a safe gallery.",
+            ownership_error or "Reference ownership is unsafe.",
+            f"Detected {len(result.rows)} rows and {len(result.regions)} regions.",
+        ]
+        if search_truncated:
+            message_lines.append(
+                f"Search was truncated by {search_limit or 'a bounded search limit'}."
+            )
+        message_lines.append(f"Diagnostics: {diagnostic_path}")
+        raise SegmentationError(
+            "\n".join(message_lines),
+            diagnostic_path,
+            details={
+                "failure_phase": "reference_ownership_validation",
+                "reference_profile": profile.name,
+                "row_count": len(result.rows),
+                "region_count": len(result.regions),
+                "candidate_count": len(candidates),
+                "anchor_region_count": anchor_region_count,
+                "search_truncated": search_truncated,
+                "search_limit": search_limit,
+                "unassigned_ink_fraction": unassigned_fraction,
+            },
+        )
+
     return ReferenceGallery(
         source_path=source_path,
         source_sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),

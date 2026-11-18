@@ -4,6 +4,7 @@ import json
 
 import numpy as np
 import pytest
+import rasterregions as rr
 from PIL import Image, ImageDraw
 
 from inkgrammar.comparison.segmentation import (
@@ -14,52 +15,31 @@ from inkgrammar.comparison.segmentation import (
 )
 
 
-def _draw_shape(draw: ImageDraw.ImageDraw, x: int, y: int, kind: str) -> None:
-    if kind == "e":
-        draw.line(
-            [
-                (x, y + 14),
-                (x + 18, y + 14),
-                (x + 20, y + 9),
-                (x + 17, y + 4),
-                (x + 10, y + 2),
-                (x + 4, y + 5),
-                (x + 1, y + 12),
-                (x + 3, y + 20),
-                (x + 9, y + 25),
-                (x + 17, y + 24),
-            ],
-            fill="black",
-            width=4,
-        )
-    elif kind == "l":
-        draw.line((x + 8, y, x + 8, y + 26), fill="black", width=4)
-    elif kind == "i":
-        draw.line((x + 8, y + 9, x + 8, y + 26), fill="black", width=4)
-        draw.ellipse((x + 6, y, x + 10, y + 4), fill="black")
-    elif kind == "n":
-        draw.line(
-            [
-                (x, y + 26),
-                (x, y + 5),
-                (x + 6, y + 2),
-                (x + 15, y + 4),
-                (x + 19, y + 10),
-                (x + 19, y + 26),
-            ],
-            fill="black",
-            width=4,
-        )
+def _draw_body(
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    y: int,
+    body_width: int,
+    *,
+    detached_mark: bool = False,
+) -> None:
+    draw.line(
+        ((x, y + 45), (x + round(body_width * 0.45), y + 25), (x + body_width, y + 2)),
+        fill="black",
+        width=4,
+    )
+    if detached_mark:
+        mark_x = x + body_width - 5
+        draw.ellipse((mark_x - 2, y - 5, mark_x + 2, y - 1), fill="black")
 
 
 def _reference_page(path):
     image = Image.new("RGB", (260, 170), "white")
     draw = ImageDraw.Draw(image)
-    draw.rectangle((0, 0, 259, 169), outline="black", width=2)
-    for x, kind in ((20, "e"), (75, "l"), (125, "i"), (185, "n")):
-        _draw_shape(draw, x, 20, kind)
-    for x, kind in ((20, "n"), (80, "e"), (145, "l"), (200, "i")):
-        _draw_shape(draw, x, 105, kind)
+    for x in (20, 75, 130, 185):
+        _draw_body(draw, x, 20, 60, detached_mark=x == 20)
+    for x in (20, 80, 145, 200):
+        _draw_body(draw, x, 105, 35)
     image.save(path)
     return path
 
@@ -67,16 +47,15 @@ def _reference_page(path):
 def _sample_page(path):
     image = Image.new("RGB", (260, 135), "white")
     draw = ImageDraw.Draw(image)
-    _draw_shape(draw, 15, 35, "e")
-    _draw_shape(draw, 105, 35, "i")
-    _draw_shape(draw, 195, 35, "n")
+    for x in (20, 100, 180):
+        _draw_body(draw, x, 35, 34)
     draw.line((4, 100, 255, 100), fill=(180, 180, 180), width=1)
     draw.point((250, 8), fill="black")
     image.save(path)
     return path
 
 
-def test_reference_gallery_segments_rows_and_attaches_detached_marks(tmp_path):
+def test_reference_gallery_segments_rows_and_reports_detached_mark_ambiguity(tmp_path):
     path = _reference_page(tmp_path / "alphabet.png")
     output = tmp_path / "reference-diagnostics"
 
@@ -88,8 +67,8 @@ def test_reference_gallery_segments_rows_and_attaches_detached_marks(tmp_path):
     ]
     assert [candidate.row_index for candidate in gallery.candidates] == [0] * 4 + [1] * 4
     assert [candidate.column_index for candidate in gallery.candidates] == [0, 1, 2, 3] * 2
-    dotted = gallery.candidates[2]
-    assert dotted.bbox.y <= 20
+    assert gallery.segmentation.status == "ambiguous"
+    assert gallery.segmentation.unassigned_ink_fraction > 0.0
     assert len(detect_ink_rows(gallery.mask_result.mask)) == 2
     assert (output / "reference-mask.png").is_file()
     assert (output / "reference-candidates.png").is_file()
@@ -110,7 +89,7 @@ def test_sample_segmentation_recovers_exact_count_and_writes_review_artifacts(tm
         "sample-001",
         "sample-002",
     ]
-    assert samples[1].bbox.y == 35
+    assert samples[1].bbox.y == 36
     assert all(candidate.segmentation_confidence >= 0.3 for candidate in samples)
     for filename in (
         "sample-mask.png",
@@ -186,6 +165,119 @@ def _alphabet_like_page(path):
             draw.rectangle((x, y, x + width, y + 25), fill="black")
     image.save(path)
     return path
+
+
+def _anchor_first_reference_page(path):
+    row_counts = (12, 8, 6, 11, 11, 5, 10)
+    image = Image.new("RGB", (1081, 1198), "white")
+    draw = ImageDraw.Draw(image)
+    for row_index, count in enumerate(row_counts):
+        y = 35 + row_index * 155
+        spacing = (image.width - 150) / max(1, count - 1)
+        for index in range(count):
+            x = 30 + index * spacing
+            body_width = 86 + (index * 7) % 12
+            draw.line(
+                (
+                    (round(x), y + 55),
+                    (round(x + body_width * 0.45), y + 30),
+                    (round(x + body_width), y + 5),
+                ),
+                fill="black",
+                width=4,
+            )
+            if index % 8 == 0:
+                dot_x = round(x + body_width - 20)
+                draw.ellipse((dot_x - 1, y - 3, dot_x + 1, y - 1), fill="black")
+    image.save(path)
+    return path
+
+
+def test_generated_anchor_first_reference_has_63_disjoint_candidates(tmp_path):
+    row_counts = [12, 8, 6, 11, 11, 5, 10]
+    path = _anchor_first_reference_page(tmp_path / "anchor-reference.png")
+    output = tmp_path / "anchor-reference-diagnostics"
+
+    gallery = segment_reference_gallery(path, ink_mode="dark", output_dir=output)
+
+    assert len(gallery.candidates) == 63
+    assert [row.candidate_count for row in gallery.segmentation.rows] == row_counts
+    assert all(row.included for row in gallery.segmentation.rows)
+    assert gallery.segmentation.search_truncated is True
+    assert gallery.segmentation.search_limit is None
+    assert gallery.segmentation.unassigned_ink_fraction == 0.0
+    assert any(
+        left.bbox.x + left.bbox.width > right.bbox.x
+        for left, right in zip(gallery.candidates[:12], gallery.candidates[1:12], strict=False)
+    )
+
+    page_masks = []
+    for candidate in gallery.candidates:
+        page_mask = np.zeros(gallery.mask_result.mask.shape, dtype=bool)
+        x0, y0 = candidate.bbox.x, candidate.bbox.y
+        page_mask[y0 : y0 + candidate.bbox.height, x0 : x0 + candidate.bbox.width] = (
+            candidate.mask
+        )
+        page_masks.append(page_mask)
+    assert all(
+        not np.any(page_masks[left] & page_masks[right])
+        for left in range(len(page_masks))
+        for right in range(left + 1, len(page_masks))
+    )
+
+    manifest = json.loads((output / "reference-candidates.json").read_text())
+    assert manifest["candidate_count"] == 63
+    assert manifest["per_row_candidate_count"] == {
+        str(index): count for index, count in enumerate(row_counts)
+    }
+
+
+def test_reference_hypothesis_invariant_falls_back_to_detected_anchor_counts(
+    tmp_path, monkeypatch
+):
+    row_counts = [12, 8, 6, 11, 11, 5, 10]
+    path = _anchor_first_reference_page(tmp_path / "anchor-reference.png")
+    output = tmp_path / "anchor-fallback-diagnostics"
+
+    def fail_hypothesis_conversion(*args, **kwargs):
+        raise ValueError("row hypothesis count and boundaries must match its regions")
+
+    monkeypatch.setattr(
+        "inkgrammar.comparison.segmentation.rr.detect_spaced_region_hypotheses",
+        fail_hypothesis_conversion,
+    )
+    gallery = segment_reference_gallery(path, ink_mode="dark", output_dir=output)
+
+    assert len(gallery.candidates) == 63
+    assert [row.candidate_count for row in gallery.segmentation.rows] == row_counts
+    assert gallery.segmentation.anchor_region_count == 63
+    assert gallery.segmentation.status == "ambiguous"
+    assert gallery.segmentation.hypothesis_count == 1
+    assert any("row-boundary invariant" in warning for warning in gallery.segmentation.warnings)
+    hypotheses = json.loads(
+        (output / "reference-segmentation-hypotheses.json").read_text()
+    )
+    assert hypotheses["page_hypotheses"] == []
+    assert len(hypotheses["selected"]["regions"]) == 63
+
+
+def test_reference_ownership_validation_rejects_overlapping_regions(tmp_path):
+    from dataclasses import replace
+
+    from inkgrammar.comparison.segmentation import _reference_ownership_error
+
+    path = tmp_path / "reference.png"
+    image = Image.new("RGB", (80, 50), "white")
+    ImageDraw.Draw(image).rectangle((20, 12, 50, 38), fill="black")
+    image.save(path)
+    result = rr.detect_spaced_regions(path, mode="dark")
+    region = result.regions[0]
+    duplicate = replace(region, reading_order=region.reading_order + 1)
+    overlapping = replace(result, regions=(region, duplicate))
+
+    assert _reference_ownership_error(overlapping) == (
+        "Reference regions have overlapping foreground ownership."
+    )
 
 
 def test_alphabet_profile_excludes_title_and_year_and_isolates_all_glyph_rows(tmp_path):
@@ -290,3 +382,60 @@ def test_isolated_candidate_image_whitens_other_ink_in_overlapping_boxes():
     assert left_crop.size == right_crop.size
     assert not np.any(np.min(left, axis=2)[~left_mask] < 128)
     assert not np.any(np.min(right, axis=2)[~right_mask] < 128)
+
+
+@pytest.mark.parametrize(
+    ("failure_type", "message", "search_truncated", "search_limit"),
+    [
+        (ValueError, "row hypothesis invariant failed", False, None),
+        (
+            rr.SegmentationSearchLimitError,
+            "partition search budget exhausted before a feasible result",
+            True,
+            "row-partition-budget",
+        ),
+    ],
+)
+def test_reference_dependency_failures_write_diagnostics(
+    tmp_path, monkeypatch, failure_type, message, search_truncated, search_limit
+):
+    path = tmp_path / "reference.png"
+    image = Image.new("RGB", (80, 50), "white")
+    ImageDraw.Draw(image).rectangle((20, 12, 50, 38), fill="black")
+    image.save(path)
+    output = tmp_path / "reference-failure"
+    failure = failure_type(message)
+
+    def fail_segmentation(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(
+        "inkgrammar.comparison.segmentation.rr.detect_spaced_region_hypotheses",
+        fail_segmentation,
+    )
+    with pytest.raises(SegmentationError, match="Reference segmentation") as error:
+        segment_reference_gallery(path, ink_mode="dark", output_dir=output)
+
+    diagnostic_path = output / "reference-segmentation-hypotheses.json"
+    assert error.value.__cause__ is failure
+    assert error.value.diagnostic_path == diagnostic_path
+    assert "Diagnostics:" in str(error.value)
+    assert diagnostic_path.is_file()
+    for filename in (
+        "reference-mask.png",
+        "reference-rows.png",
+        "reference-components.png",
+        "reference-candidates.png",
+        "reference-candidates.json",
+        "reference-gallery.png",
+    ):
+        assert (output / filename).is_file()
+    assert (output / "reference-hypotheses" / "failure.json").is_file()
+
+    manifest = json.loads((output / "reference-candidates.json").read_text())
+    assert manifest["status"] == "failed"
+    assert manifest["row_count"] == 1
+    assert manifest["search_truncated"] is search_truncated
+    assert manifest["search_limit"] == search_limit
+    hypotheses = json.loads(diagnostic_path.read_text())
+    assert hypotheses["error"]["type"] == failure_type.__name__

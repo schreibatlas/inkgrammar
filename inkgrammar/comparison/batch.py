@@ -77,11 +77,18 @@ def _copy_reference_diagnostics(cache_dir: Path, output_dir: Path) -> None:
     source = cache_dir / "segmentation"
     output_dir.mkdir(parents=True, exist_ok=True)
     files = [source / filename for filename in _REFERENCE_DIAGNOSTICS]
-    files.extend(source.glob("ref-*.png"))
+    files.extend(sorted(source.glob("ref-*.png")))
     for cached in files:
         if cached.is_file():
             shutil.copy2(cached, output_dir / cached.name)
 
+    hypotheses_dir = source / "reference-hypotheses"
+    if hypotheses_dir.is_dir():
+        shutil.copytree(
+            hypotheses_dir,
+            output_dir / "reference-hypotheses",
+            dirs_exist_ok=True,
+        )
 
 def _mask_sha256(mask: np.ndarray) -> str:
     binary = np.asarray(mask, dtype=np.uint8)
@@ -151,6 +158,8 @@ def _cache_metadata(
         "unassigned_ink_fraction": gallery.segmentation.unassigned_ink_fraction,
         "segmentation_hypothesis_count": gallery.segmentation.hypothesis_count,
         "segmentation_search_truncated": gallery.segmentation.search_truncated,
+        "segmentation_search_limit": gallery.segmentation.search_limit,
+        "anchor_region_count": gallery.segmentation.anchor_region_count,
         "row_count": len(rows),
         "rows": rows,
         "per_row_candidate_counts": {
@@ -323,6 +332,8 @@ def _load_reference_cache(
         unassigned_ink_fraction=metadata["unassigned_ink_fraction"],
         hypothesis_count=metadata["segmentation_hypothesis_count"],
         search_truncated=metadata["segmentation_search_truncated"],
+        search_limit=metadata["segmentation_search_limit"],
+        anchor_region_count=metadata["anchor_region_count"],
     )
     gallery = ReferenceGallery(
         source_path=source_path,
@@ -553,6 +564,10 @@ def _write_reference_manifest(
         "candidate_count": len(gallery.candidates),
         "unassigned_ink_fraction": metadata["unassigned_ink_fraction"],
         "status": gallery.segmentation.status,
+        "hypothesis_count": metadata["segmentation_hypothesis_count"],
+        "search_truncated": metadata["segmentation_search_truncated"],
+        "search_limit": metadata["segmentation_search_limit"],
+        "anchor_region_count": metadata["anchor_region_count"],
         "warnings": list(gallery.segmentation.warnings),
         "candidates": metadata["candidates"],
     }
@@ -833,7 +848,7 @@ def _compare_letter_page_impl(
 
     progress.stage(
         "reference_mask_rows",
-        details={"message": "Load reference mask and detect rows"},
+        details={"message": "Mask reference, detect rows, and verify foreground ownership"},
     )
     if not cache_hit:
         diagnostics_output = segmentation_dir if segment_only else cache_dir / "segmentation"
@@ -847,8 +862,30 @@ def _compare_letter_page_impl(
         except SegmentationError as error:
             if not segment_only:
                 _copy_reference_diagnostics(cache_dir, segmentation_dir)
-            diagnostic = segmentation_dir / "reference-candidates.png"
-            raise SegmentationError(str(error), diagnostic_path=diagnostic) from error
+            diagnostic = segmentation_dir / "reference-segmentation-hypotheses.json"
+            if not diagnostic.is_file():
+                diagnostic = segmentation_dir / "reference-candidates.png"
+            message = str(error)
+            if error.diagnostic_path is not None:
+                message = message.replace(str(error.diagnostic_path), str(diagnostic))
+            if f"Diagnostics: {diagnostic}" not in message:
+                message += f"\nDiagnostics: {diagnostic}"
+            failure_phase = error.details.get("failure_phase", "reference_segmentation")
+            progress.stage(
+                "reference_mask_rows",
+                details={
+                    **error.details,
+                    "failure_phase": failure_phase,
+                    "diagnostic_path": str(diagnostic),
+                    "message": f"Reference segmentation failed during {failure_phase}.",
+                    "error": str(error),
+                },
+            )
+            raise SegmentationError(
+                message,
+                diagnostic_path=diagnostic,
+                details=error.details,
+            ) from error
 
     assert gallery is not None
     progress.stage(
@@ -861,7 +898,21 @@ def _compare_letter_page_impl(
                 f"{len(gallery.segmentation.rows)} rows"
             ),
             "status": gallery.segmentation.status,
-        },
+            "reference_profile": gallery.segmentation.reference_profile,
+            "row_count": len(gallery.segmentation.rows),
+            "candidate_count": len(gallery.candidates),
+            "per_row_candidate_counts": {
+                str(row.row_index): sum(
+                    candidate.row_index == row.row_index for candidate in gallery.candidates
+                )
+                for row in gallery.segmentation.rows
+            },
+            "excluded_row_count": sum(not row.included for row in gallery.segmentation.rows),
+            "search_truncated": gallery.segmentation.search_truncated,
+            "search_limit": gallery.segmentation.search_limit,
+            "anchor_region_count": gallery.segmentation.anchor_region_count,
+            "unassigned_ink_fraction": gallery.segmentation.unassigned_ink_fraction,
+        }
     )
 
     if not segment_only:
@@ -1066,4 +1117,21 @@ def _compare_letter_page_impl(
         expected_count=expected_letters,
         results=tuple(results),
         reference_cache_hit=cache_hit,
+        reference_segmentation={
+            "status": gallery.segmentation.status,
+            "reference_profile": gallery.segmentation.reference_profile,
+            "row_count": len(gallery.segmentation.rows),
+            "candidate_count": len(gallery.candidates),
+            "per_row_candidate_counts": {
+                str(row.row_index): sum(
+                    candidate.row_index == row.row_index for candidate in gallery.candidates
+                )
+                for row in gallery.segmentation.rows
+            },
+            "hypothesis_count": gallery.segmentation.hypothesis_count,
+            "search_truncated": gallery.segmentation.search_truncated,
+            "search_limit": gallery.segmentation.search_limit,
+            "anchor_region_count": gallery.segmentation.anchor_region_count,
+            "unassigned_ink_fraction": gallery.segmentation.unassigned_ink_fraction,
+        },
     )

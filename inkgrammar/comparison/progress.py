@@ -47,7 +47,7 @@ class ProgressReporter:
         self.expected_samples = expected_samples
         self.current_stage = "starting"
         self.status = "running"
-        self.failure_details: dict[str, str] | None = None
+        self.failure_details: dict[str, Any] | None = None
         self.artifact_paths: dict[str, str] = {
             "output_dir": str(self.output_dir),
             "progress_jsonl": str(self.progress_path),
@@ -116,8 +116,17 @@ class ProgressReporter:
 
     def fail(self, error: BaseException) -> None:
         self.status = "failed"
-        self.failure_details = {"type": type(error).__name__, "message": str(error)}
-        details: dict[str, Any] = {"message": f"Failed: {error}"}
+        error_details = getattr(error, "details", {})
+        self.failure_details = {
+            "type": type(error).__name__,
+            "message": str(error),
+            **error_details,
+        }
+        details: dict[str, Any] = {
+            "message": f"Failed: {type(error).__name__}",
+            "error": str(error),
+            **error_details,
+        }
         diagnostic_path = getattr(error, "diagnostic_path", None)
         if diagnostic_path is not None:
             self.artifact_paths["diagnostic"] = str(diagnostic_path)

@@ -201,3 +201,41 @@ def test_compare_letter_cli_segment_only_honors_quiet_mode_and_profiles(tmp_path
     assert summary["operation"] == "segment-only"
     assert summary["reference"]["reference_profile"] == "generic"
     assert json.loads((output / "run.json").read_text())["status"] == "completed"
+
+
+
+def test_compare_letter_cli_reference_failure_reports_public_diagnostics_once(
+    tmp_path, monkeypatch
+):
+    reference = _reference_page(tmp_path / "reference.png")
+    sample = _page(tmp_path / "sample.png", ("e", "n", "l"))
+    output = tmp_path / "failed-reference"
+
+    def fail_segmentation(*args, **kwargs):
+        raise ValueError("synthetic rasterregions failure")
+
+    monkeypatch.setattr(
+        "inkgrammar.comparison.segmentation.rr.detect_spaced_region_hypotheses",
+        fail_segmentation,
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "compare-letter",
+            str(reference),
+            str(sample),
+            "--letters",
+            "3",
+            "--output",
+            str(output),
+        ],
+    )
+
+    diagnostic = output / "segmentation" / "reference-segmentation-hypotheses.json"
+    assert result.exit_code == 2
+    assert diagnostic.name in result.output
+    assert result.output.count("Diagnostics:") == 1
+    assert diagnostic.is_file()
+    events = [json.loads(line) for line in (output / "progress.jsonl").read_text().splitlines()]
+    reference_events = [event for event in events if event["stage"] == "reference_mask_rows"]
+    assert reference_events[-1]["details"]["failure_phase"] == "rasterregions_detection"

@@ -100,6 +100,7 @@ def write_batch_report(
     expected_count: int,
     reference_cache_hit: bool,
     results: tuple[BatchSampleResult, ...],
+    reference_segmentation: dict[str, Any],
 ) -> BatchComparisonReport:
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
@@ -117,6 +118,7 @@ def write_batch_report(
         "reference": {
             "path": Path(reference_path).name,
             "sha256": reference_sha256,
+            "segmentation": reference_segmentation,
         },
         "sample": {
             "path": Path(sample_path).name,
@@ -151,6 +153,14 @@ def write_batch_report(
         "",
         f"Reference: `{Path(reference_path).name}`",
         f"Sample: `{Path(sample_path).name}` ({expected_count} glyphs requested)",
+        (
+            f"Reference segmentation: {reference_segmentation['status']} "
+            f"({reference_segmentation['reference_profile']} profile, "
+            f"{reference_segmentation['row_count']} rows, "
+            f"{reference_segmentation['candidate_count']} candidates; "
+            f"search truncated: {reference_segmentation['search_truncated']}, "
+            f"limit: {reference_segmentation['search_limit']})."
+        ),
         f"Status: **{payload['status']}**. Match ambiguities: {match_ambiguous_count}. "
         f"Segmentation-ambiguous samples: {segmentation_ambiguous_count}.",
         "Retrieval costs rank candidates and are not correctness probabilities.",
@@ -214,6 +224,12 @@ def write_batch_report(
             f"{expected_count} glyphs requested; status {payload['status']}.</p>",
             f"<p>Match ambiguities: {match_ambiguous_count}; "
             f"segmentation-ambiguous samples: {segmentation_ambiguous_count}</p>",
+            f"<p>Reference segmentation: {reference_segmentation['status']}; "
+            f"profile {html.escape(reference_segmentation['reference_profile'])}; "
+            f"{reference_segmentation['row_count']} rows, "
+            f"{reference_segmentation['candidate_count']} candidates; "
+            f"search truncated {reference_segmentation['search_truncated']} "
+            f"(limit {reference_segmentation['search_limit']}).</p>",
             "<table><thead><tr><th>Sample</th><th>Best reference</th>"
             "<th>Match status</th><th>Segmentation status</th>"
             "<th>Cost</th><th>Report</th><th>Alternatives</th></tr></thead>",

@@ -56,7 +56,7 @@ def _page(path, glyphs: tuple[str, ...], *, y: int = 24):
 def test_batch_writes_pair_reports_summaries_and_reuses_hash_keyed_reference_cache(
     tmp_path, monkeypatch
 ):
-    reference = _page(tmp_path / "reference.png", ("e", "n", "l"), y=22)
+    reference = _page(tmp_path / "reference.png", ("e", "e", "l"), y=22)
     sample = _page(tmp_path / "sample.png", ("e", "n", "l"), y=30)
     output = tmp_path / "automatic-run"
 
@@ -88,6 +88,7 @@ def test_batch_writes_pair_reports_summaries_and_reuses_hash_keyed_reference_cac
         "sample-candidates.json",
     ):
         assert (output / "segmentation" / filename).is_file()
+    assert (output / "segmentation" / "reference-hypotheses" / "hypotheses.json").is_file()
     assert (output / "reference-index" / "gallery.json").is_file()
     assert all(
         (output / "reference-index" / f"ref-{index:03d}.png").is_file() for index in range(3)
@@ -98,6 +99,9 @@ def test_batch_writes_pair_reports_summaries_and_reuses_hash_keyed_reference_cac
     assert reference_manifest["reference_profile"] == "alphabet"
     assert reference_manifest["row_count"] == 1
     assert reference_manifest["per_row_candidate_counts"] == {"0": 3}
+    assert isinstance(reference_manifest["search_truncated"], bool)
+    assert reference_manifest["search_limit"] is None
+    assert isinstance(reference_manifest["anchor_region_count"], int)
     candidate = reference_manifest["candidates"][0]
     assert candidate["dimensions"] == {
         "width": candidate["bbox"]["width"],
@@ -106,6 +110,17 @@ def test_batch_writes_pair_reports_summaries_and_reuses_hash_keyed_reference_cac
 
     summary = json.loads(first.json_path.read_text())
     assert len(summary["matches"]) == 3
+    reference_segmentation = summary["reference"]["segmentation"]
+    assert reference_segmentation["status"] == "ok"
+    assert reference_segmentation["reference_profile"] == "alphabet"
+    assert reference_segmentation["row_count"] == 1
+    assert reference_segmentation["candidate_count"] == 3
+    assert reference_segmentation["per_row_candidate_counts"] == {"0": 3}
+    assert isinstance(reference_segmentation["search_truncated"], bool)
+    assert reference_segmentation["search_limit"] is None
+    assert reference_segmentation["unassigned_ink_fraction"] == reference_manifest[
+        "unassigned_ink_fraction"
+    ]
     assert "not a probability" in summary["matching"]["cost_interpretation"]
     assert "<img" in first.html_path.read_text()
     for match in summary["matches"]:
@@ -152,7 +167,7 @@ def test_batch_writes_pair_reports_summaries_and_reuses_hash_keyed_reference_cac
 
 
 def test_reference_cache_rebuilds_for_old_versions_profiles_and_mask_changes(tmp_path):
-    reference = _page(tmp_path / "reference.png", ("e", "n", "l"), y=22)
+    reference = _page(tmp_path / "reference.png", ("e", "e", "l"), y=22)
     sample = _page(tmp_path / "sample.png", ("e", "n", "l"), y=30)
     output = tmp_path / "cache-invalidation"
 
@@ -160,11 +175,18 @@ def test_reference_cache_rebuilds_for_old_versions_profiles_and_mask_changes(tmp
     cache_dir = next((output / ".reference-cache").iterdir())
     metadata_path = cache_dir / "gallery.json"
     metadata = json.loads(metadata_path.read_text())
-    metadata["cache_version"] = 1
+    candidate_ids = [item["id"] for item in metadata["candidates"]]
+    metadata["segmentation_algorithm_version"] = "3"
     metadata_path.write_text(json.dumps(metadata))
 
     old_cache = compare_letter_page(reference, sample, expected_letters=3, output_dir=output)
     assert old_cache.payload["reference_cache"]["hit"] is False
+    rebuilt_metadata = json.loads(metadata_path.read_text())
+    assert rebuilt_metadata["segmentation_algorithm_version"] == "4"
+    assert [item["id"] for item in rebuilt_metadata["candidates"]] == candidate_ids
+
+    reused_cache = compare_letter_page(reference, sample, expected_letters=3, output_dir=output)
+    assert reused_cache.payload["reference_cache"]["hit"] is True
 
     generic = compare_letter_page(
         reference,
@@ -193,7 +215,7 @@ def test_reference_cache_rebuilds_for_old_versions_profiles_and_mask_changes(tmp
 
 
 def test_progress_and_run_files_cover_success_failure_and_quiet_mode(tmp_path, capsys):
-    reference = _page(tmp_path / "reference.png", ("e", "n", "l"), y=22)
+    reference = _page(tmp_path / "reference.png", ("e", "e", "l"), y=22)
     sample = _page(tmp_path / "sample.png", ("e", "n", "l"), y=30)
     output = tmp_path / "progress-run"
 
@@ -213,6 +235,11 @@ def test_progress_and_run_files_cover_success_failure_and_quiet_mode(tmp_path, c
     extraction_events = [event for event in events if event["stage"] == "reference_extraction"]
     assert extraction_events
     assert all("elapsed_seconds" in event["details"] for event in extraction_events)
+    segmentation_events = [event for event in events if event["stage"] == "reference_segmentation"]
+    assert segmentation_events
+    assert segmentation_events[0]["details"]["reference_profile"] == "alphabet"
+    assert segmentation_events[0]["details"]["candidate_count"] == 3
+    assert isinstance(segmentation_events[0]["details"]["search_truncated"], bool)
     assert {
         "input_validation",
         "reference_hash",
@@ -347,3 +374,59 @@ def test_reference_segmentation_ambiguity_is_separate_from_match_ambiguity(
         assert match["status"] == match["match_status"]
     assert "Segmentation-ambiguous samples: 3" in report.markdown_path.read_text()
     assert "Segmentation status" in report.html_path.read_text()
+
+
+
+def test_reference_failure_copies_diagnostics_and_records_phase(tmp_path, monkeypatch):
+    from inkgrammar.comparison.segmentation import SegmentationError
+
+    reference = _page(tmp_path / "reference.png", ("e", "n", "l"), y=22)
+    sample = _page(tmp_path / "sample.png", ("e", "n", "l"), y=30)
+    output = tmp_path / "failed-reference"
+    dependency_error = ValueError("synthetic rasterregions failure")
+
+    def fail_segmentation(*args, **kwargs):
+        raise dependency_error
+
+    monkeypatch.setattr(
+        "inkgrammar.comparison.segmentation.rr.detect_spaced_region_hypotheses",
+        fail_segmentation,
+    )
+    with pytest.raises(SegmentationError, match="Rasterregions failed") as error:
+        compare_letter_page(reference, sample, expected_letters=3, output_dir=output)
+
+    diagnostic = output / "segmentation" / "reference-segmentation-hypotheses.json"
+    assert error.value.diagnostic_path == diagnostic
+    assert f"Diagnostics: {diagnostic}" in str(error.value)
+    assert diagnostic.is_file()
+    assert (output / "segmentation" / "reference-hypotheses" / "failure.json").is_file()
+    run = json.loads((output / "run.json").read_text())
+    assert run["status"] == "failed"
+    assert run["failure_details"]["failure_phase"] == "rasterregions_detection"
+    assert run["artifact_paths"]["diagnostic"] == str(diagnostic)
+    events = [json.loads(line) for line in (output / "progress.jsonl").read_text().splitlines()]
+    reference_events = [event for event in events if event["stage"] == "reference_mask_rows"]
+    assert reference_events[-1]["details"]["failure_phase"] == "rasterregions_detection"
+    assert events[-1]["stage"] == "failure"
+    assert events[-1]["details"]["diagnostic_path"] == str(diagnostic)
+
+
+
+def test_batch_runs_one_glyph_end_to_end_and_writes_match_reports(tmp_path):
+    reference = _page(tmp_path / "reference.png", ("e", "e", "l"), y=22)
+    sample = tmp_path / "single-sample.png"
+    image = Image.new("RGB", (250, 88), "white")
+    _draw_glyph(ImageDraw.Draw(image), 95, 30, "e")
+    image.save(sample)
+    output = tmp_path / "one-glyph-run"
+
+    report = compare_letter_page(reference, sample, expected_letters=1, output_dir=output)
+
+    assert report.payload["sample"]["detected_count"] == 1
+    assert report.payload["reference"]["segmentation"]["candidate_count"] == 3
+    assert len(report.payload["matches"]) == 1
+    match = report.payload["matches"][0]
+    assert match["reference_id"] in {"ref-000", "ref-001"}
+    assert (output / match["match_json"]).is_file()
+    assert (output / match["report_json"]).is_file()
+    assert (output / match["report_dir"] / "report.html").is_file()
