@@ -64,6 +64,18 @@ def test_generic_curve_algorithms_remain_in_planarcurve() -> None:
 
     assert "covering_walk" in _imports_from("comparison/path.py", "skeletonpaths")
     assert "analyze_mask" in _imports_from("comparison/skeleton.py", "skeletonpaths")
+    assert {"analyze_mask", "graph_from_skeleton"} <= _imports_from(
+        "fitting/centerline.py", "skeletonpaths"
+    )
+    assert "_neighbors" not in _module_definitions("fitting/centerline.py")
+
+    assert "graph_from_skeleton" in _imports_from("comparison/skeleton.py", "skeletonpaths")
+    assert {
+        "build_skeleton_graph",
+        "prepare_topology_paths",
+        "rank_paths",
+        "select_path",
+    } <= _imports_from("fitting/family_fit_v4.py", "skeletonpaths")
     assert "OutlineConfig" not in _module_definitions("outline.py")
 
     spline_forwarders = {

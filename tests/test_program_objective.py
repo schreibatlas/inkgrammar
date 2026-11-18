@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -99,6 +100,21 @@ def test_program_objective_reports_decomposed_terms_and_reuses_observation_data(
     true_energy, compiled = objective.evaluate(true_values)
     initial_energy = evaluate_program_objective(observation, program, primitives)
     rendered = render_program_coverage(compiled, observation)
+
+    variable_width_compiled = replace(
+        compiled,
+        movements=tuple(
+            replace(movement, width_profile=[(0.0, 0.08), (1.0, 0.2)])
+            for movement in compiled.movements
+        ),
+    )
+    variable_width_coverage = render_program_coverage(
+        variable_width_compiled,
+        observation,
+        samples_per_movement=40,
+    )
+    assert variable_width_coverage.shape == observation.mask.shape
+    assert np.isfinite(variable_width_coverage).all()
 
     assert rendered.shape == observation.mask.shape
     assert true_energy.total < initial_energy.total

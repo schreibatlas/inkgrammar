@@ -3,8 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.ndimage import distance_transform_edt, label
-from skimage.morphology import skeletonize
+from skeletonpaths import analyze_mask, graph_from_skeleton
 
 
 @dataclass(frozen=True)
@@ -25,28 +24,8 @@ def skeletonize_component(
         raise ValueError("component mask must be 2D")
     if min_component_area < 1:
         raise ValueError("minimum component area must be positive")
-    if not np.any(component):
-        return np.zeros(component.shape, dtype=bool), np.zeros(component.shape, dtype=float)
-    labels, component_count = label(component)
-    sizes = np.bincount(labels.ravel(), minlength=component_count + 1)
-    keep = sizes >= min_component_area
-    keep[0] = False
-    cleaned = keep[labels]
-    if not np.any(cleaned):
-        return np.zeros(component.shape, dtype=bool), np.zeros(component.shape, dtype=float)
-    return skeletonize(cleaned), distance_transform_edt(cleaned)
-
-
-def _neighbors(skeleton: np.ndarray, point: tuple[int, int]) -> list[tuple[int, int]]:
-    y, x = point
-    top, bottom = max(0, y - 1), min(skeleton.shape[0], y + 2)
-    left, right = max(0, x - 1), min(skeleton.shape[1], x + 2)
-    candidates = np.argwhere(skeleton[top:bottom, left:right])
-    return [
-        (int(candidate[0] + top), int(candidate[1] + left))
-        for candidate in candidates
-        if tuple(candidate + (top, left)) != point
-    ]
+    analysis = analyze_mask(component, min_component_area=min_component_area)
+    return analysis.skeleton, analysis.radius
 
 
 def prune_skeleton(
@@ -66,41 +45,28 @@ def prune_skeleton(
     if radius_max <= 0:
         return pruned
 
-    changed = True
-    while changed:
-        changed = False
-        endpoints = [
-            tuple(int(value) for value in point)
-            for point in np.argwhere(pruned)
-            if len(_neighbors(pruned, tuple(int(value) for value in point))) == 1
-        ]
-        for endpoint in endpoints:
-            if not pruned[endpoint]:
+    while True:
+        graph = graph_from_skeleton(pruned, radius=radius)
+        node_by_id = {node.id: node for node in graph.nodes}
+        branches = []
+        for edge in graph.edges:
+            first, second = node_by_id[edge.a], node_by_id[edge.b]
+            if first.degree == 1 and second.degree > 2:
+                branch_xy = edge.xy[:-1]
+            elif second.degree == 1 and first.degree > 2:
+                branch_xy = edge.xy[:0:-1]
+            else:
                 continue
-            path = [endpoint]
-            previous = None
-            current = endpoint
-            junction = None
-            length = 0.0
-            while True:
-                onward = [point for point in _neighbors(pruned, current) if point != previous]
-                if len(onward) != 1:
-                    break
-                next_point = onward[0]
-                length += float(np.hypot(next_point[0] - current[0], next_point[1] - current[1]))
-                if len(_neighbors(pruned, next_point)) >= 3:
-                    junction = next_point
-                    break
-                path.append(next_point)
-                previous, current = current, next_point
-            if junction is None or length >= min_spur_length_px:
+            if edge.length_px > min_spur_length_px:
                 continue
-            path_array = np.asarray(path, dtype=int)
-            confidence = float(np.mean(radius[path_array[:, 0], path_array[:, 1]] / radius_max))
+            branch_yx = branch_xy[:, ::-1].astype(int)
+            confidence = float(np.mean(radius[branch_yx[:, 0], branch_yx[:, 1]] / radius_max))
             if confidence < min_confidence:
-                pruned[path_array[:, 0], path_array[:, 1]] = False
-                changed = True
-    return pruned
+                branches.append(branch_yx)
+        if not branches:
+            return pruned
+        for branch in branches:
+            pruned[branch[:, 0], branch[:, 1]] = False
 
 
 def _local_tangent_map(skeleton: np.ndarray) -> np.ndarray:

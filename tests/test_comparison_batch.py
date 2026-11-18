@@ -80,6 +80,8 @@ def test_batch_writes_pair_reports_summaries_and_reuses_hash_keyed_reference_cac
         "ref-000-mask.png",
         "reference-candidates.png",
         "reference-candidates.json",
+        "reference-segmentation-hypotheses.json",
+        "sample-hypotheses.json",
         "sample-mask.png",
         "sample-boundaries.png",
         "sample-candidates.png",

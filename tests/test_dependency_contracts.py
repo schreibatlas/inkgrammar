@@ -28,10 +28,23 @@ def test_planarcurve_minimum_api_contract() -> None:
 
 
 def test_skeletonpaths_minimum_api_contract() -> None:
-    from skeletonpaths import SkeletonAnalysis, SkeletonWalk, analyze_mask, covering_walk
+    from skeletonpaths import (
+        SkeletonAnalysis,
+        SkeletonWalk,
+        analyze_mask,
+        covering_walk,
+        graph_from_skeleton,
+    )
 
     assert all(
-        value is not None for value in (SkeletonAnalysis, SkeletonWalk, analyze_mask, covering_walk)
+        value is not None
+        for value in (
+            SkeletonAnalysis,
+            SkeletonWalk,
+            analyze_mask,
+            covering_walk,
+            graph_from_skeleton,
+        )
     )
 
 

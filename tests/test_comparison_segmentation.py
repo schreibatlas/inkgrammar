@@ -93,6 +93,7 @@ def test_reference_gallery_segments_rows_and_attaches_detached_marks(tmp_path):
     assert len(detect_ink_rows(gallery.mask_result.mask)) == 2
     assert (output / "reference-mask.png").is_file()
     assert (output / "reference-candidates.png").is_file()
+    assert (output / "reference-segmentation-hypotheses.json").is_file()
     manifest = json.loads((output / "reference-candidates.json").read_text())
     assert manifest["candidate_count"] == 8
     assert manifest["candidates"][2]["id"] == "ref-002"
@@ -116,6 +117,7 @@ def test_sample_segmentation_recovers_exact_count_and_writes_review_artifacts(tm
         "sample-components.png",
         "sample-boundaries.png",
         "sample-candidates.png",
+        "sample-hypotheses.json",
         "sample-segmentation.json",
     ):
         assert (output / filename).is_file()
@@ -123,6 +125,9 @@ def test_sample_segmentation_recovers_exact_count_and_writes_review_artifacts(tm
     assert manifest["expected_count"] == manifest["detected_count"] == 3
     assert manifest["status"] == "ok"
     assert any("rule" in warning for warning in manifest["warnings"])
+    assert manifest["hypothesis_count"] >= 1
+    assert isinstance(manifest["search_truncated"], bool)
+    assert (output / "sample-hypotheses" / "hypotheses.json").is_file()
     with Image.open(output / "sample-mask.png") as mask_image:
         assert mask_image.crop((0, 100, 260, 101)).getbbox() is None
 

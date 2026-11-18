@@ -51,7 +51,7 @@ from .segmentation import (
 )
 from .skeleton import diagnostics_from_skeleton
 
-_REFERENCE_CACHE_VERSION = 2
+_REFERENCE_CACHE_VERSION = 3
 _DESCRIPTOR_SIZE = 96
 
 _REFERENCE_DIAGNOSTICS = (
@@ -60,6 +60,7 @@ _REFERENCE_DIAGNOSTICS = (
     "reference-components.png",
     "reference-candidates.png",
     "reference-candidates.json",
+    "reference-segmentation-hypotheses.json",
     "reference-gallery.png",
 )
 
@@ -148,6 +149,8 @@ def _cache_metadata(
         "segmentation_status": gallery.segmentation.status,
         "segmentation_warnings": list(gallery.segmentation.warnings),
         "unassigned_ink_fraction": gallery.segmentation.unassigned_ink_fraction,
+        "segmentation_hypothesis_count": gallery.segmentation.hypothesis_count,
+        "segmentation_search_truncated": gallery.segmentation.search_truncated,
         "row_count": len(rows),
         "rows": rows,
         "per_row_candidate_counts": {
@@ -318,6 +321,8 @@ def _load_reference_cache(
         reference_profile=metadata["reference_profile"],
         rows=rows,
         unassigned_ink_fraction=metadata["unassigned_ink_fraction"],
+        hypothesis_count=metadata["segmentation_hypothesis_count"],
+        search_truncated=metadata["segmentation_search_truncated"],
     )
     gallery = ReferenceGallery(
         source_path=source_path,
@@ -909,11 +914,19 @@ def _compare_letter_page_impl(
         ink_mode=sample_ink_mode,
         output_dir=segmentation_dir,
     )
+    sample_segmentation = json.loads(
+        (segmentation_dir / "sample-segmentation.json").read_text(encoding="utf-8")
+    )
     progress.stage(
         "sample_segmentation",
         completed=len(samples),
         total=expected_letters,
-        details={"message": f"Segment sample: {len(samples)}/{expected_letters} glyphs"},
+        details={
+            "message": f"Segment sample: {len(samples)}/{expected_letters} glyphs",
+            "hypothesis_count": sample_segmentation["hypothesis_count"],
+            "search_truncated": sample_segmentation["search_truncated"],
+            "search_limit": sample_segmentation["search_limit"],
+        },
     )
     if segment_only:
         for _ in samples:

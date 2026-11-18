@@ -1,7 +1,8 @@
-"""Frozen objective-v3 centerline pipeline retained for reproducibility.
+"""Frozen objective-v3 fitting policy retained for reproducibility.
 
-Do not add features or new consumers, and do not migrate its skeleton behavior
-to SkeletonPaths.
+Its generic raster primitives are shared through ``fitting.centerline`` and
+SkeletonPaths. Do not change the versioned objective or application-specific
+fitting behavior.
 """
 
 from __future__ import annotations

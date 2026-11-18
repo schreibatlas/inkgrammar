@@ -11,6 +11,7 @@ import numpy as np
 import rasterregions as rr
 from PIL import Image, ImageDraw
 from rasterregions import Component, MaskMethod, MaskMode, MaskResult
+from rasterregions.io import spaced_hypotheses_payload, write_spaced_hypotheses
 
 from .models import CropRect
 
@@ -95,6 +96,8 @@ class PageSegmentation:
     reference_profile: str | None = None
     rows: tuple[ReferenceRowDiagnostic, ...] = ()
     unassigned_ink_fraction: float = 0.0
+    hypothesis_count: int = 1
+    search_truncated: bool = False
 
 
 
@@ -118,7 +121,7 @@ RowBand = rr.RowBand
 detect_ink_rows = rr.detect_rows
 
 
-REFERENCE_SEGMENTATION_VERSION = "2"
+REFERENCE_SEGMENTATION_VERSION = "3"
 
 
 def _coerce_reference_profile(
@@ -296,21 +299,29 @@ def _adapt_candidates(
     for reading_order, region in enumerate(selected):
         column = columns.get(region.row_index, 0)
         columns[region.row_index] = column + 1
+        ys, xs = np.nonzero(region.mask)
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        bbox = CropRect(
+            x=region.bbox.x0 + x0,
+            y=region.bbox.y0 + y0,
+            width=x1 - x0,
+            height=y1 - y0,
+        )
+        mask = region.mask[y0:y1, x0:x1]
+        image = result.image.crop(
+            (bbox.x, bbox.y, bbox.x + bbox.width, bbox.y + bbox.height)
+        )
         candidates.append(
             SegmentedGlyph(
                 glyph_id=f"{prefix}-{reading_order:03d}",
-                bbox=CropRect(
-                    x=region.bbox.x0,
-                    y=region.bbox.y0,
-                    width=region.bbox.width,
-                    height=region.bbox.height,
-                ),
+                bbox=bbox,
                 row_index=region.row_index,
                 column_index=column,
                 reading_order=reading_order,
                 segmentation_confidence=region.confidence,
-                image=_isolated_candidate_image(region.image, region.mask),
-                mask=region.mask,
+                image=_isolated_candidate_image(image, mask),
+                mask=mask,
                 component_indices=region.component_indices,
                 mask_method=result.mask_result.method,
                 warnings=(warnings_by_region or {}).get(region.reading_order, ()),
@@ -367,6 +378,7 @@ def _write_page_mask(mask: np.ndarray, output: Path) -> None:
 def _write_reference_diagnostics(
     result: rr.DetectionResult,
     segmentation: PageSegmentation,
+    hypotheses: rr.SpacedSegmentationHypotheses,
     output_dir: Path,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -464,6 +476,8 @@ def _write_reference_diagnostics(
     payload = {
         "source_image": segmentation.source_path.name,
         "algorithm_version": REFERENCE_SEGMENTATION_VERSION,
+        "hypothesis_count": segmentation.hypothesis_count,
+        "search_truncated": segmentation.search_truncated,
         "reference_profile": segmentation.reference_profile,
         "row_count": len(segmentation.rows),
         "rows": row_records,
@@ -480,6 +494,10 @@ def _write_reference_diagnostics(
     (output_dir / "reference-candidates.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
+    (output_dir / "reference-segmentation-hypotheses.json").write_text(
+        json.dumps(spaced_hypotheses_payload(hypotheses), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def segment_reference_gallery(
@@ -492,7 +510,8 @@ def segment_reference_gallery(
     """Detect anonymous reference glyphs with an application-level row profile."""
     source_path = Path(image_path)
     profile = _coerce_reference_profile(reference_profile)
-    result = rr.detect_spaced_regions(source_path, mode=ink_mode)
+    hypotheses = rr.detect_spaced_region_hypotheses(source_path, mode=ink_mode)
+    result = hypotheses.selected
     override_rows = (
         profile.include_rows if profile.include_rows is not None else profile.exclude_rows
     )
@@ -549,9 +568,11 @@ def segment_reference_gallery(
         reference_profile=profile.name,
         rows=row_diagnostics,
         unassigned_ink_fraction=unassigned_fraction,
+        hypothesis_count=len(hypotheses.page_hypotheses),
+        search_truncated=hypotheses.truncated,
     )
     if output_dir is not None:
-        _write_reference_diagnostics(result, segmentation, Path(output_dir))
+        _write_reference_diagnostics(result, segmentation, hypotheses, Path(output_dir))
     if not candidates:
         diagnostic = Path(output_dir) / "reference-candidates.png" if output_dir else None
         raise SegmentationError("No reference glyph candidates were detected.", diagnostic)
@@ -580,6 +601,7 @@ def _write_sample_diagnostics(
     boundaries: list[int] | None,
     row_y0: int,
     row_y1: int,
+    hypotheses: rr.SpacedSegmentationHypotheses,
     output_dir: Path,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -608,11 +630,27 @@ def _write_sample_diagnostics(
         "warnings": warnings,
         "samples": [_candidate_record(candidate) for candidate in candidates],
         "boundaries": boundaries,
+        "hypothesis_count": len(hypotheses.page_hypotheses),
+        "page_allocations": [
+            [row.count for row in page.row_hypotheses]
+            for page in hypotheses.page_hypotheses
+        ],
+        "search_truncated": hypotheses.truncated,
+        "search_limit": (
+            hypotheses.selected.diagnostics.search_limit
+            if hypotheses.selected.diagnostics
+            else None
+        ),
     }
     for filename in ("sample-segmentation.json", "sample-candidates.json"):
         (output_dir / filename).write_text(
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
+    (output_dir / "sample-hypotheses.json").write_text(
+        json.dumps(spaced_hypotheses_payload(hypotheses), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    write_spaced_hypotheses(hypotheses, output_dir / "sample-hypotheses")
 
 
 def segment_sample_glyphs(
@@ -626,13 +664,24 @@ def segment_sample_glyphs(
     if expected_count < 1:
         raise ValueError("expected_count must be positive")
     source_path = Path(image_path)
-    result = rr.detect_regions(
+    hypotheses = rr.detect_spaced_region_hypotheses(
         source_path,
         expected_count=expected_count,
-        expected_count_scope="row",
         mode=ink_mode,
     )
+    result = hypotheses.selected
+    exact_page = (
+        hypotheses.page_hypotheses[0]
+        if hypotheses.page_hypotheses
+        and hypotheses.page_hypotheses[0].count == expected_count
+        and hypotheses.page_hypotheses[0].unassigned_ink_fraction == 0.0
+        and all(region.body_count > 0 for region in hypotheses.page_hypotheses[0].regions)
+        else None
+    )
     candidates = _adapt_candidates(result, "sample")
+    sample_status = (
+        "ok" if exact_page is not None and len(candidates) == expected_count else "failed"
+    )
     if output_dir is not None:
         selected_row_index = result.regions[0].row_index if result.regions else 0
         row = result.rows[selected_row_index] if result.rows else None
@@ -651,14 +700,15 @@ def segment_sample_glyphs(
             components,
             candidates,
             expected_count,
-            result.status,
+            sample_status,
             list(result.warnings),
             boundaries,
             row.bbox.y0 if row else 0,
             row.bbox.y1 if row else result.image.height,
+            hypotheses,
             Path(output_dir),
         )
-    if result.status != "ok" or len(candidates) != expected_count:
+    if sample_status != "ok" or len(candidates) != expected_count:
         diagnostic = Path(output_dir) / "sample-boundaries.png" if output_dir is not None else None
         raise SegmentationError(
             f"Unable to recover {expected_count} credible letter regions.", diagnostic

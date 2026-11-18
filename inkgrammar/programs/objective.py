@@ -5,10 +5,10 @@ from dataclasses import dataclass, field
 from math import hypot
 
 import numpy as np
-from PIL import Image, ImageDraw
-from planarcurve import evaluate_heading, evaluate_trajectory, evaluate_trajectory_at
+from planarcurve import Affine2D, evaluate_heading, evaluate_trajectory, evaluate_trajectory_at
 from pydantic import Field
 from rasterregions import components
+from strokeoutline import RasterFrame, StrokeInput, render_strokes
 
 from ..dataset.transforms import glyph_units_to_source_px
 from ..fitting.alignment import bilinear_sample
@@ -57,7 +57,16 @@ def _width_in_model_units(width_profile: object) -> float:
         return 0.12
     if isinstance(width_profile, (int, float, np.number)) and not isinstance(width_profile, bool):
         return float(width_profile)
-    raise ValueError("the directed centerline fitter supports constant width profiles only")
+    if callable(width_profile):
+        return float(width_profile(0.5))
+    try:
+        knots = tuple(width_profile)
+    except TypeError as exc:
+        raise ValueError("unsupported width profile") from exc
+    if not knots:
+        raise ValueError("width profile must contain at least one knot")
+    positions, widths = zip(*knots, strict=True)
+    return float(np.interp(0.5, positions, widths))
 
 
 def _pixels_per_model_unit(observation: GlyphObservation) -> float:
@@ -91,23 +100,36 @@ def render_program_coverage(
     samples_per_movement: int = 64,
     supersampling: int = 3,
 ) -> np.ndarray:
-    """Render a fast centerline coverage mask in the observation pixel frame."""
+    """Render compiled cubic centerlines with StrokeOutline in the observation frame."""
     if samples_per_movement < 2:
         raise ValueError("samples_per_movement must be at least 2")
     if supersampling < 1:
         raise ValueError("supersampling must be at least 1")
+
     width, height = observation.image.size
-    scale = supersampling
-    image = Image.new("L", (width * scale, height * scale), 0)
-    draw = ImageDraw.Draw(image)
-    paths, widths_px = _movement_points(compiled, observation, samples_per_movement)
-    for points, stroke_width_px in zip(paths, widths_px, strict=True):
-        pixels = [(int(round(x * scale)), int(round(y * scale))) for x, y in points]
-        line_width = max(1, int(round(stroke_width_px * scale)))
-        if len(pixels) >= 2:
-            draw.line(pixels, fill=255, width=line_width, joint="curve")
-    resized = image.resize((width, height), Image.Resampling.LANCZOS)
-    return np.asarray(resized, dtype=np.float32) / 255.0
+    frame = observation.frame
+    glyph_to_pixel = Affine2D.from_basis(
+        frame.origin_source_px,
+        np.asarray(frame.x_axis_source_px) * frame.x_height_px,
+        np.asarray(frame.y_axis_source_px) * frame.x_height_px,
+    )
+    raster_frame = RasterFrame(
+        width,
+        height,
+        glyph_to_pixel.compose(compiled.frame_transform),
+    )
+    strokes = tuple(
+        StrokeInput(
+            movement.movement_id,
+            movement.cubic_path,
+            movement.width_profile if movement.width_profile is not None else 0.12,
+        )
+        for movement in compiled.movements
+    )
+    rendered = render_strokes(strokes, raster_frame=raster_frame, supersampling=supersampling)
+    if rendered.combined_coverage is None:
+        raise RuntimeError("StrokeOutline did not return raster coverage for the requested frame")
+    return rendered.combined_coverage
 
 
 def _angle_difference(first: float, second: float) -> float:
