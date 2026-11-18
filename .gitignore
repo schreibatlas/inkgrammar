@@ -221,7 +221,7 @@ __marimo__/
 build/
 dist/
 work/
-inkgrammar/_version.py
+scriptstrokes/_version.py
 context_*.md
 context_*.unpack.py
 context_*.index.json
