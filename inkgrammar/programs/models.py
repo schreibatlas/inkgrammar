@@ -210,6 +210,8 @@ class DirectedGlyphProgram(StrictModel):
     parameters: list[ProgramParameter] = Field(default_factory=list)
     entry_landmark: str | None = None
     exit_landmark: str | None = None
+    gesture_instance_count: int | None = Field(default=None, ge=0)
+    exception_override_count: int = Field(default=0, ge=0)
     provenance: ProgramProvenance = Field(default_factory=ProgramProvenance)
 
     @model_validator(mode="after")

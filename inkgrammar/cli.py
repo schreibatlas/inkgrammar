@@ -10,6 +10,7 @@ from . import __version__
 from .data_cli import app as data_app
 from .dataset_cli import app as dataset_app
 from .fit import fit_join
+from .grammar_cli import app as grammar_app
 from .io import load_layout, load_model
 from .page import extract_labeled_page
 from .qc import validate_model
@@ -29,6 +30,7 @@ app.add_typer(dataset_app, name="dataset")
 app.add_typer(fit_app, name="fit")
 register_trajectory_commands(fit_app)
 app.add_typer(font_app, name="font")
+app.add_typer(grammar_app, name="grammar")
 CONTROL_SHEET_OUTPUT = Path("work/sas-1968/control/alphabet.png")
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -7,9 +8,12 @@ import numpy as np
 import pytest
 import yaml
 from PIL import Image, ImageFilter
+from planarcurve import Affine2D
+from strokeoutline import RasterFrame, StrokeInput, render_strokes
 
 from inkgrammar.dataset.transforms import standard_frame
 from inkgrammar.fitting.models import PrimitiveTemplate
+from inkgrammar.programs import write_program_fit_diagnostic
 from inkgrammar.programs.compiler import compile_glyph_program
 from inkgrammar.programs.fitting import DirectedFitConfig, fit_known_glyph
 from inkgrammar.programs.models import DirectedGlyphProgram
@@ -125,6 +129,24 @@ def test_program_objective_reports_decomposed_terms_and_reuses_observation_data(
     assert true_energy.constraints >= 0.0
     assert true_energy.prior >= 0.0
     assert true_energy.width == 0.0
+    assert true_energy.complexity > 0.0
+    assert true_energy.complexity_breakdown.primitive_instances == len(program.movements)
+    assert true_energy.complexity_breakdown.gesture_instances is None
+    assert true_energy.complexity_breakdown.free_parameters == len(program.parameters)
+    assert true_energy.complexity_breakdown.pen_lifts == len(program.strokes) - 1
+    assert true_energy.complexity_breakdown.exception_overrides == 0
+    weights = ProgramObjectiveWeights()
+    assert weights.complexity == 0.001
+    assert true_energy.total == pytest.approx(
+        weights.ink * true_energy.ink
+        + weights.distance * true_energy.distance
+        + weights.centerline * true_energy.centerline
+        + weights.topology * true_energy.topology
+        + weights.constraints * true_energy.constraints
+        + weights.prior * true_energy.prior
+        + weights.width * true_energy.width
+        + weights.complexity * true_energy.complexity
+    )
 
 
 def test_program_objective_uses_optional_skeleton_evidence() -> None:
@@ -317,3 +339,123 @@ def test_synthetic_fit_improves_on_blurred_noisy_padded_observation() -> None:
     assert abs(result.parameters["entry-length"] - true_values["entry-length"]) < 0.2
     assert abs(result.parameters["bowl-length"] - true_values["bowl-length"]) < 0.25
     assert abs(result.parameters["stroke-width"] - true_values["stroke-width"]) < 0.03
+
+
+
+def test_program_render_parity_matches_final_strokeoutline_output() -> None:
+    program, primitives = load_inputs()
+    values = {
+        "alignment-scale": 1.0,
+        "alignment-rotation": 0.0,
+        "alignment-translation-x": 0.0,
+        "alignment-translation-y": 0.0,
+        "entry-length": 0.28,
+        "bowl-length": 0.85,
+        "stem-angle": 0.0,
+        "slant": 0.0,
+        "stroke-width": 0.12,
+    }
+    observation = synthetic_observation(program, primitives, values)
+    objective = ProgramObjective(
+        program=program,
+        primitive_templates=primitives,
+        observation=observation,
+        weights=ProgramObjectiveWeights(),
+    )
+    _, compiled = objective.evaluate(values)
+    coverage = render_program_coverage(compiled, observation)
+
+    width, height = observation.image.size
+    frame = observation.frame
+    glyph_to_pixel = Affine2D.from_basis(
+        frame.origin_source_px,
+        np.asarray(frame.x_axis_source_px) * frame.x_height_px,
+        np.asarray(frame.y_axis_source_px) * frame.x_height_px,
+    )
+    raster_frame = RasterFrame(
+        width,
+        height,
+        glyph_to_pixel.compose(compiled.frame_transform),
+    )
+    strokes = tuple(
+        StrokeInput(
+            movement.movement_id,
+            movement.cubic_path,
+            movement.width_profile if movement.width_profile is not None else 0.12,
+        )
+        for movement in compiled.movements
+    )
+    final_coverage = render_strokes(
+        strokes,
+        raster_frame=raster_frame,
+        supersampling=3,
+    ).combined_coverage
+
+    assert final_coverage is not None
+    np.testing.assert_array_equal(coverage, final_coverage)
+
+
+def test_program_fit_diagnostic_writes_all_loss_and_provenance_panels(tmp_path: Path) -> None:
+    program, primitives = load_inputs()
+    values = {
+        "alignment-scale": 1.0,
+        "alignment-rotation": 0.0,
+        "alignment-translation-x": 0.0,
+        "alignment-translation-y": 0.0,
+        "entry-length": 0.28,
+        "bowl-length": 0.85,
+        "stem-angle": 0.0,
+        "slant": 0.0,
+        "stroke-width": 0.12,
+    }
+    observation = synthetic_observation(program, primitives, values)
+    energy, compiled = ProgramObjective(
+        program=program,
+        primitive_templates=primitives,
+        observation=observation,
+        weights=ProgramObjectiveWeights(),
+    ).evaluate(values)
+    output = tmp_path / "letter-a.png"
+    report = write_program_fit_diagnostic(
+        compiled,
+        program,
+        observation,
+        energy,
+        output,
+        segmentation_alternatives=(observation.mask, ~observation.mask),
+        stroke_hypotheses=(np.asarray([[20.0, 30.0], [45.0, 50.0]]),),
+        gesture_boundaries={"body": (0.1, 0.8)},
+        gesture_names={"body": "underturn"},
+        geometry_family_ids={"body": "curve-family-017"},
+        route_ambiguous=True,
+        direction_ambiguous=True,
+    )
+
+    assert output.is_file()
+    assert Image.open(output).size == (672, 870)
+    assert len(report["panels"]) == 15
+    assert report["segmentation_alternative_count"] == 2
+    assert report["stroke_hypothesis_count"] == 1
+    assert report["gesture_names"] == {"body": "underturn"}
+    assert report["geometry_family_ids"] == {"body": "curve-family-017"}
+    assert report["ambiguity"] == {"route": True, "direction": True}
+    assert set(report["loss_breakdown"]) >= {
+        "total",
+        "ink",
+        "distance",
+        "centerline",
+        "topology",
+        "constraints",
+        "prior",
+        "width",
+        "complexity",
+    }
+    assert set(report["complexity"]) == {
+        "primitive_instances",
+        "gesture_instances",
+        "free_parameters",
+        "pen_lifts",
+        "exception_overrides",
+    }
+    assert report["provenance"] == program.provenance.model_dump(mode="json")
+    assert json.loads(output.with_suffix(".json").read_text()) == report

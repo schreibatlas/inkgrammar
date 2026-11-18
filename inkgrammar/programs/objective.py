@@ -40,6 +40,15 @@ class ProgramObjectiveWeights(StrictModel):
     prior: float = Field(default=0.03, ge=0.0, allow_inf_nan=False)
     width: float = Field(default=0.2, ge=0.0, allow_inf_nan=False)
 
+    complexity: float = Field(default=0.001, ge=0.0, allow_inf_nan=False)
+
+
+class ProgramComplexityBreakdown(StrictModel):
+    primitive_instances: int = Field(ge=0)
+    gesture_instances: int | None = Field(default=None, ge=0)
+    free_parameters: int = Field(ge=0)
+    pen_lifts: int = Field(ge=0)
+    exception_overrides: int = Field(ge=0)
 
 class ProgramFitEnergy(StrictModel):
     total: float = Field(ge=0.0, allow_inf_nan=False)
@@ -50,6 +59,9 @@ class ProgramFitEnergy(StrictModel):
     constraints: float = Field(ge=0.0, allow_inf_nan=False)
     prior: float = Field(ge=0.0, allow_inf_nan=False)
     width: float = Field(ge=0.0, allow_inf_nan=False)
+    complexity: float = Field(ge=0.0, allow_inf_nan=False)
+    complexity_breakdown: ProgramComplexityBreakdown
+
 
 
 def _width_in_model_units(width_profile: object) -> float:
@@ -275,6 +287,26 @@ def _prior_loss(program: DirectedGlyphProgram, values: Mapping[str, float]) -> f
     return float(np.mean(residuals)) if residuals else 0.0
 
 
+
+def _complexity_breakdown(program: DirectedGlyphProgram) -> ProgramComplexityBreakdown:
+    return ProgramComplexityBreakdown(
+        primitive_instances=len(program.movements),
+        gesture_instances=program.gesture_instance_count,
+        free_parameters=sum(parameter.lower < parameter.upper for parameter in program.parameters),
+        pen_lifts=max(0, len(program.strokes) - 1),
+        exception_overrides=program.exception_override_count,
+    )
+
+
+def _complexity_score(breakdown: ProgramComplexityBreakdown) -> float:
+    return float(
+        breakdown.primitive_instances
+        + (breakdown.gesture_instances or 0)
+        + breakdown.free_parameters
+        + breakdown.pen_lifts
+        + breakdown.exception_overrides
+    )
+
 def _centerline_loss(
     observation: GlyphObservation,
     paths: list[np.ndarray],
@@ -364,6 +396,8 @@ class ProgramObjective:
         topology = self._topology
         constraints = _constraint_loss(self.program, compiled)
         prior = _prior_loss(self.program, values)
+        complexity_breakdown = _complexity_breakdown(self.program)
+        complexity = _complexity_score(complexity_breakdown)
         width = _width_loss(self.observation, widths_px)
         total = (
             self.weights.ink * ink
@@ -373,6 +407,7 @@ class ProgramObjective:
             + self.weights.constraints * constraints
             + self.weights.prior * prior
             + self.weights.width * width
+            + self.weights.complexity * complexity
         )
         energy = ProgramFitEnergy(
             total=total,
@@ -383,6 +418,8 @@ class ProgramObjective:
             constraints=constraints,
             prior=prior,
             width=width,
+            complexity=complexity,
+            complexity_breakdown=complexity_breakdown,
         )
         return energy, compiled
 

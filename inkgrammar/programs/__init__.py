@@ -5,7 +5,11 @@ from .compiler import (
     CompiledProgramMovement,
     compile_glyph_program,
 )
-from .diagnostics import render_program_diagnostic
+from .diagnostics import (
+    render_program_diagnostic,
+    render_program_fit_diagnostic,
+    write_program_fit_diagnostic,
+)
 from .fitting import (
     DirectedFitConfig,
     DirectedGlyphFitResult,
@@ -30,6 +34,7 @@ from .models import (
     TangentContinuityConstraint,
 )
 from .objective import (
+    ProgramComplexityBreakdown,
     ProgramFitEnergy,
     ProgramObjective,
     ProgramObjectiveWeights,
@@ -72,6 +77,7 @@ __all__ = [
     "ProgramLandmark",
     "ProgramMovement",
     "ProgramObjective",
+    "ProgramComplexityBreakdown",
     "ProgramObjectiveWeights",
     "ProgramParameter",
     "ProgramParameterBinding",
@@ -87,6 +93,8 @@ __all__ = [
     "prepare_glyph_observation",
     "render_program_coverage",
     "render_program_diagnostic",
+    "render_program_fit_diagnostic",
+    "write_program_fit_diagnostic",
     "resolve_program_parameter_values",
     "source_px_to_glyph_units",
     "standard_frame",
