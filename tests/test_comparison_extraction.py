@@ -3,7 +3,14 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from PIL import Image, ImageDraw
-from rasterregions import BBox, MaskMode, MaskResult, foreground_mask, tighten_bbox
+from rasterregions import (
+    BBox,
+    ForegroundEvidence,
+    MaskMode,
+    MaskResult,
+    foreground_mask,
+    tighten_bbox,
+)
 from skimage.draw import circle_perimeter
 
 from inkgrammar.comparison import (
@@ -136,21 +143,76 @@ def test_comparison_api_passes_mask_mode_to_rasterregions(tmp_path, monkeypatch)
 
     mask = np.zeros((20, 20), dtype=bool)
     mask[3:17, 10] = True
-    external_result = MaskResult(mask, 1.0, "grayscale", ())
+    external_evidence = ForegroundEvidence(
+        mask,
+        np.where(mask, 1.0, -1.0),
+        1.0,
+        "grayscale",
+    )
     received_modes = []
 
-    def foreground_mask_stub(image, *, mode):
+    def foreground_evidence_stub(image, *, mode):
         received_modes.append(mode)
-        return external_result
+        return external_evidence
 
-    monkeypatch.setattr(api, "foreground_mask", foreground_mask_stub)
+    monkeypatch.setattr(api, "foreground_evidence", foreground_evidence_stub)
     image_path = tmp_path / "crop.png"
     Image.new("RGB", (20, 20), "white").save(image_path)
 
     extracted = api.extract_letter(image_path, (0, 0, 20, 20), ink_mode="color")
 
     assert received_modes == ["color"]
-    assert extracted.mask_result is external_result
+    assert np.array_equal(extracted.mask_result.mask, external_evidence.mask)
+    assert extracted.mask_result.method == "grayscale"
+    assert extracted.diagnostics.analysis is not None
+
+
+def test_extract_letter_keeps_discrete_walk_and_refined_geometry(tmp_path):
+    from inkgrammar.comparison import extract_letter
+
+    image = Image.new("RGB", (52, 52), "white")
+    ImageDraw.Draw(image).line((8, 42, 18, 12, 28, 40, 42, 15), fill="black", width=7)
+    image_path = tmp_path / "curved.png"
+    image.save(image_path)
+
+    extracted = extract_letter(image_path, (0, 0, 52, 52))
+
+    assert extracted.ordered_path is not None
+    assert extracted.ordered_path.walk is not None
+    assert extracted.diagnostics.analysis is not None
+    assert extracted.continuous_path is not None
+    assert extracted.continuous_path.source == "skeletonpaths-subpixel-v1"
+    assert extracted.continuous_path.boundary_evidence == "rasterregions-decision-field"
+    assert extracted.continuous_path.edge_ids == extracted.ordered_path.walk.edge_ids
+    assert extracted.resampled_xy.shape == (256, 2)
+
+
+def test_continuous_reconstruction_failure_preserves_topology_comparison(tmp_path, monkeypatch):
+    from skeletonpaths import SubpixelReconstructionError
+
+    from inkgrammar.comparison import api
+
+    image = Image.new("RGB", (32, 32), "white")
+    ImageDraw.Draw(image).line((16, 4, 16, 27), fill="black", width=5)
+    image_path = tmp_path / "line.png"
+    image.save(image_path)
+
+    def fail_refinement(*args, **kwargs):
+        raise SubpixelReconstructionError("forced reconstruction failure")
+
+    monkeypatch.setattr(api, "refine_continuous_path", fail_refinement)
+    extracted = api.extract_letter(image_path, (0, 0, 32, 32), allow_path_failure=True)
+    comparison = api.compare_extracted_letters(
+        extracted,
+        extracted,
+        identity=api.ComparisonIdentity("sample", "reference"),
+    )
+
+    assert extracted.ordered_path is not None
+    assert extracted.continuous_path is None
+    assert extracted.diagnostics.topology.component_count == 1
+    assert comparison.alignment is None
+    assert any("forced reconstruction failure" in warning for warning in comparison.warnings)
 
 
 def test_crop_to_ink_uses_rasterregions_bbox_and_preserves_empty_policy():
@@ -162,7 +224,6 @@ def test_crop_to_ink_uses_rasterregions_bbox_and_preserves_empty_policy():
 
     assert np.array_equal(cropped, mask[bbox.y0 : bbox.y1, bbox.x0 : bbox.x1])
     assert crop_to_ink(np.zeros((3, 5), dtype=bool)).shape == (1, 1)
-
 
 
 def test_extract_segmented_glyph_reuses_exact_candidate_mask(tmp_path, monkeypatch):
@@ -196,7 +257,7 @@ def test_extract_segmented_glyph_reuses_exact_candidate_mask(tmp_path, monkeypat
         raise AssertionError("segmented extraction must not threshold the candidate image")
 
     monkeypatch.setattr(api, "analyze_skeleton", count_analysis)
-    monkeypatch.setattr(api, "foreground_mask", fail_foreground_mask)
+    monkeypatch.setattr(api, "foreground_evidence", fail_foreground_mask)
 
     extracted = api.extract_segmented_glyph(candidate, source_path=tmp_path / "sample.png")
 

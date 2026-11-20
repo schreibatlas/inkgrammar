@@ -144,7 +144,6 @@ def test_page_mask_adapter_is_rasterregions_foreground_mask():
     assert isinstance(result.warnings, tuple)
 
 
-
 def _alphabet_like_page(path):
     image = Image.new("RGB", (820, 530), "white")
     draw = ImageDraw.Draw(image)
@@ -215,9 +214,7 @@ def test_generated_anchor_first_reference_has_63_disjoint_candidates(tmp_path):
     for candidate in gallery.candidates:
         page_mask = np.zeros(gallery.mask_result.mask.shape, dtype=bool)
         x0, y0 = candidate.bbox.x, candidate.bbox.y
-        page_mask[y0 : y0 + candidate.bbox.height, x0 : x0 + candidate.bbox.width] = (
-            candidate.mask
-        )
+        page_mask[y0 : y0 + candidate.bbox.height, x0 : x0 + candidate.bbox.width] = candidate.mask
         page_masks.append(page_mask)
     assert all(
         not np.any(page_masks[left] & page_masks[right])
@@ -232,9 +229,7 @@ def test_generated_anchor_first_reference_has_63_disjoint_candidates(tmp_path):
     }
 
 
-def test_reference_hypothesis_invariant_falls_back_to_detected_anchor_counts(
-    tmp_path, monkeypatch
-):
+def test_reference_hypothesis_invariant_falls_back_to_detected_anchor_counts(tmp_path, monkeypatch):
     row_counts = [12, 8, 6, 11, 11, 5, 10]
     path = _anchor_first_reference_page(tmp_path / "anchor-reference.png")
     output = tmp_path / "anchor-fallback-diagnostics"
@@ -254,9 +249,7 @@ def test_reference_hypothesis_invariant_falls_back_to_detected_anchor_counts(
     assert gallery.segmentation.status == "ambiguous"
     assert gallery.segmentation.hypothesis_count == 1
     assert any("row-boundary invariant" in warning for warning in gallery.segmentation.warnings)
-    hypotheses = json.loads(
-        (output / "reference-segmentation-hypotheses.json").read_text()
-    )
+    hypotheses = json.loads((output / "reference-segmentation-hypotheses.json").read_text())
     assert hypotheses["page_hypotheses"] == []
     assert len(hypotheses["selected"]["regions"]) == 63
 
@@ -336,7 +329,6 @@ def test_alphabet_profile_excludes_title_and_year_and_isolates_all_glyph_rows(tm
     assert manifest["row_count"] == 9
     assert [row["row"] for row in manifest["excluded_rows"]] == [0, 1]
     assert manifest["candidate_count"] == 62
-
 
     from inkgrammar.comparison.segmentation import ReferenceSheetProfile
 

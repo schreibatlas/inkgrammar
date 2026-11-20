@@ -103,7 +103,6 @@ class PageSegmentation:
     anchor_region_count: int | None = None
 
 
-
 @dataclass(frozen=True)
 class ReferenceGallery:
     source_path: Path
@@ -185,8 +184,7 @@ def _classify_reference_rows(
         median_height = float(median(heights)) if heights else 0.0
         occupancy = min(1.0, sum(widths) / max(1, row.bbox.width))
         spacings = [
-            right.bbox.x0 - left.bbox.x1
-            for left, right in zip(regions, regions[1:], strict=False)
+            right.bbox.x0 - left.bbox.x1 for left, right in zip(regions, regions[1:], strict=False)
         ]
         median_spacing = float(median(spacings)) if spacings else None
         included = True
@@ -319,9 +317,7 @@ def _adapt_candidates(
             height=y1 - y0,
         )
         mask = region.mask[y0:y1, x0:x1]
-        image = result.image.crop(
-            (bbox.x, bbox.y, bbox.x + bbox.width, bbox.y + bbox.height)
-        )
+        image = result.image.crop((bbox.x, bbox.y, bbox.x + bbox.width, bbox.y + bbox.height))
         candidates.append(
             SegmentedGlyph(
                 glyph_id=f"{prefix}-{reading_order:03d}",
@@ -424,9 +420,7 @@ def _write_reference_diagnostics(
     rows_by_index = {row.row_index: row for row in segmentation.rows if row.included}
     candidates_by_row = {
         row_index: [
-            candidate
-            for candidate in segmentation.candidates
-            if candidate.row_index == row_index
+            candidate for candidate in segmentation.candidates if candidate.row_index == row_index
         ]
         for row_index in rows_by_index
     }
@@ -685,17 +679,21 @@ def _write_reference_failure_diagnostics(
     (hypotheses_dir / "failure.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
-    return "\n".join(message_lines), diagnostic_path, {
-        "failure_phase": "rasterregions_detection",
-        "reference_profile": reference_profile,
-        "ink_mode": ink_mode,
-        "row_count": len(rows),
-        "component_count": len(components),
-        "region_count": region_count,
-        "anchor_region_count": anchor_region_count,
-        "search_truncated": search_truncated,
-        "search_limit": search_limit,
-    }
+    return (
+        "\n".join(message_lines),
+        diagnostic_path,
+        {
+            "failure_phase": "rasterregions_detection",
+            "reference_profile": reference_profile,
+            "ink_mode": ink_mode,
+            "row_count": len(rows),
+            "component_count": len(components),
+            "region_count": region_count,
+            "anchor_region_count": anchor_region_count,
+            "search_truncated": search_truncated,
+            "search_limit": search_limit,
+        },
+    )
 
 
 def _detect_reference_hypotheses(
@@ -778,9 +776,7 @@ def segment_reference_gallery(
         warnings.append(fallback_warning)
     diagnostics = result.diagnostics
     unassigned_fraction = diagnostics.unassigned_ink_fraction if diagnostics else 0.0
-    search_truncated = hypotheses.truncated or bool(
-        diagnostics and diagnostics.search_truncated
-    )
+    search_truncated = hypotheses.truncated or bool(diagnostics and diagnostics.search_truncated)
     search_limit = diagnostics.search_limit if diagnostics else None
     if search_truncated:
         ambiguous = True
@@ -880,6 +876,7 @@ def segment_reference_gallery(
         segmentation=segmentation,
     )
 
+
 def _write_sample_diagnostics(
     image: Image.Image,
     source_name: str,
@@ -923,8 +920,7 @@ def _write_sample_diagnostics(
         "boundaries": boundaries,
         "hypothesis_count": len(hypotheses.page_hypotheses),
         "page_allocations": [
-            [row.count for row in page.row_hypotheses]
-            for page in hypotheses.page_hypotheses
+            [row.count for row in page.row_hypotheses] for page in hypotheses.page_hypotheses
         ],
         "search_truncated": hypotheses.truncated,
         "search_limit": (

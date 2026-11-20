@@ -32,6 +32,7 @@ from .matching import (
 )
 from .models import (
     ComparisonIdentity,
+    ContinuousPath,
     CropRect,
     ExtractedLetter,
     OrderedPath,
@@ -51,7 +52,7 @@ from .segmentation import (
 )
 from .skeleton import diagnostics_from_skeleton
 
-_REFERENCE_CACHE_VERSION = 3
+_REFERENCE_CACHE_VERSION = 4
 _DESCRIPTOR_SIZE = 96
 
 _REFERENCE_DIAGNOSTICS = (
@@ -89,6 +90,7 @@ def _copy_reference_diagnostics(cache_dir: Path, output_dir: Path) -> None:
             output_dir / "reference-hypotheses",
             dirs_exist_ok=True,
         )
+
 
 def _mask_sha256(mask: np.ndarray) -> str:
     binary = np.asarray(mask, dtype=np.uint8)
@@ -205,6 +207,7 @@ def _cache_metadata(
             for descriptor in index.descriptors
         ],
     }
+
 
 def _save_reference_cache(
     cache_dir: Path,
@@ -410,6 +413,12 @@ def _load_reference_extraction(
         radius = arrays["radius"]
         path_xy = arrays["path_xy"]
         resampled_xy = arrays["resampled_xy"]
+        continuous_xy = arrays["continuous_xy"]
+        continuous_tangent = arrays["continuous_tangent"]
+        continuous_curvature = arrays["continuous_curvature"]
+        continuous_radius_px = arrays["continuous_radius_px"]
+        continuous_confidence = arrays["continuous_confidence"]
+        continuous_progress = arrays["continuous_progress"]
     diagnostics = diagnostics_from_skeleton(skeleton, radius)
     path_info = metadata["ordered_path"]
     ordered_path = (
@@ -419,6 +428,26 @@ def _load_reference_extraction(
             total_edge_count=path_info["total_edge_count"],
         )
         if path_info is not None
+        else None
+    )
+    continuous_info = metadata["continuous_path"]
+    continuous_path = (
+        ContinuousPath(
+            xy=continuous_xy,
+            tangent=continuous_tangent,
+            curvature=continuous_curvature,
+            radius_px=continuous_radius_px,
+            confidence=continuous_confidence,
+            progress=continuous_progress,
+            arc_length_px=continuous_info["arc_length_px"],
+            source=continuous_info["source"],
+            boundary_evidence=continuous_info["boundary_evidence"],
+            route_event_indices=tuple(continuous_info["route_event_indices"]),
+            route_event_progress=tuple(continuous_info["route_event_progress"]),
+            edge_ids=tuple(continuous_info["edge_ids"]),
+            edge_directions=tuple(continuous_info["edge_directions"]),
+        )
+        if continuous_info is not None
         else None
     )
     with Image.open(image_path) as crop_image:
@@ -436,6 +465,8 @@ def _load_reference_extraction(
         diagnostics=diagnostics,
         ordered_path=ordered_path,
         resampled_xy=resampled_xy if ordered_path is not None else None,
+        continuous_path=continuous_path,
+        geometry_warning=metadata["geometry_warning"],
     )
 
 
@@ -449,6 +480,7 @@ def _save_reference_extraction(
     metadata_path, arrays_path, image_path = _reference_extraction_paths(cache_dir, glyph_id)
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     ordered_path = extraction.ordered_path
+    continuous_path = extraction.continuous_path
     np.savez_compressed(
         arrays_path,
         mask=extraction.mask_result.mask,
@@ -457,6 +489,22 @@ def _save_reference_extraction(
         path_xy=(ordered_path.xy if ordered_path is not None else np.zeros((0, 2))),
         resampled_xy=(
             extraction.resampled_xy if extraction.resampled_xy is not None else np.zeros((0, 2))
+        ),
+        continuous_xy=(continuous_path.xy if continuous_path is not None else np.zeros((0, 2))),
+        continuous_tangent=(
+            continuous_path.tangent if continuous_path is not None else np.zeros((0, 2))
+        ),
+        continuous_curvature=(
+            continuous_path.curvature if continuous_path is not None else np.zeros(0)
+        ),
+        continuous_radius_px=(
+            continuous_path.radius_px if continuous_path is not None else np.zeros(0)
+        ),
+        continuous_confidence=(
+            continuous_path.confidence if continuous_path is not None else np.zeros(0)
+        ),
+        continuous_progress=(
+            continuous_path.progress if continuous_path is not None else np.zeros(0)
         ),
     )
     extraction.image.save(image_path, format="PNG")
@@ -477,6 +525,20 @@ def _save_reference_extraction(
             if ordered_path is not None
             else None
         ),
+        "continuous_path": (
+            {
+                "arc_length_px": continuous_path.arc_length_px,
+                "source": continuous_path.source,
+                "boundary_evidence": continuous_path.boundary_evidence,
+                "route_event_indices": continuous_path.route_event_indices,
+                "route_event_progress": continuous_path.route_event_progress,
+                "edge_ids": continuous_path.edge_ids,
+                "edge_directions": continuous_path.edge_directions,
+            }
+            if continuous_path is not None
+            else None
+        ),
+        "geometry_warning": extraction.geometry_warning,
     }
     metadata_path.write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -622,17 +684,11 @@ def _assess_segmentation(
 ) -> tuple[str, tuple[str, ...]]:
     warnings: list[str] = []
     if gallery.segmentation.status != "ok" or gallery.segmentation.warnings:
-        warnings.extend(
-            f"Reference page: {warning}" for warning in gallery.segmentation.warnings
-        )
+        warnings.extend(f"Reference page: {warning}" for warning in gallery.segmentation.warnings)
         if not gallery.segmentation.warnings:
-            warnings.append(
-                f"Reference page segmentation status is {gallery.segmentation.status}."
-            )
+            warnings.append(f"Reference page segmentation status is {gallery.segmentation.status}.")
     warnings.extend(f"Sample {sample.glyph_id}: {warning}" for warning in sample.warnings)
-    warnings.extend(
-        f"Reference {reference.glyph_id}: {warning}" for warning in reference.warnings
-    )
+    warnings.extend(f"Reference {reference.glyph_id}: {warning}" for warning in reference.warnings)
     if sample.segmentation_confidence < 0.3:
         warnings.append(f"Sample {sample.glyph_id} boundary confidence is low.")
     if reference.segmentation_confidence < 0.3:
@@ -717,13 +773,13 @@ def _write_segmentation_only_summary(
     (output_dir / "summary.md").write_text(markdown, encoding="utf-8")
     (output_dir / "index.html").write_text(
         "<!doctype html><html><head>"
-        "<meta charset=\"utf-8\"><title>Segmentation diagnostics</title></head>"
+        '<meta charset="utf-8"><title>Segmentation diagnostics</title></head>'
         "<body><h1>Segmentation diagnostics</h1><ul>"
-        "<li><a href=\"segmentation/reference-rows.png\">Reference rows</a></li>"
-        "<li><a href=\"segmentation/reference-candidates.png\">Reference candidates</a></li>"
-        "<li><a href=\"segmentation/reference-gallery.png\">Reference gallery</a></li>"
-        "<li><a href=\"segmentation/sample-boundaries.png\">Sample boundaries</a></li>"
-        "<li><a href=\"summary.json\">Summary JSON</a></li>"
+        '<li><a href="segmentation/reference-rows.png">Reference rows</a></li>'
+        '<li><a href="segmentation/reference-candidates.png">Reference candidates</a></li>'
+        '<li><a href="segmentation/reference-gallery.png">Reference gallery</a></li>'
+        '<li><a href="segmentation/sample-boundaries.png">Sample boundaries</a></li>'
+        '<li><a href="summary.json">Summary JSON</a></li>'
         "</ul></body></html>\n",
         encoding="utf-8",
     )
@@ -912,7 +968,7 @@ def _compare_letter_page_impl(
             "search_limit": gallery.segmentation.search_limit,
             "anchor_region_count": gallery.segmentation.anchor_region_count,
             "unassigned_ink_fraction": gallery.segmentation.unassigned_ink_fraction,
-        }
+        },
     )
 
     if not segment_only:
@@ -1041,10 +1097,7 @@ def _compare_letter_page_impl(
             completed=len(ranked),
             total=len(coarse),
             details={
-                "message": (
-                    f"Refine top {len(coarse)} candidates for "
-                    f"{sample_candidate.glyph_id}"
-                )
+                "message": (f"Refine top {len(coarse)} candidates for {sample_candidate.glyph_id}")
             },
         )
         if not ranked:

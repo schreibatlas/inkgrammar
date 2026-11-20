@@ -53,8 +53,7 @@ def test_inferred_observations_preserve_bounded_skeleton_alternatives() -> None:
     assert all(candidate.segmentation_hypothesis_id == "segmentation-0" for candidate in candidates)
     assert all(len(candidate.stroke_hypotheses) <= 2 for candidate in candidates)
     assert all(
-        candidate.provenance.evidence_level == "inferred-ambiguous"
-        for candidate in candidates
+        candidate.provenance.evidence_level == "inferred-ambiguous" for candidate in candidates
     )
     assert all(
         stroke.evidence.skeleton_stroke_hypothesis_id == stroke.id
@@ -113,7 +112,6 @@ def test_reviewed_annotations_bypass_static_skeleton_ranking(
     assert stroke.gesture_boundaries[0].status == "reviewed"
     assert stroke.evidence.evidence_level == "reviewed-manual"
     assert stroke.evidence.skeleton_stroke_hypothesis_id is None
-
 
 
 def test_observed_annotations_remain_observed_in_candidate_provenance() -> None:

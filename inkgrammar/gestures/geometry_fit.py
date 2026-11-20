@@ -82,6 +82,7 @@ def fit_geometry_family(
 ) -> FittedGeometryFamily:
     """Fit a semantic-free family through PlanarCurve's shared trajectory APIs."""
     from planarcurve.fitting import fit_trajectory_family, select_shared_trajectory_model
+
     occurrence_values = tuple(occurrences)
     if not occurrence_values:
         raise ValueError("geometry family fitting requires occurrences")
@@ -163,9 +164,7 @@ def fit_geometry_family(
         if held_out_results
         else {}
     )
-    source_ids = list(
-        dict.fromkeys(item.source_observation_id for item in occurrence_values)
-    )
+    source_ids = list(dict.fromkeys(item.source_observation_id for item in occurrence_values))
     evidence = list(
         dict.fromkeys(
             evidence_id
@@ -226,9 +225,7 @@ def _fixed_family_geometry_metrics(
     target_length = polyline_length(target)
     directed_errors = np.linalg.norm(aligned - target, axis=1)
     return {
-        "normalized_directed_rmse": float(
-            np.sqrt(np.mean(directed_errors**2)) / target_length
-        ),
+        "normalized_directed_rmse": float(np.sqrt(np.mean(directed_errors**2)) / target_length),
         "normalized_symmetric_distance": (
             symmetric_polyline_distance(aligned, target, samples=samples) / target_length
         ),

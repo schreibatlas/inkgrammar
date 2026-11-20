@@ -46,12 +46,8 @@ class GestureOccurrence:
             if not np.isfinite(values).all():
                 raise ValueError("primitive curve points must be finite")
             curves[slot_id] = tuple((float(x), float(y)) for x, y in values)
-        parameters = {
-            key: float(value) for key, value in (self.parameter_values or {}).items()
-        }
-        residuals = {
-            key: float(value) for key, value in (self.constraint_residuals or {}).items()
-        }
+        parameters = {key: float(value) for key, value in (self.parameter_values or {}).items()}
+        residuals = {key: float(value) for key, value in (self.constraint_residuals or {}).items()}
         if any(not key.strip() for key in (*parameters, *residuals)):
             raise ValueError("gesture parameter and constraint IDs must not be blank")
         if any(not isfinite(value) for value in parameters.values()):
@@ -158,11 +154,13 @@ def fit_gesture_template(
         for occurrence in occurrence_values
     )
     training_matches = [
-        match for match, occurrence in zip(matches, occurrence_values, strict=True)
+        match
+        for match, occurrence in zip(matches, occurrence_values, strict=True)
         if occurrence.split == "training"
     ]
     held_out_matches = [
-        match for match, occurrence in zip(matches, occurrence_values, strict=True)
+        match
+        for match, occurrence in zip(matches, occurrence_values, strict=True)
         if occurrence.split == "held-out"
     ]
     training_metrics = _aggregate_match_metrics(training_matches)
@@ -256,11 +254,7 @@ def learn_gesture_dictionary(
         for template in template_values
     )
     all_matches = tuple(match for fit in fits for match in fit.matches)
-    reuse = Counter(
-        slot.primitive_family
-        for fit in fits
-        for slot in fit.template.primitives
-    )
+    reuse = Counter(slot.primitive_family for fit in fits for slot in fit.template.primitives)
     return GestureDictionaryFit(
         template_fits=fits,
         ranked_matches=rank_gesture_matches(
@@ -318,9 +312,7 @@ def _score_occurrence(
         parameter_deviations.append(
             abs(value - fitted_values[parameter_id]) / (parameter.upper - parameter.lower)
         )
-    parameter_deviation = (
-        float(np.mean(parameter_deviations)) if parameter_deviations else None
-    )
+    parameter_deviation = float(np.mean(parameter_deviations)) if parameter_deviations else None
     evidence = occurrence.evidence
     evidence_ids = tuple(
         dict.fromkeys(

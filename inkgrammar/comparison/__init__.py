@@ -13,7 +13,12 @@ from .batch import compare_letter_page
 from .batch_report import BatchComparisonReport, BatchSampleResult
 from .crop import coerce_crop_rect, crop_image, load_crop
 from .descriptors import GlyphDescriptor, canonicalize_mask, glyph_descriptor
-from .geometry import DifferentialGeometry, differential_geometry
+from .geometry import (
+    DifferentialGeometry,
+    continuous_differential_geometry,
+    differential_geometry,
+    legacy_differential_geometry_from_polyline,
+)
 from .matching import (
     MatchScore,
     ReferenceIndex,
@@ -29,6 +34,7 @@ from .models import (
     AlignmentResult,
     ComparisonIdentity,
     ComparisonResult,
+    ContinuousPath,
     CropRect,
     ExtractedLetter,
     InkMaskResult,
@@ -40,9 +46,11 @@ from .models import (
 )
 from .path import (
     PathExtractionError,
+    align_continuous_paths,
     align_ordered_paths,
     fit_similarity_transform,
     recover_ordered_path,
+    resample_continuous_path,
     resample_path,
 )
 from .report import WrittenComparisonReport, write_comparison_report
@@ -65,6 +73,7 @@ __all__ = [
     "AlignmentResult",
     "ComparisonAnalysis",
     "ComparisonResult",
+    "ContinuousPath",
     "compare_extracted_letters",
     "ComparisonIdentity",
     "compare_letter_images",
@@ -83,16 +92,20 @@ __all__ = [
     "SkeletonDiagnostics",
     "TopologySummary",
     "WrittenComparisonReport",
+    "align_continuous_paths",
     "align_ordered_paths",
     "analyze_comparison",
     "analyze_skeleton",
     "coerce_crop_rect",
     "crop_image",
+    "continuous_differential_geometry",
     "differential_geometry",
+    "legacy_differential_geometry_from_polyline",
     "extract_ink_mask",
     "fit_similarity_transform",
     "load_crop",
     "recover_ordered_path",
+    "resample_continuous_path",
     "resample_path",
     "write_comparison_report",
     "PageSegmentation",

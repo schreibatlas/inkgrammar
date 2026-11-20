@@ -194,8 +194,7 @@ def load_gesture_training_project(path: str | Path) -> GestureProjectBundle:
     invalid_letters = {program.character for program in programs} - set(project.validation.letters)
     if invalid_letters:
         raise ValueError(
-            "gesture programs are outside configured validation letters: "
-            f"{sorted(invalid_letters)}"
+            f"gesture programs are outside configured validation letters: {sorted(invalid_letters)}"
         )
     primitives = _primitive_templates(input_paths["primitive_templates"])
     annotations = (

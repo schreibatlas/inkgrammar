@@ -341,7 +341,6 @@ def test_synthetic_fit_improves_on_blurred_noisy_padded_observation() -> None:
     assert abs(result.parameters["stroke-width"] - true_values["stroke-width"]) < 0.03
 
 
-
 def test_program_render_parity_matches_final_strokeoutline_output() -> None:
     program, primitives = load_inputs()
     values = {

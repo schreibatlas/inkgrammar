@@ -50,6 +50,7 @@ class ProgramComplexityBreakdown(StrictModel):
     pen_lifts: int = Field(ge=0)
     exception_overrides: int = Field(ge=0)
 
+
 class ProgramFitEnergy(StrictModel):
     total: float = Field(ge=0.0, allow_inf_nan=False)
     ink: float = Field(ge=0.0, allow_inf_nan=False)
@@ -61,7 +62,6 @@ class ProgramFitEnergy(StrictModel):
     width: float = Field(ge=0.0, allow_inf_nan=False)
     complexity: float = Field(ge=0.0, allow_inf_nan=False)
     complexity_breakdown: ProgramComplexityBreakdown
-
 
 
 def _width_in_model_units(width_profile: object) -> float:
@@ -287,7 +287,6 @@ def _prior_loss(program: DirectedGlyphProgram, values: Mapping[str, float]) -> f
     return float(np.mean(residuals)) if residuals else 0.0
 
 
-
 def _complexity_breakdown(program: DirectedGlyphProgram) -> ProgramComplexityBreakdown:
     return ProgramComplexityBreakdown(
         primitive_instances=len(program.movements),
@@ -306,6 +305,7 @@ def _complexity_score(breakdown: ProgramComplexityBreakdown) -> float:
         + breakdown.pen_lifts
         + breakdown.exception_overrides
     )
+
 
 def _centerline_loss(
     observation: GlyphObservation,

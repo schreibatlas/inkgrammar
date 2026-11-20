@@ -9,7 +9,7 @@ from PIL import Image
 from planarcurve.transforms import Similarity2D
 from pydantic import Field
 from rasterregions import MaskMode, MaskResult
-from skeletonpaths import SkeletonGraph
+from skeletonpaths import SkeletonAnalysis, SkeletonGraph, SkeletonWalk
 
 from ..models import StrictModel
 
@@ -46,6 +46,7 @@ class OrderedPath:
     xy: np.ndarray
     covered_edge_count: int
     total_edge_count: int
+    walk: SkeletonWalk | None = None
 
     def __post_init__(self) -> None:
         points = np.asarray(self.xy, dtype=float)
@@ -67,11 +68,67 @@ class OrderedPath:
 
 
 @dataclass(frozen=True)
+class ContinuousPath:
+    xy: np.ndarray
+    tangent: np.ndarray
+    curvature: np.ndarray
+    radius_px: np.ndarray
+    confidence: np.ndarray
+    progress: np.ndarray
+    arc_length_px: float
+    source: str
+    boundary_evidence: str
+    route_event_indices: tuple[int, ...] = ()
+    route_event_progress: tuple[float, ...] = ()
+    edge_ids: tuple[int, ...] = ()
+    edge_directions: tuple[Literal["forward", "reverse"], ...] = ()
+
+    def __post_init__(self) -> None:
+        points = np.asarray(self.xy, dtype=float)
+        tangents = np.asarray(self.tangent, dtype=float)
+        if points.ndim != 2 or points.shape[1] != 2 or len(points) < 2:
+            raise ValueError("continuous path must have shape (N, 2) with N >= 2")
+        if tangents.shape != points.shape:
+            raise ValueError("continuous path tangents must match its coordinates")
+        arrays = {
+            "curvature": np.asarray(self.curvature, dtype=float),
+            "radius_px": np.asarray(self.radius_px, dtype=float),
+            "confidence": np.asarray(self.confidence, dtype=float),
+            "progress": np.asarray(self.progress, dtype=float),
+        }
+        if any(values.shape != (len(points),) for values in arrays.values()):
+            raise ValueError("continuous path scalar arrays must match its coordinates")
+        if not np.isfinite(points).all() or not np.isfinite(tangents).all():
+            raise ValueError("continuous path coordinates and tangents must be finite")
+        if any(not np.isfinite(values).all() for values in arrays.values()):
+            raise ValueError("continuous path scalar arrays must be finite")
+        if self.arc_length_px <= 0.0 or not np.isfinite(self.arc_length_px):
+            raise ValueError("continuous path arc length must be finite and positive")
+        if np.any(arrays["radius_px"] < 0.0):
+            raise ValueError("continuous path radii must be nonnegative")
+        if np.any((arrays["confidence"] < 0.0) | (arrays["confidence"] > 1.0)):
+            raise ValueError("continuous path confidence must be between zero and one")
+        if np.any(np.diff(arrays["progress"]) < 0.0):
+            raise ValueError("continuous path progress must be nondecreasing")
+        if len(self.route_event_indices) != len(self.route_event_progress):
+            raise ValueError("route event indices and progress values must match")
+        if any(index < 0 or index >= len(points) for index in self.route_event_indices):
+            raise ValueError("route event index is outside the continuous path")
+        if any(not 0.0 <= value <= 1.0 for value in self.route_event_progress):
+            raise ValueError("route event progress must be between zero and one")
+        for name, values in (("xy", points), ("tangent", tangents), *arrays.items()):
+            owned = np.array(values, copy=True)
+            owned.setflags(write=False)
+            object.__setattr__(self, name, owned)
+
+
+@dataclass(frozen=True)
 class AlignmentResult:
     transform: Similarity2D
     direction: Literal["forward", "reversed-for-best-match"]
     aligned_sample_xy: np.ndarray
     mean_squared_error: float
+    aligned_sample_path: ContinuousPath | None = None
 
     def __post_init__(self) -> None:
         points = np.asarray(self.aligned_sample_xy, dtype=float)
@@ -79,6 +136,13 @@ class AlignmentResult:
             raise ValueError("aligned path must have shape (N, 2) with N >= 2")
         if not np.isfinite(points).all() or not np.isfinite(self.mean_squared_error):
             raise ValueError("alignment result must be finite")
+        if self.aligned_sample_path is not None:
+            if self.aligned_sample_path.xy.shape != points.shape:
+                raise ValueError("aligned continuous path must match aligned coordinates")
+            if not np.allclose(self.aligned_sample_path.xy, points):
+                raise ValueError(
+                    "aligned continuous path coordinates must match aligned coordinates"
+                )
         points = np.array(points, copy=True)
         points.setflags(write=False)
         object.__setattr__(self, "aligned_sample_xy", points)
@@ -90,6 +154,7 @@ class SkeletonDiagnostics:
     radius: np.ndarray
     graph: SkeletonGraph
     topology: TopologySummary
+    analysis: SkeletonAnalysis | None = None
 
     def __post_init__(self) -> None:
         skeleton = np.asarray(self.skeleton, dtype=bool)
@@ -128,6 +193,8 @@ class ExtractedLetter:
     diagnostics: SkeletonDiagnostics
     ordered_path: OrderedPath | None
     resampled_xy: np.ndarray | None
+    continuous_path: ContinuousPath | None = None
+    geometry_warning: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_path", Path(self.source_path))
@@ -136,10 +203,12 @@ class ExtractedLetter:
             raise ValueError("extracted image dimensions must match its crop rectangle")
         if self.mask_result.mask.shape != expected_shape:
             raise ValueError("ink mask dimensions must match the extracted image")
-        if (self.ordered_path is None) != (self.resampled_xy is None):
-            raise ValueError(
-                "ordered path and resampled coordinates must both be present or absent"
-            )
+        if self.ordered_path is None and (
+            self.resampled_xy is not None or self.continuous_path is not None
+        ):
+            raise ValueError("continuous or resampled geometry requires an ordered path")
+        if self.continuous_path is not None and self.resampled_xy is None:
+            object.__setattr__(self, "resampled_xy", self.continuous_path.xy)
         if self.resampled_xy is None:
             return
         points = np.asarray(self.resampled_xy, dtype=float)

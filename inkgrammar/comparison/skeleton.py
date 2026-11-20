@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
-from skeletonpaths import SkeletonGraph, analyze_mask, graph_from_skeleton
+from skeletonpaths import SkeletonAnalysis, SkeletonGraph, analyze_mask, graph_from_skeleton
 
 from .models import SkeletonDiagnostics, TopologySummary
 
@@ -10,6 +10,7 @@ def _diagnostics_from_graph(
     skeleton: np.ndarray,
     radius: np.ndarray,
     graph: SkeletonGraph,
+    analysis: SkeletonAnalysis | None = None,
 ) -> SkeletonDiagnostics:
     endpoints = [node.xy for node in graph.nodes if node.degree == 1]
     junctions = [node.xy for node in graph.nodes if node.degree > 2]
@@ -23,7 +24,7 @@ def _diagnostics_from_graph(
         cycle_count=graph.cycle_count,
         component_count=graph.component_count,
     )
-    return SkeletonDiagnostics(skeleton, radius, graph, topology)
+    return SkeletonDiagnostics(skeleton, radius, graph, topology, analysis)
 
 
 def diagnostics_from_skeleton(
@@ -42,4 +43,4 @@ def analyze_skeleton(mask: np.ndarray) -> SkeletonDiagnostics:
     if ink.ndim != 2:
         raise ValueError("ink mask must be a 2D array")
     analysis = analyze_mask(ink)
-    return _diagnostics_from_graph(analysis.skeleton, analysis.radius, analysis.graph)
+    return _diagnostics_from_graph(analysis.skeleton, analysis.radius, analysis.graph, analysis)

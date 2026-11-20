@@ -8,9 +8,10 @@ from typing import Any
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+from skeletonpaths import SubpixelCenterlineOptions
 
 from .metrics import ComparisonAnalysis, analyze_comparison
-from .models import ComparisonResult, ExtractedLetter
+from .models import ComparisonResult, ExtractedLetter, TopologySummary
 from .plots import PlotSeries, write_plot
 
 _REFERENCE = (35, 105, 215)
@@ -135,14 +136,40 @@ def _draw_centerline_overlay(
     sample_xy: np.ndarray,
     *,
     error_vectors: bool = False,
+    reference_raw_skeleton_xy: np.ndarray | None = None,
+    sample_raw_skeleton_xy: np.ndarray | None = None,
+    reference_topology: TopologySummary | None = None,
+    sample_topology: TopologySummary | None = None,
+    sample_transform: Any | None = None,
+    reference_event_xy: np.ndarray | None = None,
+    sample_event_xy: np.ndarray | None = None,
 ) -> None:
-    bounds = _canvas_bounds(reference_xy, sample_xy)
+    reference_points_for_bounds = [reference_xy]
+    sample_points_for_bounds = [sample_xy]
+    if reference_raw_skeleton_xy is not None:
+        reference_points_for_bounds.append(reference_raw_skeleton_xy)
+    if sample_raw_skeleton_xy is not None:
+        sample_points_for_bounds.append(sample_raw_skeleton_xy)
+    if reference_event_xy is not None:
+        reference_points_for_bounds.append(reference_event_xy)
+    if sample_event_xy is not None:
+        sample_points_for_bounds.append(sample_event_xy)
+    bounds = _canvas_bounds(
+        np.concatenate(reference_points_for_bounds, axis=0),
+        np.concatenate(sample_points_for_bounds, axis=0),
+    )
     image = Image.new("RGB", _canvas_size(bounds), "white")
     draw = ImageDraw.Draw(image)
+
+    if reference_raw_skeleton_xy is not None:
+        draw.point(_canvas_points(reference_raw_skeleton_xy, bounds), fill=(130, 145, 140))
+    if sample_raw_skeleton_xy is not None:
+        draw.point(_canvas_points(sample_raw_skeleton_xy, bounds), fill=(75, 165, 105))
     reference_points = _canvas_points(reference_xy, bounds)
     sample_points = _canvas_points(sample_xy, bounds)
     draw.line(reference_points, fill=_REFERENCE, width=2)
     draw.line(sample_points, fill=_SAMPLE, width=2)
+
     for points, color, start_label, end_label in (
         (reference_points, _REFERENCE, "R start", "R end"),
         (sample_points, _SAMPLE, "S start", "S end"),
@@ -151,6 +178,29 @@ def _draw_centerline_overlay(
             x, y = point
             draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=color, outline="white", width=1)
             draw.text((x + 5, y - 8), label, fill=color, font=ImageFont.load_default())
+
+    for topology, transform in (
+        (reference_topology, None),
+        (sample_topology, sample_transform),
+    ):
+        if topology is None:
+            continue
+        for coordinates, color, label in (
+            (topology.endpoints, (20, 110, 230), "E"),
+            (topology.junctions, (220, 40, 180), "J"),
+        ):
+            points = np.asarray(coordinates, dtype=float).reshape((-1, 2))
+            if transform is not None and len(points):
+                points = transform.apply(points)
+            for x, y in _canvas_points(points, bounds):
+                draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=color, outline="white", width=1)
+                draw.text((x + 3, y - 7), label, fill=color, font=ImageFont.load_default())
+
+    for event_xy in (reference_event_xy, sample_event_xy):
+        if event_xy is None:
+            continue
+        for x, y in _canvas_points(event_xy, bounds):
+            draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=(235, 165, 20))
     if error_vectors:
         indexes = np.linspace(0, len(reference_points) - 1, 24).round().astype(int)
         for index in indexes:
@@ -267,6 +317,19 @@ def _write_plots(analysis: ComparisonAnalysis, output_dir: Path) -> None:
             ],
         ),
     ]
+    event_plot_keys = {
+        "plot_heading",
+        "plot_tangent_error",
+        "plot_curvature",
+        "plot_curvature_error",
+        "plot_cumulative_turn",
+    }
+    route_events = np.concatenate(
+        (
+            data["reference_route_event_progress"],
+            data["sample_route_event_progress"],
+        )
+    )
     for key, title, x_label, y_label, series in plots:
         write_plot(
             output_dir / _ARTIFACTS[key],
@@ -274,6 +337,7 @@ def _write_plots(analysis: ComparisonAnalysis, output_dir: Path) -> None:
             x_label=x_label,
             y_label=y_label,
             series=series,
+            event_progress=route_events if key in event_plot_keys else (),
         )
 
 
@@ -287,8 +351,16 @@ def _crop_description(crop: dict[str, int]) -> str:
 
 def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> dict[str, Any]:
     transform = result.alignment.transform
+    reference_path = result.reference.continuous_path
+    sample_path = result.sample.continuous_path
+    continuous_geometry = (
+        reference_path is not None
+        and sample_path is not None
+        and result.alignment.aligned_sample_path is not None
+    )
 
     def input_payload(letter: ExtractedLetter, side: str) -> dict[str, Any]:
+        path = letter.continuous_path
         return {
             "source_name": letter.source_path.name,
             "crop": letter.crop.model_dump(mode="json"),
@@ -299,6 +371,14 @@ def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> d
             "path_coverage": (
                 letter.ordered_path.coverage if letter.ordered_path is not None else None
             ),
+            "continuous_centerline": {
+                "available": path is not None,
+                "algorithm": path.source if path is not None else None,
+                "boundary_evidence": path.boundary_evidence if path is not None else None,
+                "arc_length_px": path.arc_length_px if path is not None else None,
+                "route_edge_ids": list(path.edge_ids) if path is not None else [],
+                "route_edge_directions": list(path.edge_directions) if path is not None else [],
+            },
             "original_artifact": _ARTIFACTS[f"input_{side}"],
             "mask_artifact": _ARTIFACTS[f"mask_{side}"],
             "skeleton_artifact": _ARTIFACTS[f"skeleton_{side}"],
@@ -310,9 +390,46 @@ def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> d
         *result.reference.mask_result.warnings,
         *result.sample.mask_result.warnings,
     ]
+    if continuous_geometry:
+        reconstruction = {
+            "algorithm": "skeletonpaths-subpixel-v1",
+            "boundary_evidence": {
+                "reference": reference_path.boundary_evidence,
+                "sample": sample_path.boundary_evidence,
+            },
+            "curve_model": "planarcurve-cubic-b-spline",
+            "refinement_passes": SubpixelCenterlineOptions().refinement_passes,
+            "fallback": False,
+            "fallback_reason": None,
+        }
+    else:
+        fallback_reasons = [
+            warning
+            for warning in result.warnings
+            if "refin" in warning.lower() or "continuous" in warning.lower()
+        ]
+        reconstruction = {
+            "algorithm": "legacy-polyline",
+            "boundary_evidence": {
+                "reference": (
+                    reference_path.boundary_evidence if reference_path is not None else None
+                ),
+                "sample": sample_path.boundary_evidence if sample_path is not None else None,
+            },
+            "curve_model": "polyline",
+            "refinement_passes": 0,
+            "fallback": True,
+            "fallback_reason": fallback_reasons
+            or [
+                (
+                    "Continuous centerline geometry was unavailable; "
+                    "legacy polyline metrics were selected."
+                )
+            ],
+        }
     return {
         "format": "inkgrammar-letter-comparison",
-        "format_version": 1,
+        "format_version": 2,
         "letter": result.letter,
         "identity": {
             "sample_id": result.identity.sample_id,
@@ -323,9 +440,23 @@ def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> d
             "raster": True,
             "topology": True,
             "ordered_path": True,
+            "continuous_centerline": continuous_geometry,
             "curvature": True,
         },
         "direction_source": "inferred",
+        "provenance": {
+            "observed_raster_mask": "RasterRegions foreground evidence",
+            "discrete_skeleton_topology": (
+                "SkeletonPaths graph derived from the observed raster mask"
+            ),
+            "route_orientation": (
+                "deterministic covering-walk orientation, inferred rather than observed pen order"
+            ),
+            "continuous_centerline": (
+                "reconstructed continuous centerline consistent with the observed raster "
+                "and selected topology route; not a proven historical pen trace"
+            ),
+        },
         "inputs": {
             "reference": input_payload(result.reference, "reference"),
             "sample": input_payload(result.sample, "sample"),
@@ -343,11 +474,31 @@ def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> d
             "sample_count": len(analysis.progress),
             "progress": "normalized arc-length progress from 0 to 1",
             "position_error_normalization": "reference arc length equals 1.0",
-            "smoothing": {
-                "algorithm": "Savitzky-Golay",
-                "window_length": result.smoothing_window,
-                "polynomial_order": result.smoothing_polynomial_order,
+            "centerline_reconstruction": reconstruction,
+            "differential_geometry": {
+                "heading": (
+                    "analytic tangent" if continuous_geometry else "legacy finite difference"
+                ),
+                "turn_rate": (
+                    "analytic curvature times aligned arc length"
+                    if continuous_geometry
+                    else "legacy finite difference"
+                ),
+                "route_events": "retained as discrete normalized arc-length progress markers",
+                "curvature_summary_guard_progress": analysis.metrics["turn_rate"][
+                    "route_event_guard_progress"
+                ],
             },
+            "legacy_fallback": (
+                {
+                    "selected": True,
+                    "algorithm": "Savitzky-Golay",
+                    "window_length": result.smoothing_window,
+                    "polynomial_order": result.smoothing_polynomial_order,
+                }
+                if not continuous_geometry
+                else None
+            ),
         },
         "metrics": analysis.metrics,
         "series": _json_series(analysis),
@@ -384,6 +535,18 @@ def _markdown(result: ComparisonResult, payload: dict[str, Any]) -> str:
         f"rotation {alignment['rotation_deg']:.5g} degrees, "
         f"translation {alignment['translation_xy']}; "
         f"sample direction {alignment['direction']} (inferred).",
+        (
+            "The continuous line is reconstructed from raster evidence and the selected "
+            "topology route; it is not a proven historical pen trace."
+        ),
+        (
+            "The overlay distinguishes raw skeleton pixels, refined centerlines, and discrete "
+            "endpoint/junction markers. Gray plot markers identify route events."
+        ),
+        (
+            "When available, heading uses analytic tangents and turn-rate uses analytic curvature "
+            "times aligned arc length."
+        ),
         "",
         "![Aligned centerlines](overlay-centerline.png)",
         "![Error vectors](overlay-error-vectors.png)",
@@ -482,6 +645,12 @@ def _html(result: ComparisonResult, payload: dict[str, Any]) -> str:
         f"translation {transform['translation_xy']}, "
         f"direction {html.escape(transform['direction'])} "
         "(inferred from comparison, not measured from the image).</p>",
+        (
+            "<p>The continuous line is reconstructed from raster evidence and "
+            "the selected topology route. It is not a proven historical pen trace. "
+            "The centerline overlay distinguishes raw skeleton pixels, refined "
+            "centerlines, and discrete topology markers.</p>"
+        ),
         "<div class=grid>",
         image(_ARTIFACTS["overlay_raster"], "Aligned raster masks"),
         image(_ARTIFACTS["overlay_centerline"], "Aligned centerlines and endpoints"),
@@ -582,7 +751,13 @@ def _write_raster_only_report(
 
     identity = result.identity
     assert identity is not None
-    unavailable = "Ordered-path recovery failed; trajectory metrics are unavailable."
+    unavailable = (
+        "; ".join(result.warnings)
+        or "A complete comparable route was unavailable, so trajectory metrics were not calculated."
+    )
+    continuous_paths_available = (
+        reference.continuous_path is not None and sample.continuous_path is not None
+    )
     inputs = {}
     for side, extracted in (("reference", reference), ("sample", sample)):
         inputs[side] = {
@@ -595,6 +770,25 @@ def _write_raster_only_report(
             "path_coverage": (
                 extracted.ordered_path.coverage if extracted.ordered_path is not None else None
             ),
+            "continuous_centerline": {
+                "available": extracted.continuous_path is not None,
+                "algorithm": (
+                    extracted.continuous_path.source
+                    if extracted.continuous_path is not None
+                    else None
+                ),
+                "boundary_evidence": (
+                    extracted.continuous_path.boundary_evidence
+                    if extracted.continuous_path
+                    else None
+                ),
+                "arc_length_px": (
+                    extracted.continuous_path.arc_length_px if extracted.continuous_path else None
+                ),
+                "route_edge_ids": (
+                    list(extracted.continuous_path.edge_ids) if extracted.continuous_path else []
+                ),
+            },
         }
     artifacts = {
         "input_reference": _ARTIFACTS["input_reference"],
@@ -610,7 +804,7 @@ def _write_raster_only_report(
     }
     payload = {
         "format": "inkgrammar-letter-comparison",
-        "format_version": 1,
+        "format_version": 2,
         "letter": result.letter,
         "identity": {
             "sample_id": identity.sample_id,
@@ -620,11 +814,98 @@ def _write_raster_only_report(
         "capabilities": {
             "raster": True,
             "topology": True,
-            "ordered_path": False,
+            "ordered_path": reference.ordered_path is not None and sample.ordered_path is not None,
+            "continuous_centerline": continuous_paths_available,
             "curvature": False,
             "unavailable_reason": unavailable,
         },
         "inputs": inputs,
+        "provenance": {
+            "observed_raster_mask": "RasterRegions foreground evidence",
+            "discrete_skeleton_topology": (
+                "SkeletonPaths graph derived from the observed raster mask"
+            ),
+            "route_orientation": ("unavailable because no comparable aligned route was selected"),
+            "continuous_centerline": (
+                "reconstructed continuous centerline consistent with the observed raster "
+                "and topology route; not a proven historical pen trace"
+            ),
+        },
+        "geometry": {
+            "sample_count": 0,
+            "progress": None,
+            "centerline_reconstruction": {
+                "algorithm": (
+                    "skeletonpaths-subpixel-v1" if continuous_paths_available else "unavailable"
+                ),
+                "boundary_evidence": {
+                    "reference": (
+                        reference.continuous_path.boundary_evidence
+                        if reference.continuous_path is not None
+                        else None
+                    ),
+                    "sample": (
+                        sample.continuous_path.boundary_evidence
+                        if sample.continuous_path is not None
+                        else None
+                    ),
+                },
+                "curve_model": (
+                    "planarcurve-cubic-b-spline" if continuous_paths_available else "unavailable"
+                ),
+                "refinement_passes": (
+                    SubpixelCenterlineOptions().refinement_passes
+                    if continuous_paths_available
+                    else 0
+                ),
+                "fallback": True,
+                "fallback_reason": unavailable,
+            },
+            "differential_geometry": {
+                "heading": "unavailable",
+                "turn_rate": "unavailable",
+                "route_events": "available per input in the series when continuous geometry exists",
+            },
+            "legacy_fallback": None,
+        },
+        "series": {
+            "reference_raw_skeleton_xy": np.column_stack(
+                np.nonzero(reference.diagnostics.skeleton)[::-1]
+            )
+            .astype(float)
+            .tolist(),
+            "sample_raw_skeleton_xy": np.column_stack(np.nonzero(sample.diagnostics.skeleton)[::-1])
+            .astype(float)
+            .tolist(),
+            "reference_subpixel_xy": (
+                reference.continuous_path.xy.tolist()
+                if reference.continuous_path is not None
+                else []
+            ),
+            "sample_subpixel_xy": (
+                sample.continuous_path.xy.tolist() if sample.continuous_path is not None else []
+            ),
+            "reference_centerline_confidence": (
+                reference.continuous_path.confidence.tolist()
+                if reference.continuous_path is not None
+                else []
+            ),
+            "sample_centerline_confidence": (
+                sample.continuous_path.confidence.tolist()
+                if sample.continuous_path is not None
+                else []
+            ),
+            "reference_route_event_progress": (
+                list(reference.continuous_path.route_event_progress)
+                if reference.continuous_path is not None
+                else []
+            ),
+            "sample_route_event_progress": (
+                list(sample.continuous_path.route_event_progress)
+                if sample.continuous_path is not None
+                else []
+            ),
+        },
         "metrics": {
             "raster": {
                 "reference_ink_pixels": int(reference.mask_result.mask.sum()),
@@ -658,8 +939,12 @@ def _write_raster_only_report(
         "",
         "## Available comparison capabilities",
         "",
-        "Raster masks and topology are available. Ordered-path, curvature, and trajectory metrics "
-        "are unavailable because an ordered path could not be recovered.",
+        (
+            "Raster masks and topology remain available. "
+            "A comparable aligned route was unavailable, so trajectory metrics "
+            "could not be calculated. Any continuous centerline is a reconstruction "
+            "from raster and topology evidence, not a proven historical pen trace."
+        ),
         "",
         "![Reference and sample masks, shown side by side without alignment](overlay-raster.png)",
         "",
@@ -691,7 +976,9 @@ def _write_raster_only_report(
         f"<h1>{html.escape(report_title)}</h1>"
         f"<p>Sample <code>{html.escape(identity.sample_id)}</code> matched to reference "
         f"<code>{html.escape(identity.reference_id)}</code>.</p>"
-        f"<p>{html.escape(unavailable)} Raster masks and topology remain available.</p>"
+        f"<p>{html.escape(unavailable)} Raster masks and topology remain available. "
+        "Any continuous centerline is reconstructed from raster and topology evidence, "
+        "not a proven historical pen trace.</p>"
         f"{images}<h2>Topology</h2><pre>"
         f"{html.escape(json.dumps(payload['metrics']['topology'], indent=2))}</pre>"
         '<p><a href="report.json">Machine-readable report</a></p></body></html>'
@@ -715,10 +1002,45 @@ def write_comparison_report(
     _write_extraction_images(result.reference, destination, "reference")
     _write_extraction_images(result.sample, destination, "sample")
     _write_raster_overlay(result, destination / _ARTIFACTS["overlay_raster"])
+    reference_continuous = result.reference.continuous_path
+    sample_continuous = result.alignment.aligned_sample_path
+    reference_centerline = (
+        reference_continuous.xy
+        if reference_continuous is not None
+        else result.reference.resampled_xy
+    )
+    sample_centerline = (
+        sample_continuous.xy
+        if sample_continuous is not None
+        else result.alignment.aligned_sample_xy
+    )
+    reference_raw_skeleton_xy = np.argwhere(result.reference.diagnostics.skeleton)[:, ::-1].astype(
+        float
+    )
+    sample_raw_skeleton_xy = result.alignment.transform.apply(
+        np.argwhere(result.sample.diagnostics.skeleton)[:, ::-1].astype(float)
+    )
+    reference_event_xy = (
+        reference_continuous.xy[list(reference_continuous.route_event_indices)]
+        if reference_continuous is not None
+        else np.empty((0, 2), dtype=float)
+    )
+    sample_event_xy = (
+        sample_continuous.xy[list(sample_continuous.route_event_indices)]
+        if sample_continuous is not None
+        else np.empty((0, 2), dtype=float)
+    )
     _draw_centerline_overlay(
         destination / _ARTIFACTS["overlay_centerline"],
-        result.reference.resampled_xy,
-        result.alignment.aligned_sample_xy,
+        reference_centerline,
+        sample_centerline,
+        reference_raw_skeleton_xy=reference_raw_skeleton_xy,
+        sample_raw_skeleton_xy=sample_raw_skeleton_xy,
+        reference_topology=result.reference.diagnostics.topology,
+        sample_topology=result.sample.diagnostics.topology,
+        sample_transform=result.alignment.transform,
+        reference_event_xy=reference_event_xy,
+        sample_event_xy=sample_event_xy,
     )
     _draw_centerline_overlay(
         destination / _ARTIFACTS["overlay_error_vectors"],

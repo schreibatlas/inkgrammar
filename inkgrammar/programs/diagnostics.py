@@ -14,8 +14,6 @@ from .objective import ProgramFitEnergy, render_program_coverage
 from .observation import GlyphObservation
 
 MOVEMENT_COLORS: tuple[tuple[int, int, int], ...] = (
-
-
     (35, 105, 190),
     (220, 85, 55),
     (40, 150, 100),
@@ -174,9 +172,7 @@ def _draw_panel(
 
 def _paths_preview(paths: Sequence[np.ndarray]) -> Image.Image | None:
     nonempty = [
-        np.asarray(path, dtype=float).reshape(-1, 2)
-        for path in paths
-        if np.asarray(path).size
+        np.asarray(path, dtype=float).reshape(-1, 2) for path in paths if np.asarray(path).size
     ]
     if not nonempty:
         return None
@@ -346,9 +342,7 @@ def render_program_fit_diagnostic(
             () if stroke_hypotheses else ("No path hypotheses supplied",),
         ),
         (
-            render_program_diagnostic(
-                compiled, program, size=_PANEL_CONTENT_SIZE, margin=8
-            ),
+            render_program_diagnostic(compiled, program, size=_PANEL_CONTENT_SIZE, margin=8),
             (),
         ),
         (

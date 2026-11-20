@@ -259,8 +259,6 @@ def expand_gesture_program(
     )
 
 
-
-
 def compile_gesture_program(
     program: GestureGlyphProgram,
     gesture_templates: Mapping[str, GestureTemplate],

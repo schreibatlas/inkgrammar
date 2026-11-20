@@ -92,8 +92,6 @@ class MovementAnnotations(StrictModel):
         return self
 
 
-
-
 @dataclass(frozen=True)
 class RasterRegionCandidate:
     segmentation_hypothesis_id: str
@@ -437,6 +435,7 @@ def _unique_ids(values: Sequence[str | None]) -> list[str]:
 def _validate_candidate_limit(value: int) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError("max_candidates must be a positive integer")
+
 
 class GeometryLearningConfig(StrictModel):
     allowed_change_counts: list[int] = Field(default_factory=lambda: [0, 1, 2, 3, 4])

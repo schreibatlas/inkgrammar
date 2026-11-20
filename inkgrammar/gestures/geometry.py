@@ -25,8 +25,7 @@ class HeadingRateProfilePayload(StrictModel):
     def validate_change_order(self) -> HeadingRateProfilePayload:
         positions = [change.at for change in self.changes]
         if any(
-            current <= previous
-            for previous, current in zip(positions, positions[1:], strict=False)
+            current <= previous for previous, current in zip(positions, positions[1:], strict=False)
         ):
             raise ValueError("heading-rate changes must be strictly ordered")
         return self

@@ -137,6 +137,20 @@ def test_transformed_query_ranks_its_reference_first_without_unique_assignment()
     assert TOPOLOGY_WEIGHT == 0.15
 
 
+def test_continuous_refinement_keeps_the_known_candidate_ranked_first():
+    gallery = _gallery(_shape("e"), _shape("n"), _shape("l"))
+    sample = _shape("e")
+    coarse = rank_reference_candidates(sample, gallery, top_k=3)
+
+    refined = refine_top_k_matches(sample, gallery, coarse)
+
+    assert coarse[0].reference_id == "e"
+    assert refined[0].reference_id == "e"
+    assert refined[0].centerline_cost is not None
+    assert refined[0].heading_cost is not None
+    assert refined[0].turn_rate_cost is not None
+
+
 def test_refinement_is_limited_to_the_coarse_top_k_candidates():
     gallery = _gallery(_shape("e"), _shape("n"), _shape("l"))
     coarse = rank_reference_candidates(_shape("e"), gallery, top_k=2)

@@ -56,10 +56,7 @@ def test_structural_cases_preserve_loops_crossings_detached_marks_and_ambiguity(
     a = expand_gesture_program(programs[("a", "default")], grammar.templates)
     a_program = programs[("a", "default")]
     a = expand_gesture_program(a_program, grammar.templates)
-    a_roles = [
-        grammar.templates[item.gesture].role
-        for item in a_program.gestures.values()
-    ]
+    a_roles = [grammar.templates[item.gesture].role for item in a_program.gestures.values()]
     assert a_roles == ["oval", "exit"]
     assert any(isinstance(item, LoopClosureConstraint) for item in a.constraints)
 
@@ -75,9 +72,7 @@ def test_structural_cases_preserve_loops_crossings_detached_marks_and_ambiguity(
     ]
     assert crossing_primitives == ["curve-family-009", "curve-family-010"]
     reverse_crossing = expand_gesture_program(crossing_alternative, grammar.templates)
-    reverse_crossing_primitives = [
-        item.primitive for item in reverse_crossing.movements.values()
-    ]
+    reverse_crossing_primitives = [item.primitive for item in reverse_crossing.movements.values()]
     assert reverse_crossing_primitives == ["curve-family-010", "curve-family-009"]
 
     dot_default = programs[("i", "default")]
@@ -104,9 +99,7 @@ def test_structural_cases_preserve_loops_crossings_detached_marks_and_ambiguity(
     ]
     assert retrace_directions == ["forward", "reverse"]
     reverse_retrace = expand_gesture_program(retrace_alternative, grammar.templates)
-    reverse_retrace_directions = [
-        item.direction for item in reverse_retrace.movements.values()
-    ]
+    reverse_retrace_directions = [item.direction for item in reverse_retrace.movements.values()]
     assert reverse_retrace_directions == ["reverse", "forward"]
     assert retrace_alternative.provenance.notes is not None
     assert grammar.structural_cases["ambiguous-traversal-or-order"] == ("i", "x", "s")

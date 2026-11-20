@@ -158,12 +158,12 @@ The current canonical SAS calibration is 31 fit units per x-height. It is measur
 
 ## External geometry ownership
 
-| Responsibility                                                                                           | Owning package | InkGrammar-owned boundary                                             |
-| -------------------------------------------------------------------------------------------------------- | -------------- | --------------------------------------------------------------------- |
-| Foreground masks, connected components, rows, and anonymous regions                                      | RasterRegions  | Dataset review records and labelled glyph semantics                   |
-| SVG parsing, curve and polyline algorithms, spline math, transforms, and paired-point similarity fitting | PlanarCurve    | Coordinate-frame adapters and fitting-domain schemas                  |
-| Skeleton mask analysis, pixel graphs, edge coverage, and generic routing                                 | SkeletonPaths  | Candidate selection, handwriting orientation, and evidence provenance |
-| Variable-width expansion, caps, joins, and closed contours                                               | StrokeOutline  | Shaped-text traversal and width-profile selection                     |
+| Responsibility                                                                                                                           | Owning package | InkGrammar-owned boundary                                                                   |
+| ---------------------------------------------------------------------------------------------------------------------------------------- | -------------- | ------------------------------------------------------------------------------------------- |
+| Foreground masks, connected components, rows, and anonymous regions                                                                      | RasterRegions  | Dataset review records and labelled glyph semantics                                         |
+| Curve fitting/evaluation, polyline algorithms, transforms, analytic derivatives, and paired-point similarity fitting                     | PlanarCurve    | Coordinate-frame adapters, comparison conventions, and fitting-domain schemas               |
+| Skeleton topology, pixel graphs, edge coverage, route ranking, topology-preserving subpixel centerline reconstruction, and refined walks | SkeletonPaths  | Handwriting route orientation, comparison policy, evidence provenance, and report semantics |
+| Variable-width expansion, caps, joins, and closed contours                                                                               | StrokeOutline  | Shaped-text traversal and width-profile selection                                           |
 
 SkeletonPaths routes remain inferred topology candidates. Only reviewed trajectory annotations support physical stroke-order or direction claims. Pass typed `planarcurve.CubicPath` values to StrokeOutline when available; retain the SVG-string adapter for shaped-text compatibility.
 
@@ -173,4 +173,4 @@ PlanarCurve's `fit_similarity_transform(reference_points, sample_points)` maps p
 
 The compatibility inventory found eight shipped objective-v2/v3 checkpoint or report records, even though the checked-in fitting configurations use objective v4. Keep v2 and v3 dispatch and schemas. No retirement window or supported migration has been approved. Objective-v3 centerline tracing remains frozen. Objective-v4 review-overlay topology diagnostics use SkeletonPaths, while existing objective-v2/v3 diagnostics remain unchanged.
 
-The package metadata requires PlanarCurve and SkeletonPaths releases that provide the APIs used here. The 0.1.2 minimums identify the next compatible release line. InkGrammar's fitting extra retains SciPy and scikit-image because InkGrammar still imports both directly.
+The package metadata requires RasterRegions 0.2.3 for continuous foreground evidence, PlanarCurve 0.1.4 for high-level spline fitting/evaluation, and SkeletonPaths 0.1.4 for topology-preserving subpixel refinement and refined walks. InkGrammar's fitting extra retains SciPy and scikit-image because InkGrammar still imports both directly.

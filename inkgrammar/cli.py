@@ -165,6 +165,7 @@ def compare_letter_command(
         typer.echo(f"HTML report: {report.html_path}")
         typer.echo(f"JSON report: {report.json_path}")
 
+
 @page_app.command("extract")
 def page_extract(
     image: Path = typer.Argument(..., exists=True),  # noqa: B008

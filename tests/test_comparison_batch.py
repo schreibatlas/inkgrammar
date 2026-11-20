@@ -118,9 +118,10 @@ def test_batch_writes_pair_reports_summaries_and_reuses_hash_keyed_reference_cac
     assert reference_segmentation["per_row_candidate_counts"] == {"0": 3}
     assert isinstance(reference_segmentation["search_truncated"], bool)
     assert reference_segmentation["search_limit"] is None
-    assert reference_segmentation["unassigned_ink_fraction"] == reference_manifest[
-        "unassigned_ink_fraction"
-    ]
+    assert (
+        reference_segmentation["unassigned_ink_fraction"]
+        == reference_manifest["unassigned_ink_fraction"]
+    )
     assert "not a probability" in summary["matching"]["cost_interpretation"]
     assert "<img" in first.html_path.read_text()
     for match in summary["matches"]:
@@ -147,7 +148,6 @@ def test_batch_writes_pair_reports_summaries_and_reuses_hash_keyed_reference_cac
 
     monkeypatch.setattr(comparison_api, "analyze_skeleton", count_sample_analysis)
 
-
     def fail_repeat_analysis(mask):
         raise AssertionError("prepared sample paths must be reused for every top-K candidate")
 
@@ -163,7 +163,6 @@ def test_batch_writes_pair_reports_summaries_and_reuses_hash_keyed_reference_cac
     public_gallery = json.loads((output / "reference-index" / "gallery.json").read_text())
     assert public_gallery["cache_hit"] is True
     assert analysis_calls == 3
-
 
 
 def test_reference_cache_rebuilds_for_old_versions_profiles_and_mask_changes(tmp_path):
@@ -211,7 +210,6 @@ def test_reference_cache_rebuilds_for_old_versions_profiles_and_mask_changes(tmp
     )
     assert corrupted_mask.payload["reference_cache"]["hit"] is False
     assert first.payload["reference_cache"]["hit"] is False
-
 
 
 def test_progress_and_run_files_cover_success_failure_and_quiet_mode(tmp_path, capsys):
@@ -332,10 +330,7 @@ def test_segment_only_writes_diagnostics_without_matching_or_skeleton_analysis(
     assert "path_refinement" not in stages
 
 
-
-def test_reference_segmentation_ambiguity_is_separate_from_match_ambiguity(
-    tmp_path, monkeypatch
-):
+def test_reference_segmentation_ambiguity_is_separate_from_match_ambiguity(tmp_path, monkeypatch):
     from dataclasses import replace
 
     import inkgrammar.comparison.batch as comparison_batch
@@ -376,7 +371,6 @@ def test_reference_segmentation_ambiguity_is_separate_from_match_ambiguity(
     assert "Segmentation status" in report.html_path.read_text()
 
 
-
 def test_reference_failure_copies_diagnostics_and_records_phase(tmp_path, monkeypatch):
     from inkgrammar.comparison.segmentation import SegmentationError
 
@@ -409,7 +403,6 @@ def test_reference_failure_copies_diagnostics_and_records_phase(tmp_path, monkey
     assert reference_events[-1]["details"]["failure_phase"] == "rasterregions_detection"
     assert events[-1]["stage"] == "failure"
     assert events[-1]["details"]["diagnostic_path"] == str(diagnostic)
-
 
 
 def test_batch_runs_one_glyph_end_to_end_and_writes_match_reports(tmp_path):

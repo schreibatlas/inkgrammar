@@ -6,16 +6,17 @@ from typing import Literal
 
 import numpy as np
 from PIL import Image
-from planarcurve.polyline import polyline_length
+from skeletonpaths import SubpixelReconstructionError, SubpixelReconstructionLimitError
 
 from .descriptors import GlyphDescriptor, glyph_descriptor
-from .geometry import differential_geometry
-from .models import ExtractedLetter
+from .geometry import continuous_differential_geometry
+from .models import ContinuousPath, ExtractedLetter
 from .path import (
     PathExtractionError,
-    align_ordered_paths,
+    align_continuous_paths,
     recover_ordered_path,
-    resample_path,
+    refine_continuous_path,
+    resample_continuous_path,
 )
 from .segmentation import ReferenceGallery, SegmentedGlyph
 from .skeleton import analyze_skeleton
@@ -146,6 +147,20 @@ def rank_reference_candidates(
     return [replace(score, rank=rank) for rank, score in enumerate(ranked[:top_k], start=1)]
 
 
+def _continuous_path_for_match(
+    glyph: SegmentedGlyph,
+    extracted: ExtractedLetter | None,
+) -> ContinuousPath | None:
+    if extracted is not None:
+        if extracted.continuous_path is not None:
+            return extracted.continuous_path
+        if extracted.diagnostics.analysis is not None:
+            return None
+    diagnostics = analyze_skeleton(glyph.mask)
+    ordered_path = recover_ordered_path(diagnostics)
+    return refine_continuous_path(diagnostics, ordered_path)
+
+
 def refine_match(
     sample: SegmentedGlyph,
     reference: SegmentedGlyph,
@@ -154,45 +169,30 @@ def refine_match(
     sample_extracted: ExtractedLetter | None = None,
     reference_extracted: ExtractedLetter | None = None,
 ) -> MatchScore:
-    """Add optional ordered-path geometry evidence without rejecting raster matches."""
+    """Add continuous path evidence to raster ranking without rejecting candidates."""
     try:
-        if reference_extracted is None:
-            reference_diagnostics = analyze_skeleton(reference.mask)
-            reference_path = recover_ordered_path(reference_diagnostics)
-            reference_xy = resample_path(reference_path.xy)
-        else:
-            reference_path = reference_extracted.ordered_path
-            reference_xy = reference_extracted.resampled_xy
-            if reference_path is None or reference_xy is None:
-                return replace(coarse_score, refined_cost=coarse_score.coarse_cost)
-
-        if sample_extracted is None:
-            sample_diagnostics = analyze_skeleton(sample.mask)
-            sample_path = recover_ordered_path(sample_diagnostics)
-            sample_xy = resample_path(sample_path.xy)
-        else:
-            sample_path = sample_extracted.ordered_path
-            sample_xy = sample_extracted.resampled_xy
-            if sample_path is None or sample_xy is None:
-                return replace(coarse_score, refined_cost=coarse_score.coarse_cost)
-
-        alignment = align_ordered_paths(reference_xy, sample_xy)
-        reference_geometry = differential_geometry(reference_xy)
-        sample_geometry = differential_geometry(alignment.aligned_sample_xy)
-    except (PathExtractionError, ValueError):
+        reference_path = _continuous_path_for_match(reference, reference_extracted)
+        sample_path = _continuous_path_for_match(sample, sample_extracted)
+        if reference_path is None or sample_path is None:
+            return replace(coarse_score, refined_cost=coarse_score.coarse_cost)
+        alignment = align_continuous_paths(reference_path, sample_path)
+        aligned_sample_path = alignment.aligned_sample_path
+        if aligned_sample_path is None:
+            return replace(coarse_score, refined_cost=coarse_score.coarse_cost)
+        reference_samples = resample_continuous_path(reference_path)
+        reference_geometry = continuous_differential_geometry(reference_samples)
+        sample_geometry = continuous_differential_geometry(aligned_sample_path)
+    except (
+        PathExtractionError,
+        SubpixelReconstructionError,
+        SubpixelReconstructionLimitError,
+        ValueError,
+    ):
         return replace(coarse_score, refined_cost=coarse_score.coarse_cost)
 
-    reference_length = float(polyline_length(reference_path.xy))
-    if reference_length <= 0.0:
-        return replace(coarse_score, refined_cost=coarse_score.coarse_cost)
     centerline = float(
-        np.mean(
-            np.linalg.norm(
-                alignment.aligned_sample_xy - reference_xy,
-                axis=1,
-            )
-        )
-        / reference_length
+        np.mean(np.linalg.norm(alignment.aligned_sample_xy - reference_samples.xy, axis=1))
+        / reference_path.arc_length_px
     )
     heading_delta = sample_geometry.heading_rad - reference_geometry.heading_rad
     heading = float(

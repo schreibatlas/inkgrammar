@@ -103,9 +103,7 @@ def propose_gesture_boundaries(
     indices = sorted({0, landmark_count - 1, *events_by_index})
     pairs: list[tuple[int, int]] = [(0, landmark_count - 1)]
     pairs.extend((indices[index], indices[index + 1]) for index in range(len(indices) - 1))
-    pairs.extend(
-        (indices[index], indices[index + 2]) for index in range(len(indices) - 2)
-    )
+    pairs.extend((indices[index], indices[index + 2]) for index in range(len(indices) - 2))
     unique_pairs = list(dict.fromkeys(pairs))[:max_candidates]
 
     return tuple(

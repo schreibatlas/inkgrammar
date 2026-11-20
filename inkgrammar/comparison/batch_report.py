@@ -110,11 +110,7 @@ def write_batch_report(
         item["segmentation_status"] == "ambiguous" for item in samples
     )
     payload: dict[str, Any] = {
-        "status": (
-            "ambiguous"
-            if match_ambiguous_count or segmentation_ambiguous_count
-            else "ok"
-        ),
+        "status": ("ambiguous" if match_ambiguous_count or segmentation_ambiguous_count else "ok"),
         "reference": {
             "path": Path(reference_path).name,
             "sha256": reference_sha256,

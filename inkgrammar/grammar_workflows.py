@@ -43,9 +43,7 @@ def materialize_grammar_project(bundle: GestureProjectBundle) -> dict[str, Any]:
     for key, snapshot in snapshots.items():
         snapshot_config["files"][key] = snapshot["snapshot"]
     snapshot_config["output_dir"] = "run"
-    project_snapshot.write_text(
-        yaml.safe_dump(snapshot_config, sort_keys=True), encoding="utf-8"
-    )
+    project_snapshot.write_text(yaml.safe_dump(snapshot_config, sort_keys=True), encoding="utf-8")
     report = {
         "format": "inkgrammar-gesture-materialization",
         "format_version": 1,

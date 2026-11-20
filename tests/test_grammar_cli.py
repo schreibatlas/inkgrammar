@@ -223,12 +223,8 @@ def test_grammar_commands_create_deterministic_run_artifacts(tmp_path: Path) -> 
     assert _invoke(runner, ["grammar", "control-sheet", project_arg]) == control_output
     assert control_path.read_bytes() == first_control_sheet
 
-    first_inspection = _invoke(
-        runner, ["grammar", "inspect-letter", project_arg, "--letter", "a"]
-    )
-    second_inspection = _invoke(
-        runner, ["grammar", "inspect-letter", project_arg, "--letter", "a"]
-    )
+    first_inspection = _invoke(runner, ["grammar", "inspect-letter", project_arg, "--letter", "a"])
+    second_inspection = _invoke(runner, ["grammar", "inspect-letter", project_arg, "--letter", "a"])
     assert first_inspection == second_inspection
     inspection = json.loads(first_inspection)
     assert inspection["programs"][0]["gesture_instances"][0]["geometry_family_ids"] == [
@@ -249,7 +245,6 @@ def test_project_inputs_are_confined_to_project_directory(tmp_path: Path) -> Non
 
     assert result.exit_code != 0
     assert "grammar project inputs must be files beneath the project" in result.output
-
 
 
 def test_fitting_generation_deprecation_gates_are_documented() -> None:

@@ -121,11 +121,7 @@ class GestureTemplate(StrictModel):
         if len(constraint_ids) != len(set(constraint_ids)):
             raise ValueError("gesture constraint IDs must be unique")
         for constraint in self.constraints:
-            reference_ids = (
-                landmark_ids
-                if constraint.kind == "loop-closure"
-                else slot_ids
-            )
+            reference_ids = landmark_ids if constraint.kind == "loop-closure" else slot_ids
             if constraint.first not in reference_ids or constraint.second not in reference_ids:
                 raise ValueError(f"gesture constraint references an unknown item: {constraint.id}")
 

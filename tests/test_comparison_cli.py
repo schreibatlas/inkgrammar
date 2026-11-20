@@ -53,8 +53,6 @@ def _page(path, glyphs: tuple[str, ...]):
     return path
 
 
-
-
 def _reference_page(path):
     image = Image.new("RGB", (280, 90), "white")
     draw = ImageDraw.Draw(image)
@@ -62,6 +60,7 @@ def _reference_page(path):
         _draw_glyph(draw, x, kind)
     image.save(path)
     return path
+
 
 def test_compare_letter_cli_automatic_mode_writes_batch_summary(tmp_path):
     reference = _reference_page(tmp_path / "reference.png")
@@ -97,11 +96,10 @@ def test_compare_letter_cli_automatic_mode_writes_batch_summary(tmp_path):
     gallery = json.loads((output / "reference-index" / "gallery.json").read_text())
     assert gallery["reference_profile"] == "generic"
     assert all(len(match["alternatives"]) == 3 for match in summary["matches"])
-    events = [
-        json.loads(line) for line in (output / "progress.jsonl").read_text().splitlines()
-    ]
+    events = [json.loads(line) for line in (output / "progress.jsonl").read_text().splitlines()]
     extraction = [event for event in events if event["stage"] == "reference_extraction"]
     assert extraction and all("elapsed_seconds" in event["details"] for event in extraction)
+
 
 def test_compare_letter_cli_reports_exact_count_diagnostics(tmp_path):
     reference = _page(tmp_path / "reference.png", ("e", "n", "l"))
@@ -153,7 +151,6 @@ def test_compare_letter_cli_rejects_missing_mixed_and_incomplete_modes(tmp_path)
     assert "provide --letter" in incomplete.output
 
 
-
 def test_compare_letter_help_describes_automatic_controls():
     result = CliRunner().invoke(app, ["compare-letter", "--help"])
 
@@ -201,7 +198,6 @@ def test_compare_letter_cli_segment_only_honors_quiet_mode_and_profiles(tmp_path
     assert summary["operation"] == "segment-only"
     assert summary["reference"]["reference_profile"] == "generic"
     assert json.loads((output / "run.json").read_text())["status"] == "completed"
-
 
 
 def test_compare_letter_cli_reference_failure_reports_public_diagnostics_once(

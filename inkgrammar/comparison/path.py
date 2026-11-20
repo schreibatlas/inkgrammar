@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import numpy as np
 from planarcurve.polyline import polyline_length, resample_polyline_by_arclength
-from planarcurve.transforms import fit_similarity_transform
-from skeletonpaths import covering_walk
+from planarcurve.transforms import Similarity2D, fit_similarity_transform
+from skeletonpaths import (
+    SubpixelReconstructionError,
+    covering_walk,
+    refine_graph_geometry,
+    refined_walk,
+)
 
-from .models import AlignmentResult, OrderedPath, SkeletonDiagnostics
+from .models import AlignmentResult, ContinuousPath, OrderedPath, SkeletonDiagnostics
 
 
 class PathExtractionError(ValueError):
@@ -30,7 +35,63 @@ def recover_ordered_path(diagnostics: SkeletonDiagnostics) -> OrderedPath:
     walk = covering_walk(graph, start_node=start.id, end_node=end.id)
     if len(walk.xy) < 2 or polyline_length(walk.xy) <= 0.0:
         raise PathExtractionError("ordered skeleton path has no finite positive arc length")
-    return OrderedPath(walk.xy, walk.covered_edge_count, walk.total_edge_count)
+    return OrderedPath(
+        walk.xy,
+        walk.covered_edge_count,
+        walk.total_edge_count,
+        walk,
+    )
+
+
+def refine_continuous_path(
+    diagnostics: SkeletonDiagnostics,
+    ordered_path: OrderedPath,
+    *,
+    decision_field: np.ndarray | None = None,
+) -> ContinuousPath:
+    if diagnostics.analysis is None or ordered_path.walk is None:
+        raise PathExtractionError("skeleton analysis and covering-walk provenance are unavailable")
+    refined_graph = refine_graph_geometry(
+        diagnostics.analysis,
+        decision_field=decision_field,
+    )
+    refined = refined_walk(refined_graph, ordered_path.walk)
+    xy = np.asarray(refined.xy, dtype=float)
+    segment_lengths = np.linalg.norm(np.diff(xy, axis=0), axis=1)
+    sampled_length = float(np.sum(segment_lengths))
+    if sampled_length <= 0.0:
+        raise PathExtractionError("refined covering walk has no positive arc length")
+    progress = np.concatenate(([0.0], np.cumsum(segment_lengths))) / sampled_length
+
+    edge_lookup = {edge.edge_id: edge for edge in refined_graph.edges}
+    event_indices = []
+    offset = 0
+    for index, edge_id in enumerate(ordered_path.walk.edge_ids):
+        if index:
+            event_indices.append(offset)
+        offset += len(edge_lookup[edge_id].xy)
+    if offset != len(xy):
+        raise SubpixelReconstructionError("refined walk samples do not match its edge sequence")
+    boundary_evidence = (
+        "rasterregions-decision-field"
+        if decision_field is not None
+        else "skeletonpaths-binary-distance-fallback"
+    )
+    return ContinuousPath(
+        xy=xy,
+        tangent=refined.tangent,
+        curvature=refined.curvature,
+        radius_px=refined.radius_px,
+        confidence=refined.confidence,
+        progress=progress,
+        arc_length_px=refined.length_px,
+        source="skeletonpaths-subpixel-v1",
+        boundary_evidence=boundary_evidence,
+        route_event_indices=tuple(event_indices),
+        route_event_progress=tuple(float(progress[index]) for index in event_indices),
+        edge_ids=refined.edge_ids,
+        edge_directions=refined.edge_directions,
+    )
 
 
 def resample_path(points_xy: np.ndarray, sample_count: int = 256) -> np.ndarray:
@@ -63,3 +124,127 @@ def align_ordered_paths(reference_xy: np.ndarray, sample_xy: np.ndarray) -> Alig
         candidates.append((error, direction, transform, aligned))
     error, direction, transform, aligned = min(candidates, key=lambda candidate: candidate[0])
     return AlignmentResult(transform, direction, aligned, error)
+
+
+def resample_continuous_path(
+    path: ContinuousPath,
+    sample_count: int = 256,
+) -> ContinuousPath:
+    if sample_count < 2:
+        raise ValueError("sample count must be at least two")
+    progress = np.linspace(0.0, 1.0, sample_count)
+
+    def interpolate(values: np.ndarray) -> np.ndarray:
+        if values.ndim == 1:
+            return np.interp(progress, path.progress, values)
+        return np.column_stack(
+            [np.interp(progress, path.progress, values[:, axis]) for axis in range(values.shape[1])]
+        )
+
+    xy = interpolate(path.xy)
+    tangent = interpolate(path.tangent)
+    tangent_norm = np.linalg.norm(tangent, axis=1)
+    if np.any(tangent_norm <= 1e-12):
+        raise ValueError("continuous path has an undefined sampled tangent")
+    tangent = tangent / tangent_norm[:, None]
+    event_indices = tuple(
+        int(np.argmin(np.abs(progress - event_progress)))
+        for event_progress in path.route_event_progress
+    )
+    return ContinuousPath(
+        xy=xy,
+        tangent=tangent,
+        curvature=interpolate(path.curvature),
+        radius_px=interpolate(path.radius_px),
+        confidence=interpolate(path.confidence),
+        progress=progress,
+        arc_length_px=path.arc_length_px,
+        source=path.source,
+        boundary_evidence=path.boundary_evidence,
+        route_event_indices=event_indices,
+        route_event_progress=path.route_event_progress,
+        edge_ids=path.edge_ids,
+        edge_directions=path.edge_directions,
+    )
+
+
+def reverse_continuous_path(path: ContinuousPath) -> ContinuousPath:
+    indexed_events = sorted(
+        (len(path.xy) - 1 - index, 1.0 - progress)
+        for index, progress in zip(
+            path.route_event_indices,
+            path.route_event_progress,
+            strict=True,
+        )
+    )
+    return ContinuousPath(
+        xy=path.xy[::-1],
+        tangent=-path.tangent[::-1],
+        curvature=-path.curvature[::-1],
+        radius_px=path.radius_px[::-1],
+        confidence=path.confidence[::-1],
+        progress=1.0 - path.progress[::-1],
+        arc_length_px=path.arc_length_px,
+        source=path.source,
+        boundary_evidence=path.boundary_evidence,
+        route_event_indices=tuple(index for index, _ in indexed_events),
+        route_event_progress=tuple(value for _, value in indexed_events),
+        edge_ids=path.edge_ids[::-1],
+        edge_directions=tuple(
+            "reverse" if direction == "forward" else "forward"
+            for direction in path.edge_directions[::-1]
+        ),
+    )
+
+
+def transform_continuous_path(
+    path: ContinuousPath,
+    transform: Similarity2D,
+) -> ContinuousPath:
+    angle = np.deg2rad(transform.rotation_deg)
+    cosine, sine = np.cos(angle), np.sin(angle)
+    rotation = np.array(((cosine, -sine), (sine, cosine)))
+    return ContinuousPath(
+        xy=transform.apply(path.xy),
+        tangent=path.tangent @ rotation.T,
+        curvature=path.curvature / transform.scale,
+        radius_px=path.radius_px * transform.scale,
+        confidence=path.confidence,
+        progress=path.progress,
+        arc_length_px=path.arc_length_px * transform.scale,
+        source=path.source,
+        boundary_evidence=path.boundary_evidence,
+        route_event_indices=path.route_event_indices,
+        route_event_progress=path.route_event_progress,
+        edge_ids=path.edge_ids,
+        edge_directions=path.edge_directions,
+    )
+
+
+def align_continuous_paths(
+    reference: ContinuousPath,
+    sample: ContinuousPath,
+    sample_count: int = 256,
+) -> AlignmentResult:
+    reference_samples = resample_continuous_path(reference, sample_count)
+    sample_samples = resample_continuous_path(sample, sample_count)
+    candidates = []
+    for direction, oriented_sample in (
+        ("forward", sample_samples),
+        ("reversed-for-best-match", reverse_continuous_path(sample_samples)),
+    ):
+        transform = fit_similarity_transform(reference_samples.xy, oriented_sample.xy)
+        aligned_path = transform_continuous_path(oriented_sample, transform)
+        error = float(np.mean(np.sum((reference_samples.xy - aligned_path.xy) ** 2, axis=1)))
+        candidates.append((error, direction, transform, aligned_path))
+    error, direction, transform, aligned_path = min(
+        candidates,
+        key=lambda candidate: candidate[0],
+    )
+    return AlignmentResult(
+        transform=transform,
+        direction=direction,
+        aligned_sample_xy=aligned_path.xy,
+        mean_squared_error=error,
+        aligned_sample_path=aligned_path,
+    )

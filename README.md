@@ -206,13 +206,14 @@ without human review.
 
 ## Curve and skeleton geometry
 
-InkGrammar uses PlanarCurve for continuous curve geometry, polyline operations, transforms, and fitting. SkeletonPaths owns raster skeleton graphs, topology routes, and route ranking. SkeletonPaths paths are neutral `(x, y)` geometry; route orientation and ambiguity do not establish physical stroke direction. `inkgrammar.fitting.skeleton_graph` remains only as a compatibility re-export.
+RasterRegions supplies foreground classification and evidence. InkGrammar uses PlanarCurve for continuous curve fitting and evaluation, polyline operations, transforms, and analytic derivatives. SkeletonPaths owns discrete raster skeleton topology, topology-preserving subpixel centerline reconstruction, refined covering walks, and generic route ranking. SkeletonPaths paths are neutral `(x, y)` geometry; route orientation and ambiguity do not establish physical stroke direction. `inkgrammar.fitting.skeleton_graph` remains only as a compatibility re-export.
 
-| Responsibility                                                   | Owning package | InkGrammar boundary                                       |
-| ---------------------------------------------------------------- | -------------- | --------------------------------------------------------- |
-| SVG parsing, curve operations, transforms, and polyline sampling | PlanarCurve    | Coordinate frames and fitting-domain adapters             |
-| Raster skeleton graphs, topology routes, and route ranking       | SkeletonPaths  | Evidence status and reviewed physical-order annotations   |
-| Variable-width outlines, caps, joins, and contour composition    | StrokeOutline  | Shaped-text traversal and per-stroke width-profile lookup |
+| Responsibility                                                                                     | Owning package | InkGrammar boundary                                                                           |
+| -------------------------------------------------------------------------------------------------- | -------------- | --------------------------------------------------------------------------------------------- |
+| Foreground classification and evidence                                                             | RasterRegions  | Ink-mask selection and evidence provenance                                                    |
+| Curve fitting/evaluation, transforms, analytic geometry, and polyline sampling                     | PlanarCurve    | Coordinate-frame adapters, comparison conventions, and fitting-domain schemas                 |
+| Raster skeleton topology, route graphs, and topology-preserving subpixel centerline reconstruction | SkeletonPaths  | Handwriting-specific route orientation, evidence provenance, comparison, and report semantics |
+| Variable-width outlines, caps, joins, and contour composition                                      | StrokeOutline  | Shaped-text traversal and per-stroke width-profile lookup                                     |
 
 ## Stroke outlining
 

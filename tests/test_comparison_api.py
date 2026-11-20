@@ -67,7 +67,7 @@ def test_compare_letter_images_api_writes_complete_report_and_keeps_crop_pixels(
     assert report.payload["inputs"]["sample"]["mask_method"] == "color"
     assert report.payload["inputs"]["sample"]["topology"]["component_count"] == 1
     assert report.payload["geometry"]["sample_count"] == 256
-    assert report.payload["metrics"]["path"]["mean_error"] < 1e-12
+    assert report.payload["metrics"]["path"]["mean_error"] < 0.01
 
     with (
         Image.open(reference_path) as source,
@@ -176,10 +176,59 @@ def test_label_free_comparison_writes_raster_report_when_path_recovery_fails(tmp
         "raster": True,
         "topology": True,
         "ordered_path": False,
+        "continuous_centerline": False,
         "curvature": False,
-        "unavailable_reason": ("Ordered-path recovery failed; trajectory metrics are unavailable."),
+        "unavailable_reason": (
+            "Continuous or ordered-path trajectory metrics are unavailable for "
+            "reference and sample; raster and topology comparison remain available."
+        ),
     }
+    assert report.payload["format_version"] == 2
+    assert report.payload["geometry"]["centerline_reconstruction"]["fallback"] is True
+    assert report.payload["geometry"]["centerline_reconstruction"]["algorithm"] == "unavailable"
+    assert report.payload["series"]["reference_raw_skeleton_xy"]
+    centerline_provenance = report.payload["provenance"]["continuous_centerline"]
+    assert "not a proven historical pen trace" in centerline_provenance
     assert report.html_path.is_file()
     assert report.markdown_path.is_file()
     assert (report.output_dir / "overlay-raster.png").is_file()
-    assert "trajectory metrics are unavailable" in report.markdown_path.read_text()
+    assert "trajectory metrics could not be calculated" in report.markdown_path.read_text()
+
+
+def test_changed_smoothing_options_warn_and_do_not_change_continuous_geometry(tmp_path):
+    import numpy as np
+
+    from inkgrammar.comparison import (
+        ComparisonIdentity,
+        compare_extracted_letters,
+        extract_letter,
+    )
+    from inkgrammar.comparison.metrics import analyze_comparison
+
+    reference_path, sample_path = _write_letter_images(tmp_path)
+    reference = extract_letter(reference_path, (5, 5, 70, 62))
+    sample = extract_letter(sample_path, (5, 5, 70, 62))
+    identity = ComparisonIdentity("sample", "reference", "e")
+    default = compare_extracted_letters(reference, sample, identity=identity)
+    changed = compare_extracted_letters(
+        reference,
+        sample,
+        identity=identity,
+        smoothing_window=7,
+        smoothing_polynomial_order=2,
+    )
+
+    warning = next(message for message in changed.warnings if "Legacy smoothing options" in message)
+    assert "window=7" in warning
+    assert "only by the ordered-polyline fallback" in warning
+    assert not any("Legacy smoothing options" in message for message in default.warnings)
+    default_analysis = analyze_comparison(default)
+    changed_analysis = analyze_comparison(changed)
+    np.testing.assert_array_equal(
+        default_analysis.reference_geometry.heading_rad,
+        changed_analysis.reference_geometry.heading_rad,
+    )
+    np.testing.assert_array_equal(
+        default_analysis.reference_geometry.turn_rate_rad_per_progress,
+        changed_analysis.reference_geometry.turn_rate_rad_per_progress,
+    )
