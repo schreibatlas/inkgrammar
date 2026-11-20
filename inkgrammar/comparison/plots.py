@@ -17,6 +17,7 @@ def write_plot(
     y_label: str,
     series: Sequence[PlotSeries],
     event_progress: Sequence[float] = (),
+    event_annotations: Sequence[tuple[float, str]] = (),
 ) -> None:
     width, height = 900, 440
     scale = 4
@@ -75,6 +76,24 @@ def write_plot(
             (x_pixel, top * scale, x_pixel, plot_bottom * scale),
             fill=(185, 185, 185),
             width=scale,
+        )
+
+    for index, (event, label) in enumerate(event_annotations):
+        x = left + (float(event) - x_min) / (x_max - x_min) * (plot_right - left)
+        x_pixel = round(x * scale)
+        draw.line(
+            (x_pixel, top * scale, x_pixel, plot_bottom * scale),
+            fill=(145, 145, 145),
+            width=scale,
+        )
+        draw.text(
+            (
+                min(x_pixel + scale, plot_right * scale - 36 * scale),
+                (top + 2 + index % 3 * 14) * scale,
+            ),
+            label,
+            fill=(85, 85, 85),
+            font=font,
         )
 
     for index, (label, x_values, y_values, color) in enumerate(series):

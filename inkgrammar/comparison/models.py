@@ -2,16 +2,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from PIL import Image
 from planarcurve.transforms import Similarity2D
 from pydantic import Field
-from rasterregions import MaskMode, MaskResult
-from skeletonpaths import SkeletonAnalysis, SkeletonGraph, SkeletonWalk
+from rasterregions import ForegroundEvidence, MaskMode, MaskResult
+from skeletonpaths import SkeletonAnalysis, SkeletonGraph, SkeletonWalk, StrokeHypothesis
 
 from ..models import StrictModel
+
+if TYPE_CHECKING:
+    from planarcurve.fitting import TrajectoryModelSelectionResult
 
 InkMode = MaskMode
 InkMaskResult = MaskResult
@@ -22,6 +25,15 @@ class CropRect(StrictModel):
     y: int = Field(ge=0)
     width: int = Field(gt=0)
     height: int = Field(gt=0)
+
+
+class JunctionRegionSummary(StrictModel):
+    node_id: int = Field(ge=0)
+    xy: tuple[float, float]
+    radius_px: float = Field(ge=0)
+    support_pixels: list[tuple[int, int]]
+    port_count: int = Field(ge=0)
+    confidence: float = Field(ge=0, le=1)
 
 
 class LetterImageInput(StrictModel):
@@ -37,6 +49,8 @@ class TopologySummary(StrictModel):
     endpoints: list[tuple[float, float]]
     junction_count: int = Field(ge=0)
     junctions: list[tuple[float, float]]
+    junction_regions: list[JunctionRegionSummary] = Field(default_factory=list)
+    raw_junction_seed_count: int = Field(ge=0)
     cycle_count: int = Field(ge=0)
     component_count: int = Field(ge=0)
 
@@ -123,6 +137,76 @@ class ContinuousPath:
 
 
 @dataclass(frozen=True)
+class WritingEvent:
+    kind: Literal["junction-encounter", "pen-lift", "stroke-start", "stroke-end"]
+    progress: float
+    junction_node_id: int | None = None
+    occurrence: int | None = None
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.progress) or not 0.0 <= self.progress <= 1.0:
+            raise ValueError("writing-event progress must be between zero and one")
+        if self.kind == "junction-encounter" and self.junction_node_id is None:
+            raise ValueError("junction encounters require a semantic junction node")
+        if self.occurrence is not None and self.occurrence < 1:
+            raise ValueError("junction occurrence numbers must be positive")
+
+
+@dataclass(frozen=True)
+class WritingRouteScore:
+    coverage_cost: float
+    repeat_cost: float
+    lift_cost: float
+    continuity_cost: float
+    steering_complexity_cost: float
+    junction_pairing_cost: float = 0.0
+    counterpart_similarity_cost: float | None = None
+
+    @property
+    def intrinsic_cost(self) -> float:
+        return (
+            1_000_000.0 * self.coverage_cost
+            + 100.0 * self.repeat_cost
+            + 10.0 * self.lift_cost
+            + 10.0 * self.continuity_cost
+            + self.steering_complexity_cost
+            + self.junction_pairing_cost
+        )
+
+
+@dataclass(frozen=True)
+class WritingRouteCandidate:
+    hypothesis: StrokeHypothesis
+    continuous_strokes: tuple[ContinuousPath, ...]
+    events: tuple[WritingEvent, ...]
+    steering_models: tuple[TrajectoryModelSelectionResult, ...]
+    score: WritingRouteScore
+    ambiguous: bool
+    physical_junction_count: int
+    cycle_count: int
+
+
+@dataclass(frozen=True)
+class WritingRoutePairScore:
+    reference_rank: int
+    sample_rank: int
+    intrinsic_route_cost: float
+    aligned_centerline_cost: float
+    steering_profile_cost: float
+    topology_event_compatibility_cost: float
+    total_cost: float
+
+
+@dataclass(frozen=True)
+class WritingRoutePairSelection:
+    reference: WritingRouteCandidate
+    sample: WritingRouteCandidate
+    score: WritingRoutePairScore
+    ambiguous: bool
+    alternatives: tuple[WritingRoutePairScore, ...]
+
+
+@dataclass(frozen=True)
 class AlignmentResult:
     transform: Similarity2D
     direction: Literal["forward", "reversed-for-best-match"]
@@ -195,14 +279,22 @@ class ExtractedLetter:
     resampled_xy: np.ndarray | None
     continuous_path: ContinuousPath | None = None
     geometry_warning: str | None = None
+    route_candidates: tuple[WritingRouteCandidate, ...] = ()
+    foreground_evidence: ForegroundEvidence | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_path", Path(self.source_path))
+        object.__setattr__(self, "route_candidates", tuple(self.route_candidates))
         expected_shape = (self.crop.height, self.crop.width)
         if self.image.size != (self.crop.width, self.crop.height):
             raise ValueError("extracted image dimensions must match its crop rectangle")
         if self.mask_result.mask.shape != expected_shape:
             raise ValueError("ink mask dimensions must match the extracted image")
+        if (
+            self.foreground_evidence is not None
+            and self.foreground_evidence.mask.shape != expected_shape
+        ):
+            raise ValueError("raster foreground evidence dimensions must match the extracted image")
         if self.ordered_path is None and (
             self.resampled_xy is not None or self.continuous_path is not None
         ):
@@ -231,6 +323,7 @@ class ComparisonResult:
     smoothing_polynomial_order: int = 2
     warnings: list[str] = field(default_factory=list)
     identity: ComparisonIdentity | None = None
+    route_selection: WritingRoutePairSelection | None = None
 
     def __post_init__(self) -> None:
         identity = self.identity

@@ -43,6 +43,11 @@ from .models import (
     OrderedPath,
     SkeletonDiagnostics,
     TopologySummary,
+    WritingEvent,
+    WritingRouteCandidate,
+    WritingRoutePairScore,
+    WritingRoutePairSelection,
+    WritingRouteScore,
 )
 from .path import (
     PathExtractionError,
@@ -54,6 +59,7 @@ from .path import (
     resample_path,
 )
 from .report import WrittenComparisonReport, write_comparison_report
+from .routes import generate_writing_route_candidates, select_writing_route_pair
 from .segmentation import (
     PageSegmentation,
     ReferenceGallery,
@@ -91,6 +97,13 @@ __all__ = [
     "PathExtractionError",
     "SkeletonDiagnostics",
     "TopologySummary",
+    "WritingEvent",
+    "WritingRouteCandidate",
+    "WritingRoutePairScore",
+    "WritingRoutePairSelection",
+    "WritingRouteScore",
+    "generate_writing_route_candidates",
+    "select_writing_route_pair",
     "WrittenComparisonReport",
     "align_continuous_paths",
     "align_ordered_paths",

@@ -5,7 +5,9 @@ from typing import get_args
 
 
 def test_planarcurve_minimum_api_contract() -> None:
+    from planarcurve.fitting import select_trajectory_model
     from planarcurve.polyline import polyline_self_intersections
+    from planarcurve.trajectory import HeadingRateProfile
     from planarcurve.trajectory_chain import (
         DirectedTrajectory,
         TrajectoryChain,
@@ -16,9 +18,11 @@ def test_planarcurve_minimum_api_contract() -> None:
 
     assert callable(fit_similarity_transform)
     assert callable(polyline_self_intersections)
+    assert callable(select_trajectory_model)
     assert all(
         value is not None
         for value in (
+            HeadingRateProfile,
             DirectedTrajectory,
             TrajectoryChain,
             evaluate_trajectory_chain,
@@ -29,21 +33,27 @@ def test_planarcurve_minimum_api_contract() -> None:
 
 def test_skeletonpaths_minimum_api_contract() -> None:
     from skeletonpaths import (
+        JunctionRegion,
+        JunctionRegionOptions,
         SkeletonAnalysis,
         SkeletonWalk,
         analyze_mask,
         covering_walk,
         graph_from_skeleton,
+        stroke_hypotheses_from_analysis,
     )
 
     assert all(
         value is not None
         for value in (
+            JunctionRegion,
+            JunctionRegionOptions,
             SkeletonAnalysis,
             SkeletonWalk,
             analyze_mask,
             covering_walk,
             graph_from_skeleton,
+            stroke_hypotheses_from_analysis,
         )
     )
 

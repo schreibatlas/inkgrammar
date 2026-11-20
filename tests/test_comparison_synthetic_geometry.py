@@ -137,6 +137,37 @@ def _loop_route(turns: int) -> np.ndarray:
     return np.vstack((entry, loop, entry[::-1]))
 
 
+def test_lowercase_e_counts_one_junction_and_keeps_repeated_encounters(tmp_path) -> None:
+    route = np.asarray(
+        [
+            (54, 28),
+            (45, 18),
+            (30, 14),
+            (16, 20),
+            (12, 30),
+            (16, 40),
+            (30, 44),
+            (43, 38),
+            (45, 30),
+            (30, 30),
+            (12, 30),
+        ],
+        dtype=float,
+    )
+    extracted = _render_and_extract(tmp_path, "lowercase-e", route, width=6)
+    candidate = extracted.route_candidates[0]
+    junction_events = [event for event in candidate.events if event.kind == "junction-encounter"]
+
+    assert extracted.diagnostics.topology.junction_count == 1
+    assert candidate.physical_junction_count == 1
+    assert len(junction_events) == 2
+    assert {event.junction_node_id for event in junction_events} == {
+        extracted.diagnostics.graph.junction_regions[0].node_id
+    }
+    assert [event.occurrence for event in junction_events] == [1, 2]
+    assert junction_events[0].progress < junction_events[1].progress
+
+
 def test_loop_entry_and_retrace_preserve_topology_route_and_events(tmp_path) -> None:
     entry = _render_and_extract(tmp_path, "loop-entry", _loop_route(1), width=6)
     retrace = _render_and_extract(tmp_path, "loop-retrace", _loop_route(2), width=6)
@@ -152,6 +183,17 @@ def test_loop_entry_and_retrace_preserve_topology_route_and_events(tmp_path) -> 
         assert path.edge_directions == extracted.ordered_path.walk.edge_directions
         assert len(path.route_event_progress) == 2
         assert len(path.route_event_indices) == 2
+        junction_events = [
+            event
+            for event in extracted.route_candidates[0].events
+            if event.kind == "junction-encounter"
+        ]
+        assert len(extracted.diagnostics.graph.junction_regions) == 1
+        assert len(junction_events) == 2
+        assert {event.junction_node_id for event in junction_events} == {
+            extracted.diagnostics.graph.junction_regions[0].node_id
+        }
+        assert [event.occurrence for event in junction_events] == [1, 2]
 
         distances, _ = cKDTree(_loop_route(1)).query(path.xy)
         valid = (path.progress >= 0.03) & (path.progress <= 0.97)

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import rasterregions as rr
 from PIL import Image
+from skeletonpaths import SkeletonAnalysis
 
 from .segmentation import SegmentedGlyph
+from .skeleton import analyze_skeleton
 
 
 @dataclass(frozen=True)
@@ -20,6 +22,7 @@ class GlyphDescriptor:
     junction_count: int | None = None
     cycle_count: int | None = None
     path_available: bool | None = None
+    analysis: SkeletonAnalysis | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         mask = np.asarray(self.normalized_mask, dtype=bool)
@@ -65,16 +68,30 @@ def canonicalize_mask(
     return canvas
 
 
-def glyph_descriptor(candidate: SegmentedGlyph, *, size: int = 96) -> GlyphDescriptor:
-    """Create the coarse raster and topology descriptor for retrieval ranking."""
+def glyph_descriptor(
+    candidate: SegmentedGlyph,
+    *,
+    size: int = 96,
+    analysis: SkeletonAnalysis | None = None,
+) -> GlyphDescriptor:
+    """Create a coarse raster and semantic-topology descriptor for retrieval."""
     ys, xs = np.nonzero(candidate.mask)
     if not len(xs):
         raise ValueError(f"glyph candidate {candidate.glyph_id} has an empty mask")
     tight = candidate.mask[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
+    if analysis is None:
+        analysis = analyze_skeleton(candidate.mask).analysis
+    assert analysis is not None
+    graph = analysis.graph
     return GlyphDescriptor(
         glyph_id=candidate.glyph_id,
         normalized_mask=canonicalize_mask(tight, size=size),
         aspect_ratio=float(tight.shape[1] / tight.shape[0]),
         ink_fill=float(tight.mean()),
         component_count=len(rr.components(tight)),
+        endpoint_count=sum(node.degree == 1 for node in graph.nodes),
+        junction_count=len(graph.junction_regions),
+        cycle_count=graph.cycle_count,
+        path_available=bool(graph.edges) and graph.component_count == 1,
+        analysis=analysis,
     )

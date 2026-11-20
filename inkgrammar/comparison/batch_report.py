@@ -65,11 +65,120 @@ def match_score_payload(score: MatchScore) -> dict[str, Any]:
         "topology_cost": score.topology_cost,
         "centerline_cost": score.centerline_cost,
         "heading_cost": score.heading_cost,
-        "turn_rate_cost": score.turn_rate_cost,
+        "fitted_steering_cost": score.fitted_steering_cost,
+        "route_structure_cost": score.route_structure_cost,
     }
 
 
+def match_reason(score: MatchScore, alternatives: tuple[MatchScore, ...]) -> str:
+    if not alternatives:
+        return "Only available reference candidate."
+    runner_up = alternatives[0]
+    weights = {
+        "raster": ("raster_cost", RASTER_WEIGHT),
+        "aspect": ("aspect_cost", ASPECT_WEIGHT),
+        "fill": ("fill_cost", FILL_WEIGHT),
+        "topology": ("topology_cost", TOPOLOGY_WEIGHT),
+        "centerline": ("centerline_cost", 0.45),
+        "heading": ("heading_cost", 0.15),
+        "fitted steering": ("fitted_steering_cost", 0.15),
+        "route structure": ("route_structure_cost", 0.10),
+    }
+    advantages = []
+    for label, (attribute, weight) in weights.items():
+        best_value = getattr(score, attribute)
+        next_value = getattr(runner_up, attribute)
+        if best_value is not None and next_value is not None and best_value < next_value:
+            advantages.append((weight * (next_value - best_value), label))
+    advantages.sort(reverse=True)
+    if not advantages:
+        return f"Lowest combined retrieval cost; next candidate is {runner_up.reference_id}."
+    features = " and ".join(label for _, label in advantages[:2])
+    return (
+        f"Ranked ahead of {runner_up.reference_id}; lower {features} costs "
+        "were the strongest advantages."
+    )
+
+
+def ambiguity_sources(
+    score: MatchScore,
+    alternatives: tuple[MatchScore, ...],
+    match_status: str,
+    segmentation_status: str,
+    segmentation_warnings: tuple[str, ...],
+    pair_report_json: Path | None = None,
+) -> list[dict[str, str]]:
+    sources = []
+    if match_status == "ambiguous" and alternatives:
+        next_cost = alternatives[0].cost
+        margin = next_cost - score.cost
+        relative_margin = margin / max(abs(score.cost), 1e-9)
+        sources.append(
+            {
+                "source": "match_cost_tie",
+                "reason": (
+                    f"Best and next retrieval costs differ by {margin:.4g} "
+                    f"({relative_margin:.1%}), within the configured ambiguity margin."
+                ),
+            }
+        )
+    if segmentation_status == "ambiguous":
+        detail = "; ".join(segmentation_warnings[:2])
+        sources.append(
+            {
+                "source": "segmentation_uncertainty",
+                "reason": (
+                    detail or ("Segmentation reported uncertain sample or reference boundaries.")
+                ),
+            }
+        )
+    if pair_report_json is not None and pair_report_json.is_file():
+        pair_payload = json.loads(pair_report_json.read_text(encoding="utf-8"))
+        writing = pair_payload.get("writing", {})
+        if writing.get("route_ambiguous"):
+            selected = pair_payload.get("diagnostics", {}).get("selected_route_pair") or {}
+            ranks = {
+                "reference": selected.get("reference_rank"),
+                "sample": selected.get("sample_rank"),
+            }
+            candidates = pair_payload.get("diagnostics", {}).get("candidate_routes", {})
+            hypothesis_ambiguous = any(
+                candidate.get("ambiguous")
+                for side, rank in ranks.items()
+                for candidate in candidates.get(side, ())
+                if candidate.get("rank") == rank
+            )
+            sources.append(
+                {
+                    "source": (
+                        "writing_route_hypothesis"
+                        if hypothesis_ambiguous
+                        else "writing_route_pair_tie"
+                    ),
+                    "reason": (
+                        "A selected bounded route hypothesis remains ambiguous."
+                        if hypothesis_ambiguous
+                        else "Alternative joint route-pair interpretations remain near-tied."
+                    ),
+                }
+            )
+    return sources
+
+
+def _ambiguity_text(sources: list[dict[str, str]]) -> str:
+    return "; ".join(f"{item['source']}: {item['reason']}" for item in sources) or "None reported."
+
+
 def _sample_payload(result: BatchSampleResult, output_dir: Path) -> dict[str, Any]:
+    reason = match_reason(result.score, result.alternatives)
+    ambiguity = ambiguity_sources(
+        result.score,
+        result.alternatives,
+        result.status,
+        result.segmentation_status,
+        result.segmentation_warnings,
+        result.report_json,
+    )
     return {
         "sample_id": result.sample_id,
         "sample_bbox": result.sample_bbox.model_dump(mode="json"),
@@ -79,6 +188,8 @@ def _sample_payload(result: BatchSampleResult, output_dir: Path) -> dict[str, An
         "status": result.status,
         "match_status": result.status,
         "segmentation_status": result.segmentation_status,
+        "match_reason": reason,
+        "ambiguity_sources": ambiguity,
         "segmentation_warnings": list(result.segmentation_warnings),
         "cost": result.score.cost,
         "alternatives": [match_score_payload(score) for score in result.alternatives],
@@ -161,13 +272,15 @@ def write_batch_report(
         f"Segmentation-ambiguous samples: {segmentation_ambiguous_count}.",
         "Retrieval costs rank candidates and are not correctness probabilities.",
         "",
-        "| Sample | Best reference | Match status | Segmentation status | Cost | Pair report |",
-        "|---|---|---:|---:|---:|---|",
+        "| Sample | Best reference | Match status | Segmentation status | Cost | "
+        "Match reason | Ambiguity sources | Pair report |",
+        "|---|---|---:|---:|---:|---|---|---|",
     ]
     for item in samples:
         markdown.append(
             f"| {item['sample_id']} | {item['reference_id']} | {item['status']} "
             f"| {item['segmentation_status']} | {item['cost']:.4f} "
+            f"| {item['match_reason']} | {_ambiguity_text(item['ambiguity_sources'])} "
             f"| [{item['report_dir']}/report.html]({item['report_dir']}/report.html) |"
         )
     markdown.extend(["", "## Ranked alternatives", ""])
@@ -202,6 +315,8 @@ def write_batch_report(
             f"<td>{html.escape(item['status'])}</td>"
             f"<td>{html.escape(item['segmentation_status'])}</td>"
             f"<td>{item['cost']:.4f}</td>"
+            f"<td>{html.escape(item['match_reason'])}</td>"
+            f"<td>{html.escape(_ambiguity_text(item['ambiguity_sources']))}</td>"
             f'<td><a href="{report_link}">pair report</a></td>'
             f'<td><a href="{alternatives_link}"><img src="{alternatives_link}" '
             f'width="180" alt="ranked alternatives"></a>'
@@ -227,8 +342,9 @@ def write_batch_report(
             f"search truncated {reference_segmentation['search_truncated']} "
             f"(limit {reference_segmentation['search_limit']}).</p>",
             "<table><thead><tr><th>Sample</th><th>Best reference</th>"
-            "<th>Match status</th><th>Segmentation status</th>"
-            "<th>Cost</th><th>Report</th><th>Alternatives</th></tr></thead>",
+            "<th>Match status</th><th>Segmentation status</th><th>Cost</th>"
+            "<th>Match reason</th><th>Ambiguity sources</th>"
+            "<th>Report</th><th>Alternatives</th></tr></thead>",
             f"<tbody>{''.join(rows)}</tbody></table>",
             "</body></html>",
         ]

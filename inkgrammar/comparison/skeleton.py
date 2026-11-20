@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 from skeletonpaths import SkeletonAnalysis, SkeletonGraph, analyze_mask, graph_from_skeleton
 
-from .models import SkeletonDiagnostics, TopologySummary
+from .models import JunctionRegionSummary, SkeletonDiagnostics, TopologySummary
 
 
 def _diagnostics_from_graph(
@@ -13,14 +13,26 @@ def _diagnostics_from_graph(
     analysis: SkeletonAnalysis | None = None,
 ) -> SkeletonDiagnostics:
     endpoints = [node.xy for node in graph.nodes if node.degree == 1]
-    junctions = [node.xy for node in graph.nodes if node.degree > 2]
+    junction_regions = graph.junction_regions
     topology = TopologySummary(
         node_count=len(graph.nodes),
         edge_count=len(graph.edges),
         endpoint_count=len(endpoints),
         endpoints=endpoints,
-        junction_count=len(junctions),
-        junctions=junctions,
+        junction_count=len(junction_regions),
+        junctions=[region.xy for region in junction_regions],
+        junction_regions=[
+            JunctionRegionSummary(
+                node_id=region.node_id,
+                xy=region.xy,
+                radius_px=region.radius_px,
+                support_pixels=list(region.support_pixels),
+                port_count=region.port_count,
+                confidence=region.confidence,
+            )
+            for region in junction_regions
+        ],
+        raw_junction_seed_count=graph.raw_junction_seed_count,
         cycle_count=graph.cycle_count,
         component_count=graph.component_count,
     )
@@ -38,9 +50,18 @@ def diagnostics_from_skeleton(
     return _diagnostics_from_graph(skeleton, radius, graph)
 
 
+def diagnostics_from_analysis(analysis: SkeletonAnalysis) -> SkeletonDiagnostics:
+    """Build diagnostics while preserving a prepared SkeletonPaths analysis."""
+    return _diagnostics_from_graph(
+        analysis.skeleton,
+        analysis.radius,
+        analysis.graph,
+        analysis,
+    )
+
+
 def analyze_skeleton(mask: np.ndarray) -> SkeletonDiagnostics:
     ink = np.array(mask, dtype=bool, copy=True)
     if ink.ndim != 2:
         raise ValueError("ink mask must be a 2D array")
-    analysis = analyze_mask(ink)
-    return _diagnostics_from_graph(analysis.skeleton, analysis.radius, analysis.graph, analysis)
+    return diagnostics_from_analysis(analyze_mask(ink))

@@ -6,7 +6,11 @@ from typing import Literal
 
 import numpy as np
 from PIL import Image
-from skeletonpaths import SubpixelReconstructionError, SubpixelReconstructionLimitError
+from skeletonpaths import (
+    SkeletonAnalysis,
+    SubpixelReconstructionError,
+    SubpixelReconstructionLimitError,
+)
 
 from .descriptors import GlyphDescriptor, glyph_descriptor
 from .geometry import continuous_differential_geometry
@@ -20,6 +24,7 @@ from .path import (
 )
 from .segmentation import ReferenceGallery, SegmentedGlyph
 from .skeleton import analyze_skeleton
+from .steering import fitted_steering_distance
 
 RASTER_WEIGHT = 1.0
 ASPECT_WEIGHT = 0.15
@@ -30,7 +35,8 @@ DEFAULT_TOP_K = 5
 MINIMUM_ALTERNATIVES = 3
 CENTERLINE_WEIGHT = 0.45
 HEADING_WEIGHT = 0.15
-TURN_RATE_WEIGHT = 0.15
+FITTED_STEERING_WEIGHT = 0.15
+ROUTE_STRUCTURE_WEIGHT = 0.10
 AMBIGUITY_ABSOLUTE_MARGIN = 0.04
 AMBIGUITY_RELATIVE_MARGIN = 0.15
 
@@ -57,7 +63,8 @@ class MatchScore:
     refined_cost: float | None = None
     centerline_cost: float | None = None
     heading_cost: float | None = None
-    turn_rate_cost: float | None = None
+    fitted_steering_cost: float | None = None
+    route_structure_cost: float | None = None
 
     @property
     def cost(self) -> float:
@@ -134,12 +141,13 @@ def rank_reference_candidates(
     gallery: ReferenceGallery | ReferenceIndex,
     *,
     top_k: int = DEFAULT_TOP_K,
+    sample_analysis: SkeletonAnalysis | None = None,
 ) -> list[MatchScore]:
     """Return the best coarse shape matches, independently for this sample."""
     if top_k < 1:
         raise ValueError("top_k must be positive")
     index = gallery if isinstance(gallery, ReferenceIndex) else build_reference_index(gallery)
-    sample_descriptor = glyph_descriptor(sample)
+    sample_descriptor = glyph_descriptor(sample, analysis=sample_analysis)
     ranked = sorted(
         (coarse_match_cost(sample_descriptor, descriptor) for descriptor in index.descriptors),
         key=lambda score: (score.coarse_cost, score.reference_id),
@@ -161,6 +169,37 @@ def _continuous_path_for_match(
     return refine_continuous_path(diagnostics, ordered_path)
 
 
+def _route_structure_cost(
+    sample_extracted: ExtractedLetter | None,
+    reference_extracted: ExtractedLetter | None,
+) -> float | None:
+    if (
+        sample_extracted is None
+        or reference_extracted is None
+        or not sample_extracted.route_candidates
+        or not reference_extracted.route_candidates
+    ):
+        return None
+    sample_route = min(
+        sample_extracted.route_candidates,
+        key=lambda candidate: candidate.score.intrinsic_cost,
+    )
+    reference_route = min(
+        reference_extracted.route_candidates,
+        key=lambda candidate: candidate.score.intrinsic_cost,
+    )
+    sample_lifts = sum(event.kind == "pen-lift" for event in sample_route.events)
+    reference_lifts = sum(event.kind == "pen-lift" for event in reference_route.events)
+    terms = (
+        _normalized_count_difference(
+            len(sample_route.continuous_strokes), len(reference_route.continuous_strokes)
+        ),
+        _normalized_count_difference(sample_lifts, reference_lifts),
+        abs(sample_route.score.repeat_cost - reference_route.score.repeat_cost),
+    )
+    return float(np.mean(terms))
+
+
 def refine_match(
     sample: SegmentedGlyph,
     reference: SegmentedGlyph,
@@ -170,25 +209,32 @@ def refine_match(
     reference_extracted: ExtractedLetter | None = None,
 ) -> MatchScore:
     """Add continuous path evidence to raster ranking without rejecting candidates."""
+    route_structure = _route_structure_cost(sample_extracted, reference_extracted)
     try:
         reference_path = _continuous_path_for_match(reference, reference_extracted)
         sample_path = _continuous_path_for_match(sample, sample_extracted)
         if reference_path is None or sample_path is None:
-            return replace(coarse_score, refined_cost=coarse_score.coarse_cost)
+            raise PathExtractionError("continuous matching paths are unavailable")
         alignment = align_continuous_paths(reference_path, sample_path)
         aligned_sample_path = alignment.aligned_sample_path
         if aligned_sample_path is None:
-            return replace(coarse_score, refined_cost=coarse_score.coarse_cost)
+            raise PathExtractionError("aligned continuous sample path is unavailable")
         reference_samples = resample_continuous_path(reference_path)
         reference_geometry = continuous_differential_geometry(reference_samples)
         sample_geometry = continuous_differential_geometry(aligned_sample_path)
+        fitted_steering = fitted_steering_distance(reference_path, sample_path)
     except (
         PathExtractionError,
         SubpixelReconstructionError,
         SubpixelReconstructionLimitError,
         ValueError,
     ):
-        return replace(coarse_score, refined_cost=coarse_score.coarse_cost)
+        route_increment = ROUTE_STRUCTURE_WEIGHT * (route_structure or 0.0)
+        return replace(
+            coarse_score,
+            refined_cost=coarse_score.coarse_cost + route_increment,
+            route_structure_cost=route_structure,
+        )
 
     centerline = float(
         np.mean(np.linalg.norm(alignment.aligned_sample_xy - reference_samples.xy, axis=1))
@@ -198,27 +244,20 @@ def refine_match(
     heading = float(
         np.mean(np.abs(np.arctan2(np.sin(heading_delta), np.cos(heading_delta)))) / np.pi
     )
-    turn_rate = float(
-        np.mean(
-            np.abs(
-                sample_geometry.turn_rate_rad_per_progress
-                - reference_geometry.turn_rate_rad_per_progress
-            )
-        )
-        / (2.0 * np.pi)
-    )
     refined = (
         coarse_score.coarse_cost
         + CENTERLINE_WEIGHT * centerline
         + HEADING_WEIGHT * heading
-        + TURN_RATE_WEIGHT * turn_rate
+        + FITTED_STEERING_WEIGHT * fitted_steering
+        + ROUTE_STRUCTURE_WEIGHT * (route_structure or 0.0)
     )
     return replace(
         coarse_score,
         refined_cost=float(refined),
         centerline_cost=centerline,
         heading_cost=heading,
-        turn_rate_cost=turn_rate,
+        fitted_steering_cost=fitted_steering,
+        route_structure_cost=route_structure,
     )
 
 

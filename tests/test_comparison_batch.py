@@ -367,8 +367,76 @@ def test_reference_segmentation_ambiguity_is_separate_from_match_ambiguity(tmp_p
         match = json.loads((output / item["match_json"]).read_text())
         assert match["segmentation_status"] == "ambiguous"
         assert match["status"] == match["match_status"]
+        assert item["match_reason"]
+        assert any(
+            source["source"] == "segmentation_uncertainty" for source in item["ambiguity_sources"]
+        )
+        assert match["match_reason"] == item["match_reason"]
+        assert match["ambiguity_sources"] == item["ambiguity_sources"]
     assert "Segmentation-ambiguous samples: 3" in report.markdown_path.read_text()
     assert "Segmentation status" in report.html_path.read_text()
+    assert "Match reason" in report.markdown_path.read_text()
+    assert "Ambiguity sources" in report.html_path.read_text()
+    assert "segmentation_uncertainty" in report.markdown_path.read_text()
+
+
+def test_batch_reason_and_ambiguity_sources_explain_each_uncertainty(tmp_path) -> None:
+    from inkgrammar.comparison.batch_report import ambiguity_sources, match_reason
+    from inkgrammar.comparison.matching import MatchScore
+
+    best = MatchScore(
+        reference_id="ref-best",
+        rank=1,
+        coarse_cost=0.12,
+        raster_cost=0.1,
+        aspect_cost=0.2,
+        fill_cost=0.3,
+        topology_cost=0.2,
+        refined_cost=0.12,
+    )
+    next_best = MatchScore(
+        reference_id="ref-next",
+        rank=2,
+        coarse_cost=0.13,
+        raster_cost=0.2,
+        aspect_cost=0.2,
+        fill_cost=0.3,
+        topology_cost=0.4,
+        refined_cost=0.13,
+    )
+    reason = match_reason(best, (next_best,))
+    assert "ref-next" in reason
+    assert "raster and topology" in reason
+
+    pair_report = tmp_path / "report.json"
+    pair_report.write_text(
+        json.dumps(
+            {
+                "writing": {"route_ambiguous": True},
+                "diagnostics": {
+                    "selected_route_pair": {"reference_rank": 1, "sample_rank": 2},
+                    "candidate_routes": {
+                        "reference": [{"rank": 1, "ambiguous": True}],
+                        "sample": [{"rank": 2, "ambiguous": False}],
+                    },
+                },
+            }
+        )
+    )
+    sources = ambiguity_sources(
+        best,
+        (next_best,),
+        "ambiguous",
+        "ambiguous",
+        ("uncertain crop boundary",),
+        pair_report,
+    )
+    assert {item["source"] for item in sources} == {
+        "match_cost_tie",
+        "segmentation_uncertainty",
+        "writing_route_hypothesis",
+    }
+    assert "within the configured ambiguity margin" in sources[0]["reason"]
 
 
 def test_reference_failure_copies_diagnostics_and_records_phase(tmp_path, monkeypatch):

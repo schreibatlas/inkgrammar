@@ -66,9 +66,17 @@ def test_compare_letter_images_api_writes_complete_report_and_keeps_crop_pixels(
     assert report.payload["inputs"]["reference"]["mask_method"] == "grayscale"
     assert report.payload["inputs"]["sample"]["mask_method"] == "color"
     assert report.payload["inputs"]["sample"]["topology"]["component_count"] == 1
-    assert report.payload["geometry"]["sample_count"] == 256
-    assert report.payload["metrics"]["path"]["mean_error"] < 0.01
-
+    diagnostics = report.payload["diagnostics"]
+    assert diagnostics["geometry"]["sample_count"] == 256
+    assert diagnostics["metrics"]["path"]["mean_error"] < 0.01
+    writing = diagnostics["writing_metrics"]
+    assert writing["direction_source"] == "inferred_from_static_image_geometry"
+    assert writing["entry_exit"]["direction_source"] == "inferred_from_static_image_geometry"
+    assert writing["steering"]["reference_strokes"]
+    reconstruction = report.payload["reconstruction"]
+    assert reconstruction["available"]
+    assert reconstruction["reference"]["renderer"] == "strokeoutline.render_strokes"
+    assert reconstruction["sample"]["stroke_width_profiles"]
     with (
         Image.open(reference_path) as source,
         Image.open(output_dir / "input-reference.png") as retained,
@@ -140,7 +148,7 @@ def test_compare_letter_cli_rejects_malformed_crop_coordinates(tmp_path):
     assert "--reference-crop must be x,y,width,height" in result.output
 
 
-def test_label_free_comparison_writes_raster_report_when_path_recovery_fails(tmp_path, monkeypatch):
+def test_label_free_comparison_writes_raster_report_when_route_search_fails(tmp_path, monkeypatch):
     import inkgrammar.comparison.api as comparison_api
     from inkgrammar.comparison import (
         ComparisonIdentity,
@@ -152,10 +160,10 @@ def test_label_free_comparison_writes_raster_report_when_path_recovery_fails(tmp
 
     reference_path, sample_path = _write_letter_images(tmp_path)
 
-    def fail_path_recovery(_diagnostics):
+    def fail_route_search(_diagnostics, **_kwargs):
         raise PathExtractionError("synthetic multi-stroke path")
 
-    monkeypatch.setattr(comparison_api, "recover_ordered_path", fail_path_recovery)
+    monkeypatch.setattr(comparison_api, "generate_writing_route_candidates", fail_route_search)
     reference = extract_letter(reference_path, (0, 0, 80, 72), allow_path_failure=True)
     sample = extract_letter(sample_path, (0, 0, 80, 72), allow_path_failure=True)
     result = compare_extracted_letters(
@@ -172,27 +180,26 @@ def test_label_free_comparison_writes_raster_report_when_path_recovery_fails(tmp
         "reference_id": "ref-004",
         "label": None,
     }
-    assert report.payload["capabilities"] == {
-        "raster": True,
-        "topology": True,
-        "ordered_path": False,
-        "continuous_centerline": False,
-        "curvature": False,
-        "unavailable_reason": (
-            "Continuous or ordered-path trajectory metrics are unavailable for "
-            "reference and sample; raster and topology comparison remain available."
-        ),
-    }
-    assert report.payload["format_version"] == 2
-    assert report.payload["geometry"]["centerline_reconstruction"]["fallback"] is True
-    assert report.payload["geometry"]["centerline_reconstruction"]["algorithm"] == "unavailable"
-    assert report.payload["series"]["reference_raw_skeleton_xy"]
+    capabilities = report.payload["capabilities"]
+    assert capabilities["raster"] is True
+    assert capabilities["topology"] is True
+    assert capabilities["ordered_path"] is True
+    assert capabilities["continuous_centerline"] is False
+    assert capabilities["writing_routes"] is False
+    assert capabilities["ink_reconstruction"] is False
+    assert "synthetic multi-stroke path" in report.payload["writing"]["unavailable_reason"]
+    assert report.payload["format_version"] == 3
+    diagnostics = report.payload["diagnostics"]
+    reconstruction = diagnostics["geometry"]["centerline_reconstruction"]
+    assert reconstruction["fallback"] is True
+    assert reconstruction["algorithm"] == "unavailable_without_joint_route"
+    assert diagnostics["series"]["reference_raw_skeleton_xy"]
     centerline_provenance = report.payload["provenance"]["continuous_centerline"]
     assert "not a proven historical pen trace" in centerline_provenance
     assert report.html_path.is_file()
     assert report.markdown_path.is_file()
     assert (report.output_dir / "overlay-raster.png").is_file()
-    assert "trajectory metrics could not be calculated" in report.markdown_path.read_text()
+    assert "Route-based writing measurements are unavailable" in report.markdown_path.read_text()
 
 
 def test_changed_smoothing_options_warn_and_do_not_change_continuous_geometry(tmp_path):

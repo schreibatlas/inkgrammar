@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 from rasterregions import MaskMode, MaskResult, foreground_evidence
-from skeletonpaths import SubpixelReconstructionError, SubpixelReconstructionLimitError
+from skeletonpaths import (
+    SkeletonAnalysis,
+    SubpixelReconstructionError,
+    SubpixelReconstructionLimitError,
+)
 
 from .crop import coerce_crop_rect, load_crop
 from .models import (
@@ -16,44 +22,81 @@ from .models import (
     ExtractedLetter,
     OrderedPath,
     SkeletonDiagnostics,
+    WritingRouteCandidate,
 )
 from .path import (
     PathExtractionError,
     align_continuous_paths,
     align_ordered_paths,
     recover_ordered_path,
-    refine_continuous_path,
     resample_path,
 )
 from .report import WrittenComparisonReport, write_comparison_report
+from .routes import generate_writing_route_candidates, select_writing_route_pair
 from .segmentation import SegmentedGlyph
-from .skeleton import analyze_skeleton
+from .skeleton import analyze_skeleton, diagnostics_from_analysis
+from .steering import fit_writing_route_candidates, steering_profile_distance
 
 
-def _refine_path(
+def _route_paths(
     diagnostics: SkeletonDiagnostics,
-    ordered_path: OrderedPath | None,
     *,
     decision_field: np.ndarray | None = None,
-) -> tuple[ContinuousPath | None, str | None]:
-    if ordered_path is None:
-        return None, None
+    allow_path_failure: bool,
+) -> tuple[
+    tuple[WritingRouteCandidate, ...],
+    OrderedPath | None,
+    ContinuousPath | None,
+    str | None,
+]:
     try:
-        return (
-            refine_continuous_path(
-                diagnostics,
-                ordered_path,
-                decision_field=decision_field,
-            ),
-            None,
+        candidates = generate_writing_route_candidates(
+            diagnostics,
+            decision_field=decision_field,
         )
+        candidate = candidates[0]
+        walk = candidate.hypothesis.walks[0]
+        ordered_path = OrderedPath(
+            xy=walk.xy,
+            covered_edge_count=walk.covered_edge_count,
+            total_edge_count=walk.total_edge_count,
+            walk=walk,
+        )
+        return candidates, ordered_path, candidate.continuous_strokes[0], None
     except (
         PathExtractionError,
         SubpixelReconstructionError,
         SubpixelReconstructionLimitError,
         ValueError,
     ) as error:
-        return None, f"Continuous centerline reconstruction failed: {error}"
+        if not allow_path_failure:
+            if isinstance(error, PathExtractionError):
+                raise
+            raise PathExtractionError(f"Writing-route reconstruction failed: {error}") from error
+        ordered_path = None
+        if allow_path_failure:
+            with suppress(PathExtractionError):
+                ordered_path = recover_ordered_path(diagnostics)
+        return (), ordered_path, None, f"Writing-route reconstruction failed: {error}"
+
+
+def _with_selected_route(
+    extracted: ExtractedLetter,
+    candidate: WritingRouteCandidate,
+) -> ExtractedLetter:
+    walk = candidate.hypothesis.walks[0]
+    path = candidate.continuous_strokes[0]
+    return replace(
+        extracted,
+        ordered_path=OrderedPath(
+            xy=walk.xy,
+            covered_edge_count=walk.covered_edge_count,
+            total_edge_count=walk.total_edge_count,
+            walk=walk,
+        ),
+        continuous_path=path,
+        resampled_xy=resample_path(path.xy),
+    )
 
 
 def extract_letter(
@@ -63,7 +106,7 @@ def extract_letter(
     ink_mode: MaskMode = "auto",
     allow_path_failure: bool = False,
 ) -> ExtractedLetter:
-    """Crop an image and recover its raster, topology, and continuous path geometry."""
+    """Crop an image and recover bounded writing-route hypotheses and geometry."""
     source_path = Path(image_path)
     crop_rect = coerce_crop_rect(crop)
     image = load_crop(source_path, crop_rect)
@@ -76,16 +119,10 @@ def extract_letter(
         threshold=evidence.threshold,
     )
     diagnostics = analyze_skeleton(mask_result.mask)
-    try:
-        ordered_path = recover_ordered_path(diagnostics)
-    except PathExtractionError:
-        if not allow_path_failure:
-            raise
-        ordered_path = None
-    continuous_path, geometry_warning = _refine_path(
+    route_candidates, ordered_path, continuous_path, geometry_warning = _route_paths(
         diagnostics,
-        ordered_path,
         decision_field=evidence.decision_field,
+        allow_path_failure=allow_path_failure,
     )
     return ExtractedLetter(
         source_path=source_path,
@@ -97,6 +134,8 @@ def extract_letter(
         resampled_xy=(resample_path(continuous_path.xy) if continuous_path is not None else None),
         continuous_path=continuous_path,
         geometry_warning=geometry_warning,
+        route_candidates=route_candidates,
+        foreground_evidence=evidence,
     )
 
 
@@ -105,16 +144,18 @@ def extract_segmented_glyph(
     *,
     source_path: str | Path,
     allow_path_failure: bool = True,
+    analysis: SkeletonAnalysis | None = None,
 ) -> ExtractedLetter:
-    """Analyze a segmented candidate without reloading or thresholding its source crop."""
-    diagnostics = analyze_skeleton(candidate.mask)
-    try:
-        ordered_path = recover_ordered_path(diagnostics)
-    except PathExtractionError:
-        if not allow_path_failure:
-            raise
-        ordered_path = None
-    continuous_path, geometry_warning = _refine_path(diagnostics, ordered_path)
+    """Analyze a segmented candidate without reloading its source image."""
+    diagnostics = (
+        diagnostics_from_analysis(analysis)
+        if analysis is not None
+        else analyze_skeleton(candidate.mask)
+    )
+    route_candidates, ordered_path, continuous_path, geometry_warning = _route_paths(
+        diagnostics,
+        allow_path_failure=allow_path_failure,
+    )
     return ExtractedLetter(
         source_path=Path(source_path),
         crop=candidate.bbox,
@@ -130,6 +171,7 @@ def extract_segmented_glyph(
         resampled_xy=(resample_path(continuous_path.xy) if continuous_path is not None else None),
         continuous_path=continuous_path,
         geometry_warning=geometry_warning,
+        route_candidates=route_candidates,
     )
 
 
@@ -141,12 +183,31 @@ def compare_extracted_letters(
     smoothing_window: int = 11,
     smoothing_polynomial_order: int = 2,
 ) -> ComparisonResult:
-    """Compare extracted glyphs, using continuous geometry when both paths are available."""
+    """Compare extracted glyphs, using jointly selected routes when available."""
     warnings = [
         f"{side} {extracted.geometry_warning}"
         for side, extracted in (("Reference", reference), ("Sample", sample))
         if extracted.geometry_warning is not None
     ]
+    route_selection = None
+    if reference.route_candidates and sample.route_candidates:
+        reference_candidates = fit_writing_route_candidates(reference.route_candidates)
+        sample_candidates = fit_writing_route_candidates(sample.route_candidates)
+        reference = replace(reference, route_candidates=reference_candidates)
+        sample = replace(sample, route_candidates=sample_candidates)
+        route_selection = select_writing_route_pair(
+            reference_candidates,
+            sample_candidates,
+            steering_distance=steering_profile_distance,
+        )
+        reference = _with_selected_route(reference, route_selection.reference)
+        sample = _with_selected_route(sample, route_selection.sample)
+        warnings.append(
+            "Route order and orientation are inferred from static image geometry; "
+            "they are not observed pen traces."
+        )
+        if route_selection.ambiguous:
+            warnings.append("Several plausible writing-route interpretations remain near-tied.")
     if smoothing_window != 11 or smoothing_polynomial_order != 2:
         warnings.append(
             "Legacy smoothing options "
@@ -187,6 +248,7 @@ def compare_extracted_letters(
         smoothing_polynomial_order=smoothing_polynomial_order,
         warnings=warnings,
         identity=identity,
+        route_selection=route_selection,
     )
 
 

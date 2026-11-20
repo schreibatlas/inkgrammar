@@ -87,6 +87,9 @@ def test_skeleton_diagnostics_report_endpoints_radius_and_components() -> None:
 
     assert result.topology.endpoint_count == 2
     assert result.topology.junction_count == 0
+    assert result.topology.junction_regions == []
+    assert result.topology.junctions == []
+    assert result.topology.raw_junction_seed_count == result.graph.raw_junction_seed_count
     assert result.topology.component_count == 1
     assert result.topology.cycle_count == 0
     assert result.radius[10, 12] > 0
@@ -187,9 +190,10 @@ def test_extract_letter_keeps_discrete_walk_and_refined_geometry(tmp_path):
     assert extracted.resampled_xy.shape == (256, 2)
 
 
-def test_continuous_reconstruction_failure_preserves_topology_comparison(tmp_path, monkeypatch):
+def test_route_reconstruction_failure_preserves_topology_comparison(tmp_path, monkeypatch):
     from skeletonpaths import SubpixelReconstructionError
 
+    import inkgrammar.comparison.routes as comparison_routes
     from inkgrammar.comparison import api
 
     image = Image.new("RGB", (32, 32), "white")
@@ -200,7 +204,7 @@ def test_continuous_reconstruction_failure_preserves_topology_comparison(tmp_pat
     def fail_refinement(*args, **kwargs):
         raise SubpixelReconstructionError("forced reconstruction failure")
 
-    monkeypatch.setattr(api, "refine_continuous_path", fail_refinement)
+    monkeypatch.setattr(comparison_routes, "refine_continuous_walk", fail_refinement)
     extracted = api.extract_letter(image_path, (0, 0, 32, 32), allow_path_failure=True)
     comparison = api.compare_extracted_letters(
         extracted,
@@ -266,3 +270,39 @@ def test_extract_segmented_glyph_reuses_exact_candidate_mask(tmp_path, monkeypat
     assert extracted.mask_result.method == "dark"
     assert extracted.image is not candidate.image
     assert extracted.ordered_path is not None
+
+
+def test_extract_segmented_glyph_reuses_prepared_analysis(tmp_path, monkeypatch):
+    from inkgrammar.comparison import api
+    from inkgrammar.comparison.segmentation import SegmentedGlyph
+    from inkgrammar.comparison.skeleton import analyze_skeleton
+
+    mask = np.zeros((24, 24), dtype=bool)
+    mask[3:21, 11:14] = True
+    image = Image.new("RGB", (24, 24), "white")
+    ImageDraw.Draw(image).rectangle((11, 3, 13, 20), fill="black")
+    candidate = SegmentedGlyph(
+        glyph_id="prepared-analysis",
+        bbox=CropRect(x=0, y=0, width=24, height=24),
+        row_index=0,
+        column_index=0,
+        reading_order=0,
+        segmentation_confidence=1.0,
+        image=image,
+        mask=mask,
+    )
+    analysis = analyze_skeleton(mask).analysis
+    assert analysis is not None
+
+    def unexpected_analysis(_mask):
+        raise AssertionError("prepared skeleton analysis should be reused")
+
+    monkeypatch.setattr(api, "analyze_skeleton", unexpected_analysis)
+    extracted = api.extract_segmented_glyph(
+        candidate,
+        source_path=tmp_path / "sample.png",
+        analysis=analysis,
+    )
+
+    assert extracted.diagnostics.analysis is analysis
+    assert extracted.diagnostics.topology.endpoint_count == 2

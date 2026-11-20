@@ -11,11 +11,14 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageDraw
 from rasterregions import MaskMode, MaskResult
+from skeletonpaths import SkeletonAnalysis
 
 from .api import compare_extracted_letters, extract_segmented_glyph
 from .batch_report import (
     BatchComparisonReport,
     BatchSampleResult,
+    ambiguity_sources,
+    match_reason,
     match_score_payload,
     write_batch_report,
 )
@@ -50,9 +53,9 @@ from .segmentation import (
     segment_reference_gallery,
     segment_sample_glyphs,
 )
-from .skeleton import diagnostics_from_skeleton
+from .skeleton import analyze_skeleton, diagnostics_from_skeleton
 
-_REFERENCE_CACHE_VERSION = 4
+_REFERENCE_CACHE_VERSION = 5
 _DESCRIPTOR_SIZE = 96
 
 _REFERENCE_DIAGNOSTICS = (
@@ -346,6 +349,7 @@ def _load_reference_cache(
         segmentation=segmentation,
     )
 
+    candidate_by_id = {candidate.glyph_id: candidate for candidate in candidates}
     with np.load(cache_dir / "descriptors.npz", allow_pickle=False) as stored:
         descriptors = tuple(
             GlyphDescriptor(
@@ -358,6 +362,7 @@ def _load_reference_cache(
                 junction_count=descriptor_data["junction_count"],
                 cycle_count=descriptor_data["cycle_count"],
                 path_available=descriptor_data["path_available"],
+                analysis=analyze_skeleton(candidate_by_id[str(glyph_id)].mask).analysis,
             )
             for (
                 glyph_id,
@@ -552,6 +557,7 @@ def _get_reference_extraction(
     candidate: SegmentedGlyph,
     ink_mode: MaskMode,
     progress: ProgressReporter,
+    prepared_analysis: SkeletonAnalysis | None = None,
 ) -> ExtractedLetter:
     started = perf_counter()
     cache_status = "hit"
@@ -569,6 +575,7 @@ def _get_reference_extraction(
             candidate,
             source_path=source_path,
             allow_path_failure=True,
+            analysis=prepared_analysis,
         )
         _save_reference_extraction(
             cache_dir,
@@ -709,12 +716,24 @@ def _write_match_json(
     segmentation_warnings: tuple[str, ...],
     pair_report_dir: Path,
 ) -> None:
+    alternatives = tuple(ranked[1:])
+    reason = match_reason(best, alternatives)
+    uncertainty = ambiguity_sources(
+        best,
+        alternatives,
+        status,
+        segmentation_status,
+        segmentation_warnings,
+        pair_report_dir / "report.json",
+    )
     payload = {
         "sample_id": sample.glyph_id,
         "sample_bbox": sample.bbox.model_dump(mode="json"),
         "segmentation_confidence": sample.segmentation_confidence,
         "status": status,
         "match_status": status,
+        "match_reason": reason,
+        "ambiguity_sources": uncertainty,
         "segmentation_status": segmentation_status,
         "segmentation_warnings": list(segmentation_warnings),
         "best": {
@@ -1049,6 +1068,7 @@ def _compare_letter_page_impl(
     effective_top_k = max(top_k, MINIMUM_ALTERNATIVES)
     candidates = {candidate.glyph_id: candidate for candidate in gallery.candidates}
     results = []
+    reference_descriptors = {descriptor.glyph_id: descriptor for descriptor in index.descriptors}
     reference_extractions: dict[str, ExtractedLetter] = {}
 
     for sample_index, sample_candidate in enumerate(samples, start=1):
@@ -1061,6 +1081,7 @@ def _compare_letter_page_impl(
             sample_candidate,
             index,
             top_k=min(effective_top_k, len(gallery.candidates)),
+            sample_analysis=sample_extracted.diagnostics.analysis,
         )
         progress.stage(
             "coarse_ranking",
@@ -1084,6 +1105,7 @@ def _compare_letter_page_impl(
                     candidates[reference_id],
                     reference_ink_mode,
                     progress,
+                    prepared_analysis=reference_descriptors[reference_id].analysis,
                 )
         ranked = refine_top_k_matches(
             sample_candidate,

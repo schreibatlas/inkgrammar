@@ -5,6 +5,7 @@ from typing import Any
 
 import numpy as np
 from planarcurve.polyline import polyline_length
+from rasterregions import foreground_evidence
 
 from .geometry import (
     DifferentialGeometry,
@@ -13,6 +14,8 @@ from .geometry import (
 )
 from .models import ComparisonResult
 from .path import resample_continuous_path, reverse_continuous_path
+from .reconstruction import reconstruct_route_ink
+from .steering import steering_model_summary
 
 
 @dataclass(frozen=True)
@@ -76,6 +79,253 @@ def _continuous_inputs(result: ComparisonResult):
     if result.alignment.direction == "reversed-for-best-match":
         sample_source = reverse_continuous_path(sample_source)
     return reference, result.alignment.aligned_sample_path, sample_source
+
+
+def _glyph_height(extracted) -> float:
+    mask = extracted.mask_result.mask
+    rows = np.flatnonzero(mask.any(axis=1))
+    return float(rows[-1] - rows[0] + 1) if rows.size else float(mask.shape[0])
+
+
+def _width_profile(candidate, glyph_height: float) -> tuple[np.ndarray, np.ndarray]:
+    total_length = sum(stroke.arc_length_px for stroke in candidate.continuous_strokes)
+    progress_parts = []
+    width_parts = []
+    length_before = 0.0
+    for stroke in candidate.continuous_strokes:
+        progress_parts.append(
+            (length_before + stroke.progress * stroke.arc_length_px) / total_length
+        )
+        width_parts.append(2.0 * stroke.radius_px / glyph_height)
+        length_before += stroke.arc_length_px
+    return np.concatenate(progress_parts), np.concatenate(width_parts)
+
+
+def _width_summary(candidate, glyph_height: float) -> dict[str, object]:
+    progress, widths = _width_profile(candidate, glyph_height)
+    phases = ((0.0, 1.0 / 3.0), (1.0 / 3.0, 2.0 / 3.0), (2.0 / 3.0, 1.0))
+    phase_means = []
+    for index, (start, end) in enumerate(phases):
+        selected = (progress >= start) & (
+            (progress <= end) if index == len(phases) - 1 else (progress < end)
+        )
+        phase_means.append(float(np.mean(widths[selected])) if np.any(selected) else None)
+    median = float(np.median(widths))
+    return {
+        "median_width_over_glyph_height": median,
+        "coefficient_of_variation": float(np.std(widths) / median) if median > 0.0 else None,
+        "phase_mean_width_over_glyph_height": {
+            "entry": phase_means[0],
+            "middle": phase_means[1],
+            "exit": phase_means[2],
+        },
+    }
+
+
+def _progress_allocation(candidate) -> dict[str, float | None]:
+    encounters = [
+        event.progress for event in candidate.events if event.kind == "junction-encounter"
+    ]
+    if not encounters:
+        return {
+            "fraction_before_first_junction_encounter": None,
+            "fraction_between_first_and_last_junction_encounter": None,
+            "fraction_after_last_junction_encounter": None,
+        }
+    return {
+        "fraction_before_first_junction_encounter": float(encounters[0]),
+        "fraction_between_first_and_last_junction_encounter": float(encounters[-1] - encounters[0]),
+        "fraction_after_last_junction_encounter": float(1.0 - encounters[-1]),
+    }
+
+
+def _reconstruction_metrics(
+    result: ComparisonResult,
+) -> tuple[dict[str, object], dict[str, np.ndarray]]:
+    selection = result.route_selection
+    if selection is None:
+        return (
+            {
+                "available": False,
+                "unavailable_reason": "joint writing-route selection is unavailable",
+            },
+            {},
+        )
+
+    metrics: dict[str, object] = {
+        "available": True,
+        "coverage_comparison": "observed binary mask versus anti-aliased rendered coverage",
+        "reference": {},
+        "sample": {},
+    }
+    series: dict[str, np.ndarray] = {}
+    for side, extracted, candidate in (
+        ("reference", result.reference, selection.reference),
+        ("sample", result.sample, selection.sample),
+    ):
+        evidence = extracted.foreground_evidence
+        if evidence is None:
+            evidence = foreground_evidence(extracted.image, mode=extracted.mask_result.method)
+        reconstruction = reconstruct_route_ink(candidate, evidence)
+        metrics[side] = {
+            **reconstruction.metrics,
+            "stroke_width_profiles": [
+                {
+                    "progress": [progress for progress, _ in profile],
+                    "width_px": [width for _, width in profile],
+                }
+                for profile in reconstruction.width_profiles
+            ],
+        }
+        series[f"{side}_observed_ink"] = reconstruction.observed_mask
+        series[f"{side}_rendered_coverage"] = reconstruction.rendered_coverage
+        series[f"{side}_under_coverage"] = reconstruction.under_coverage_mask
+        series[f"{side}_over_coverage"] = reconstruction.over_coverage_mask
+    return metrics, series
+
+
+def _writing_metrics(result: ComparisonResult) -> dict[str, object]:
+    selection = result.route_selection
+    if selection is None:
+        return {
+            "available": False,
+            "unavailable_reason": "joint writing-route selection is unavailable",
+            "direction_source": "inferred_from_static_image_geometry",
+        }
+    reference = selection.reference
+    sample = selection.sample
+    reference_topology = result.reference.diagnostics.topology
+    sample_topology = result.sample.diagnostics.topology
+    junction_mismatch = reference.physical_junction_count != sample.physical_junction_count
+    cycle_mismatch = reference.cycle_count != sample.cycle_count
+    component_mismatch = reference_topology.component_count != sample_topology.component_count
+    reference_models = [steering_model_summary(model) for model in reference.steering_models]
+    sample_models = [steering_model_summary(model) for model in sample.steering_models]
+    reference_turn = sum(model["total_signed_turn_deg"] for model in reference_models)
+    sample_turn = sum(model["total_signed_turn_deg"] for model in sample_models)
+    dominant_phase_differences = [
+        abs(reference_model["dominant_turn_progress"] - sample_model["dominant_turn_progress"])
+        for reference_model, sample_model in zip(reference_models, sample_models, strict=False)
+    ]
+    reference_width = _width_summary(reference, _glyph_height(result.reference))
+    sample_width = _width_summary(sample, _glyph_height(result.sample))
+    reference_median_width = reference_width["median_width_over_glyph_height"]
+    sample_median_width = sample_width["median_width_over_glyph_height"]
+    reference_variability = reference_width["coefficient_of_variation"]
+    sample_variability = sample_width["coefficient_of_variation"]
+    phase_width_ratios = {
+        phase: (
+            sample_width["phase_mean_width_over_glyph_height"][phase]
+            / reference_width["phase_mean_width_over_glyph_height"][phase]
+            if reference_width["phase_mean_width_over_glyph_height"][phase] not in {None, 0.0}
+            and sample_width["phase_mean_width_over_glyph_height"][phase] is not None
+            else None
+        )
+        for phase in ("entry", "middle", "exit")
+    }
+    reference_path = reference.continuous_strokes[0]
+    sample_path = (
+        result.alignment.aligned_sample_path
+        if result.alignment is not None and result.alignment.aligned_sample_path is not None
+        else sample.continuous_strokes[0]
+    )
+    reference_heading = np.degrees(
+        np.arctan2(reference_path.tangent[[0, -1], 1], reference_path.tangent[[0, -1], 0])
+    )
+    sample_heading = np.degrees(
+        np.arctan2(sample_path.tangent[[0, -1], 1], sample_path.tangent[[0, -1], 0])
+    )
+    heading_difference = (sample_heading - reference_heading + 180.0) % 360.0 - 180.0
+    glyph_height = _glyph_height(result.reference)
+    vertical_delta = (sample_path.xy[[0, -1], 1] - reference_path.xy[[0, -1], 1]) / max(
+        glyph_height, 1.0
+    )
+    return {
+        "available": True,
+        "direction_source": "inferred_from_static_image_geometry",
+        "stroke_structure": {
+            "reference_stroke_count": len(reference.continuous_strokes),
+            "sample_stroke_count": len(sample.continuous_strokes),
+            "reference_pen_lift_count": reference.hypothesis.pen_lift_count,
+            "sample_pen_lift_count": sample.hypothesis.pen_lift_count,
+            "reference_repeated_length_ratio": reference.score.repeat_cost,
+            "sample_repeated_length_ratio": sample.score.repeat_cost,
+            "reference_full_coverage": not reference.hypothesis.uncovered_edge_ids,
+            "sample_full_coverage": not sample.hypothesis.uncovered_edge_ids,
+            "route_ambiguous": selection.ambiguous,
+        },
+        "topology": {
+            "reference_physical_junction_count": reference.physical_junction_count,
+            "sample_physical_junction_count": sample.physical_junction_count,
+            "reference_junction_encounter_count": sum(
+                event.kind == "junction-encounter" for event in reference.events
+            ),
+            "sample_junction_encounter_count": sum(
+                event.kind == "junction-encounter" for event in sample.events
+            ),
+            "reference_cycle_count": reference.cycle_count,
+            "sample_cycle_count": sample.cycle_count,
+            "reference_component_count": reference_topology.component_count,
+            "sample_component_count": sample_topology.component_count,
+            "mismatch_flags": {
+                "physical_junction_count": junction_mismatch,
+                "cycle_count": cycle_mismatch,
+                "component_count": component_mismatch,
+            },
+        },
+        "entry_exit": {
+            "direction_source": "inferred_from_static_image_geometry",
+            "start_heading_difference_deg": float(heading_difference[0]),
+            "end_heading_difference_deg": float(heading_difference[1]),
+            "start_vertical_placement_delta_over_glyph_height": float(vertical_delta[0]),
+            "end_vertical_placement_delta_over_glyph_height": float(vertical_delta[1]),
+        },
+        "steering": {
+            "reference_strokes": reference_models,
+            "sample_strokes": sample_models,
+            "reference_total_signed_turn_deg": float(reference_turn),
+            "sample_total_signed_turn_deg": float(sample_turn),
+            "total_signed_turn_difference_deg": float(sample_turn - reference_turn),
+            "profile_distance": selection.score.steering_profile_cost,
+            "dominant_turn_phase_difference": (
+                float(np.mean(dominant_phase_differences)) if dominant_phase_differences else None
+            ),
+        },
+        "path_allocation": {
+            "reference": _progress_allocation(reference),
+            "sample": _progress_allocation(sample),
+            "units": "normalized path progress, not elapsed time",
+        },
+        "width": {
+            "normalization": "robust glyph height",
+            "reference": reference_width,
+            "sample": sample_width,
+            "sample_to_reference_median_ratio": (
+                float(sample_median_width / reference_median_width)
+                if reference_median_width > 0.0
+                else None
+            ),
+            "sample_to_reference_variability_ratio": (
+                float(sample_variability / reference_variability)
+                if (
+                    sample_variability is not None
+                    and reference_variability is not None
+                    and reference_variability > 0.0
+                )
+                else None
+            ),
+            "sample_to_reference_phase_width_ratios": phase_width_ratios,
+        },
+        "route_pair_score": {
+            "intrinsic_route_cost": selection.score.intrinsic_route_cost,
+            "aligned_centerline_cost": selection.score.aligned_centerline_cost,
+            "steering_profile_cost": selection.score.steering_profile_cost,
+            "topology_event_compatibility_cost": (
+                selection.score.topology_event_compatibility_cost
+            ),
+            "total_cost": selection.score.total_cost,
+        },
+    }
 
 
 def analyze_comparison(
@@ -234,6 +484,8 @@ def analyze_comparison(
             "sample_median_px": float(np.median(sample_width)),
         },
     }
+    metrics["writing"] = _writing_metrics(result)
+    metrics["reconstruction"], reconstruction_series = _reconstruction_metrics(result)
     reference_continuous = result.reference.continuous_path
     sample_continuous = result.sample.continuous_path
     empty_points = np.empty((0, 2), dtype=float)
@@ -288,6 +540,7 @@ def analyze_comparison(
         "sample_resampled_xy": sample_xy,
         "sample_source_resampled_xy": sample_source_xy,
     }
+    series.update(reconstruction_series)
     return ComparisonAnalysis(
         progress,
         reference_geometry,

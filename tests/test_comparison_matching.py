@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +16,7 @@ from inkgrammar.comparison.matching import (
     TOPOLOGY_WEIGHT,
     MatchScore,
     build_reference_index,
+    coarse_match_cost,
     match_status,
     rank_reference_candidates,
     refine_match,
@@ -22,6 +24,7 @@ from inkgrammar.comparison.matching import (
 )
 from inkgrammar.comparison.models import CropRect
 from inkgrammar.comparison.segmentation import PageSegmentation, ReferenceGallery, SegmentedGlyph
+from inkgrammar.comparison.steering import fitted_steering_distance
 
 
 def _shape(kind: str, *, size: int = 64, offset: tuple[int, int] = (0, 0)) -> SegmentedGlyph:
@@ -148,7 +151,7 @@ def test_continuous_refinement_keeps_the_known_candidate_ranked_first():
     assert refined[0].reference_id == "e"
     assert refined[0].centerline_cost is not None
     assert refined[0].heading_cost is not None
-    assert refined[0].turn_rate_cost is not None
+    assert refined[0].fitted_steering_cost is not None
 
 
 def test_refinement_is_limited_to_the_coarse_top_k_candidates():
@@ -180,8 +183,82 @@ def test_refinement_uses_paths_when_available_and_falls_back_when_not():
 
     assert refined.centerline_cost is not None
     assert refined.heading_cost is not None
-    assert refined.turn_rate_cost is not None
+    assert refined.fitted_steering_cost is not None
     assert refined.refined_cost <= refined.coarse_cost + 1e-8
-    assert descriptor.path_available is None
+    assert descriptor.path_available is True
+    assert descriptor.endpoint_count == 2
+    assert descriptor.junction_count == 0
+    assert descriptor.cycle_count == 0
     assert raster_only.refined_cost == raster_only.coarse_cost
     assert raster_only.centerline_cost is None
+
+
+def test_glyph_descriptor_reuses_prepared_skeleton_analysis(monkeypatch) -> None:
+    from inkgrammar.comparison import descriptors as descriptor_module
+    from inkgrammar.comparison.skeleton import analyze_skeleton
+
+    candidate = _shape("l")
+    analysis = analyze_skeleton(candidate.mask).analysis
+    assert analysis is not None
+
+    def unexpected_analysis(_mask):
+        raise AssertionError("prepared skeleton analysis should be reused")
+
+    monkeypatch.setattr(descriptor_module, "analyze_skeleton", unexpected_analysis)
+    descriptor = glyph_descriptor(candidate, analysis=analysis)
+
+    assert descriptor.analysis is analysis
+    assert descriptor.endpoint_count == 2
+    assert descriptor.junction_count == 0
+    assert descriptor.cycle_count == 0
+    assert descriptor.path_available is True
+
+
+def test_semantic_topology_mismatch_changes_coarse_cost() -> None:
+    descriptor = glyph_descriptor(_shape("l"))
+    same = coarse_match_cost(descriptor, descriptor)
+    different = coarse_match_cost(
+        descriptor,
+        replace(descriptor, cycle_count=descriptor.cycle_count + 1),
+    )
+
+    assert same.topology_cost == 0.0
+    assert different.topology_cost > same.topology_cost
+    assert different.coarse_cost > same.coarse_cost
+
+
+def test_fitted_steering_distance_ignores_raw_curvature_spikes() -> None:
+    from inkgrammar.comparison.api import extract_segmented_glyph
+
+    extracted = extract_segmented_glyph(_shape("l"), source_path=Path("l.png"))
+    path = extracted.continuous_path
+    assert path is not None
+    spiked_curvature = path.curvature.copy()
+    spiked_curvature[::2] += 1_000_000.0
+    spiked_path = replace(path, curvature=spiked_curvature)
+
+    assert fitted_steering_distance(path, spiked_path) == 0.0
+
+
+def test_refinement_keeps_topology_steering_and_route_structure_separate() -> None:
+    from inkgrammar.comparison.api import extract_segmented_glyph
+
+    sample = _shape("two-strokes")
+    reference = _shape("l")
+    sample_extracted = extract_segmented_glyph(sample, source_path=Path("sample.png"))
+    reference_extracted = extract_segmented_glyph(reference, source_path=Path("reference.png"))
+    coarse = rank_reference_candidates(sample, _gallery(reference))[0]
+
+    refined = refine_match(
+        sample,
+        reference,
+        coarse,
+        sample_extracted=sample_extracted,
+        reference_extracted=reference_extracted,
+    )
+
+    assert refined.topology_cost > 0.0
+    assert refined.fitted_steering_cost is not None
+    assert refined.route_structure_cost is not None
+    assert refined.route_structure_cost > 0.0
+    assert not hasattr(refined, "turn_rate_cost")
