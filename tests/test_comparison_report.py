@@ -98,7 +98,7 @@ def test_report_writes_machine_and_human_outputs(tmp_path) -> None:
     assert metrics["turn_rate"]["summary_sample_count"] < 256
     assert metrics["width"]["source"] == "subpixel-cross-section"
     assert "not a proven historical pen trace" in payload["provenance"]["continuous_centerline"]
-    assert "not observed historical pen order" in payload["provenance"]["route_orientation"]
+    assert "direction is unavailable" in payload["provenance"]["route_orientation"]
     assert "speed" in payload["provenance"]["unmeasured_properties"]
     for name in (
         "reference_raw_skeleton_xy",
@@ -121,7 +121,7 @@ def test_report_writes_machine_and_human_outputs(tmp_path) -> None:
     assert "Engineering diagnostics" in html
     assert "plot-curvature-error.png" in html
     assert "1. Writing summary" in markdown
-    assert "not observed historical pen traces" in markdown
+    assert "direction is unavailable" in markdown
     assert "score" not in payload
     assert (report.output_dir / "input-reference.png").read_bytes()
 
@@ -152,7 +152,8 @@ def test_report_v3_renders_lowercase_e_routes_and_ink_residuals(tmp_path) -> Non
     image.save(image_path)
     crop = CropRect(x=0, y=0, width=64, height=64)
     extracted = extract_letter(image_path, crop)
-    assert len(extracted.diagnostics.topology.junction_regions) == 3
+    assert len(extracted.diagnostics.topology.junction_regions) == 2
+    assert extracted.diagnostics.topology.raw_junction_seed_count == 3
     result = compare_extracted_letters(
         extracted,
         extracted,
@@ -173,23 +174,73 @@ def test_report_v3_renders_lowercase_e_routes_and_ink_residuals(tmp_path) -> Non
 
     assert report.payload["format_version"] == 3
     assert report.payload["writing"]["available"] is True
-    assert report.payload["writing"]["reference"]["physical_junction_count"] == 3
+    assert report.payload["writing"]["reference"]["physical_junction_count"] == 2
     assert report.payload["writing"]["reference"]["junction_encounter_count"] == len(
         selected_events
     )
     assert report.payload["writing"]["route_ambiguous"] is True
     assert (
-        report.payload["interpretation"]["direction_source"]
-        == "inferred_from_static_image_geometry"
+        report.payload["interpretation"]["direction_source"] == "static_image_geometry_not_observed"
     )
+    assert (
+        report.payload["interpretation"]["direction_status"]
+        == report.payload["writing"]["direction_status"]
+    )
+    assert report.payload["writing"]["direction_interpretation"]
     assert report.payload["reconstruction"]["available"] is True
-    assert report.payload["artifacts"]["primary"][:4] == [
+    assert report.payload["artifacts"]["primary"][:5] == [
         "input-reference.png",
         "input-sample.png",
         "writing-path-overlay.png",
+        "writing-path-overlay.svg",
         "steering-profile.png",
     ]
+    route_search = report.payload["diagnostics"]["route_search"]
+    assert route_search["hypothesis_limit"] == 32
+    assert route_search["report_limit"] == 5
+    assert route_search["reference_candidates_reported"] <= 5
+    assert route_search["sample_candidates_reported"] <= 5
+    for side in ("reference", "sample"):
+        orientation = report.payload["writing"][side]["orientation"]
+        assert orientation["interpretation"] in {"inferred", "unresolved"}
+        assert orientation["status"] in {"resolved", "ambiguous"}
+        prior = report.payload["writing"][side]["writing_prior"]
+        assert {
+            "pen_lift_cost",
+            "start_endpoint_cost",
+            "end_endpoint_cost",
+            "direction_cost",
+            "junction_continuity_cost",
+        } <= prior.keys()
+    selected_score = report.payload["diagnostics"]["selected_route_pair"]["score"]
+    assert "writing_prior_cost" in selected_score
+    assert "pen_lift_count" in selected_score
+    route_svg = (report.output_dir / "writing-path-overlay.svg").read_text()
+    assert route_svg.count("<polyline") == (
+        report.payload["writing"]["reference"]["stroke_count"]
+        + report.payload["writing"]["sample"]["stroke_count"]
+    )
+    assert route_svg.count(">J</text>") == (
+        report.payload["writing"]["reference"]["physical_junction_count"]
+        + report.payload["writing"]["sample"]["physical_junction_count"]
+    )
+    assert "direction: unresolved" in route_svg or "direction: inferred" in route_svg
+    with Image.open(report.output_dir / "writing-path-overlay.png") as overlay:
+        assert min(overlay.size) >= 640
+        assert f'width="{overlay.width}" height="{overlay.height}"' in route_svg
+    from inkgrammar.comparison.report import (
+        _write_writing_path_overlay,
+        _write_writing_path_overlay_svg,
+    )
+
+    repeat_png = tmp_path / "repeat-route.png"
+    repeat_svg = tmp_path / "repeat-route.svg"
+    _write_writing_path_overlay(result, repeat_png)
+    _write_writing_path_overlay_svg(result, repeat_svg)
+    assert repeat_png.read_bytes() == (report.output_dir / "writing-path-overlay.png").read_bytes()
+    assert repeat_svg.read_bytes() == (report.output_dir / "writing-path-overlay.svg").read_bytes()
     for artifact in (
+        "writing-path-overlay.svg",
         "writing-path-overlay.png",
         "steering-profile.png",
         "ink-reconstruction-reference.png",
@@ -199,7 +250,7 @@ def test_report_v3_renders_lowercase_e_routes_and_ink_residuals(tmp_path) -> Non
     ):
         assert (report.output_dir / artifact).is_file()
     markdown = report.markdown_path.read_text()
-    assert "2. How the inferred pen path differs" in markdown
+    assert "2. How the selected route differs" in markdown
     assert "4. Ink reconstruction" in markdown
     html = report.html_path.read_text()
     assert "junction circles mark physical semantic regions" in html.lower()
@@ -258,3 +309,22 @@ def test_report_records_selected_legacy_fallback(tmp_path) -> None:
         == "Savitzky-Golay"
     )
     assert report.payload["diagnostics"]["metrics"]["width"]["source"] == "edt-bilinear-fallback"
+
+
+def test_route_candidate_report_is_bounded_and_keeps_the_selected_candidate() -> None:
+    from inkgrammar.comparison.report import _route_candidate_diagnostics
+    from inkgrammar.comparison.routes import (
+        ROUTE_REPORT_LIMIT,
+        generate_writing_route_candidates,
+    )
+
+    extracted = _extracted_letter("reference.png", "black")
+    base_candidates = generate_writing_route_candidates(extracted.diagnostics, limit=1)
+    candidates = tuple(base_candidates[index % len(base_candidates)] for index in range(10))
+    extracted = replace(extracted, route_candidates=candidates)
+
+    diagnostics = _route_candidate_diagnostics(extracted, selected_rank=9)
+
+    assert len(diagnostics) == ROUTE_REPORT_LIMIT
+    assert [item["rank"] for item in diagnostics] == [1, 2, 3, 4, 9]
+    assert diagnostics[-1]["selected"]

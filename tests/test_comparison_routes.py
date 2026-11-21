@@ -6,6 +6,7 @@ import numpy as np
 
 from inkgrammar.comparison.models import ContinuousPath, WritingRouteScore
 from inkgrammar.comparison.routes import (
+    ROUTE_REPORT_LIMIT,
     generate_writing_route_candidates,
     select_writing_route_pair,
 )
@@ -17,7 +18,7 @@ def _candidate():
     mask[15, 5:28] = True
     diagnostics = analyze_skeleton(mask)
     candidates = generate_writing_route_candidates(diagnostics, limit=1)
-    assert len(candidates) == 1
+    assert candidates
     return candidates[0]
 
 
@@ -42,9 +43,19 @@ def _continuous_path(points: tuple[tuple[float, float], ...]) -> ContinuousPath:
 
 
 def _route(candidate, path: ContinuousPath, steering_cost: float = 0.0):
+    hypothesis = replace(
+        candidate.hypothesis,
+        orientation_ambiguous=False,
+        orientation_ambiguous_strokes=(False,),
+    )
     return replace(
         candidate,
+        hypothesis=hypothesis,
         continuous_strokes=(path,),
+        glyph_endpoints=(
+            (float(path.xy[0, 0]), float(path.xy[0, 1])),
+            (float(path.xy[-1, 0]), float(path.xy[-1, 1])),
+        ),
         score=WritingRouteScore(
             coverage_cost=0.0,
             repeat_cost=0.0,
@@ -56,6 +67,21 @@ def _route(candidate, path: ContinuousPath, steering_cost: float = 0.0):
     )
 
 
+def test_centerline_cost_uses_each_stroke_without_joining_them() -> None:
+    from inkgrammar.comparison.routes import _centerline_cost
+
+    candidate = _candidate()
+    first = _continuous_path(((0, 0), (1, 0), (2, 0), (3, 0)))
+    second = _continuous_path(((100, 100), (101, 100), (102, 100), (103, 100)))
+    changed_second = _continuous_path(((100, 100), (101, 101), (102, 99), (103, 100)))
+    reference = replace(candidate, continuous_strokes=(first, second))
+    identical = replace(candidate, continuous_strokes=(first, second))
+    changed = replace(candidate, continuous_strokes=(first, changed_second))
+
+    assert _centerline_cost(reference, identical) == 0.0
+    assert _centerline_cost(reference, changed) > 0.0
+
+
 def test_route_candidate_search_respects_requested_bound() -> None:
     mask = np.zeros((32, 32), dtype=bool)
     mask[15, 5:28] = True
@@ -63,9 +89,41 @@ def test_route_candidate_search_respects_requested_bound() -> None:
 
     candidates = generate_writing_route_candidates(diagnostics, limit=1)
 
-    assert len(candidates) == 1
+    assert sum(candidate.orientation_variant == "native" for candidate in candidates) == 1
     assert not candidates[0].hypothesis.uncovered_edge_ids
     assert candidates[0].score.coverage_cost == 0.0
+
+
+def test_route_search_uses_stroke_diversity_and_global_reversal(monkeypatch) -> None:
+    from inkgrammar.comparison import routes
+
+    mask = np.zeros((32, 32), dtype=bool)
+    mask[15, 5:28] = True
+    diagnostics = analyze_skeleton(mask)
+    original_search = routes.stroke_hypotheses_from_analysis
+    search_options = {}
+
+    def capture_search(analysis, **kwargs):
+        search_options.update(kwargs)
+        return original_search(analysis, **kwargs)
+
+    monkeypatch.setattr(routes, "stroke_hypotheses_from_analysis", capture_search)
+    candidates = routes.generate_writing_route_candidates(diagnostics)
+
+    assert routes.ROUTE_SEARCH_LIMIT > ROUTE_REPORT_LIMIT
+    assert search_options["limit"] == routes.ROUTE_SEARCH_LIMIT
+    assert search_options["diversity"] == "stroke-count"
+    native = next(
+        candidate for candidate in candidates if candidate.orientation_variant == "native"
+    )
+    assert native.hypothesis.orientation_ambiguous
+    reverse = next(
+        candidate for candidate in candidates if candidate.orientation_variant == "global-reverse"
+    )
+    np.testing.assert_allclose(
+        reverse.continuous_strokes[0].xy,
+        native.continuous_strokes[0].xy[::-1],
+    )
 
 
 def test_joint_route_selection_is_deterministic_and_marks_near_ties() -> None:

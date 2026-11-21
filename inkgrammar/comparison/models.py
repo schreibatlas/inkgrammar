@@ -175,6 +175,41 @@ class WritingRouteScore:
 
 
 @dataclass(frozen=True)
+class WritingDirectionPolicy:
+    script_direction: Literal["left-to-right", "right-to-left", "neutral"] = "left-to-right"
+    endpoint_bias_weight: float = 0.2
+    direction_weight: float = 0.2
+    pen_lift_weight: float = 0.05
+    junction_continuity_weight: float = 0.1
+    pen_lift_geometry_tolerance: float = 0.1
+    ambiguity_margin: float = 0.005
+
+    def __post_init__(self) -> None:
+        if self.script_direction not in {"left-to-right", "right-to-left", "neutral"}:
+            raise ValueError("unsupported script direction")
+        weights = (
+            self.endpoint_bias_weight,
+            self.direction_weight,
+            self.pen_lift_weight,
+            self.junction_continuity_weight,
+            self.pen_lift_geometry_tolerance,
+            self.ambiguity_margin,
+        )
+        if any(not np.isfinite(value) or value < 0.0 for value in weights):
+            raise ValueError("writing direction policy values must be finite and nonnegative")
+
+
+@dataclass(frozen=True)
+class WritingPriorScore:
+    pen_lift_cost: float
+    start_endpoint_cost: float
+    end_endpoint_cost: float
+    direction_cost: float
+    junction_continuity_cost: float
+    total: float
+
+
+@dataclass(frozen=True)
 class WritingRouteCandidate:
     hypothesis: StrokeHypothesis
     continuous_strokes: tuple[ContinuousPath, ...]
@@ -184,6 +219,15 @@ class WritingRouteCandidate:
     ambiguous: bool
     physical_junction_count: int
     cycle_count: int
+    orientation_variant: Literal["native", "global-reverse"] = "native"
+    orientation_evidence: Literal[
+        "graph-order-only", "pair-similarity", "writing-prior", "resolved"
+    ] = "graph-order-only"
+    orientation_status: Literal["resolved", "ambiguous"] = "ambiguous"
+    orientation_margin: float | None = None
+    orientation_group: int = 0
+    glyph_endpoints: tuple[tuple[float, float], ...] = ()
+    writing_prior: WritingPriorScore | None = None
 
 
 @dataclass(frozen=True)
@@ -195,6 +239,9 @@ class WritingRoutePairScore:
     steering_profile_cost: float
     topology_event_compatibility_cost: float
     total_cost: float
+    geometry_cost: float = 0.0
+    writing_prior_cost: float = 0.0
+    pen_lift_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -230,6 +277,31 @@ class AlignmentResult:
         points = np.array(points, copy=True)
         points.setflags(write=False)
         object.__setattr__(self, "aligned_sample_xy", points)
+
+
+@dataclass(frozen=True)
+class WritingRouteAlignment:
+    transform: Similarity2D
+    direction: Literal["forward", "reversed-for-best-match"]
+    aligned_sample_strokes: tuple[ContinuousPath, ...]
+    stroke_mean_squared_errors: tuple[float, ...]
+    mean_squared_error: float
+    stroke_transforms: tuple[Similarity2D, ...] = ()
+    strategy: Literal["shared", "per-stroke"] = "shared"
+
+    def __post_init__(self) -> None:
+        strokes = tuple(self.aligned_sample_strokes)
+        errors = tuple(float(value) for value in self.stroke_mean_squared_errors)
+        transforms = tuple(self.stroke_transforms)
+        if len(transforms) != len(errors):
+            raise ValueError("route alignment must keep one transform per paired stroke")
+        if len(errors) > len(strokes) or any(not np.isfinite(value) for value in errors):
+            raise ValueError("route alignment stroke errors are invalid")
+        if not np.isfinite(self.mean_squared_error):
+            raise ValueError("route alignment error must be finite")
+        object.__setattr__(self, "aligned_sample_strokes", strokes)
+        object.__setattr__(self, "stroke_mean_squared_errors", errors)
+        object.__setattr__(self, "stroke_transforms", transforms)
 
 
 @dataclass(frozen=True)
@@ -281,6 +353,7 @@ class ExtractedLetter:
     geometry_warning: str | None = None
     route_candidates: tuple[WritingRouteCandidate, ...] = ()
     foreground_evidence: ForegroundEvidence | None = None
+    selected_route: WritingRouteCandidate | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_path", Path(self.source_path))
@@ -295,6 +368,15 @@ class ExtractedLetter:
             and self.foreground_evidence.mask.shape != expected_shape
         ):
             raise ValueError("raster foreground evidence dimensions must match the extracted image")
+        if (
+            self.selected_route is not None
+            and len(self.selected_route.continuous_strokes) > 1
+            and any(
+                value is not None
+                for value in (self.ordered_path, self.resampled_xy, self.continuous_path)
+            )
+        ):
+            raise ValueError("multi-stroke selected routes cannot populate single-path fields")
         if self.ordered_path is None and (
             self.resampled_xy is not None or self.continuous_path is not None
         ):
@@ -324,6 +406,7 @@ class ComparisonResult:
     warnings: list[str] = field(default_factory=list)
     identity: ComparisonIdentity | None = None
     route_selection: WritingRoutePairSelection | None = None
+    route_alignment: WritingRouteAlignment | None = None
 
     def __post_init__(self) -> None:
         identity = self.identity
@@ -337,6 +420,8 @@ class ComparisonResult:
         else:
             object.__setattr__(self, "letter", identity.label)
         has_paths = self.reference.resampled_xy is not None and self.sample.resampled_xy is not None
+        if self.route_alignment is not None and self.route_selection is None:
+            raise ValueError("route alignment requires a selected writing route pair")
         if self.alignment is not None:
             if not has_paths:
                 raise ValueError("alignment requires ordered paths for both inputs")

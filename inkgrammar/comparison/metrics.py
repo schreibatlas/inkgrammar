@@ -223,23 +223,96 @@ def _writing_metrics(result: ComparisonResult) -> dict[str, object]:
         )
         for phase in ("entry", "middle", "exit")
     }
-    reference_path = reference.continuous_strokes[0]
-    sample_path = (
-        result.alignment.aligned_sample_path
-        if result.alignment is not None and result.alignment.aligned_sample_path is not None
-        else sample.continuous_strokes[0]
-    )
-    reference_heading = np.degrees(
-        np.arctan2(reference_path.tangent[[0, -1], 1], reference_path.tangent[[0, -1], 0])
-    )
-    sample_heading = np.degrees(
-        np.arctan2(sample_path.tangent[[0, -1], 1], sample_path.tangent[[0, -1], 0])
-    )
-    heading_difference = (sample_heading - reference_heading + 180.0) % 360.0 - 180.0
-    glyph_height = _glyph_height(result.reference)
-    vertical_delta = (sample_path.xy[[0, -1], 1] - reference_path.xy[[0, -1], 1]) / max(
-        glyph_height, 1.0
-    )
+    if result.route_alignment is not None:
+        sample_source_strokes = sample.continuous_strokes
+        if result.route_alignment.direction == "reversed-for-best-match":
+            sample_source_strokes = tuple(
+                reverse_continuous_path(stroke) for stroke in reversed(sample_source_strokes)
+            )
+        stroke_metrics = []
+        stroke_weights = []
+        for reference_path, aligned_sample_path, sample_source_path in zip(
+            reference.continuous_strokes,
+            result.route_alignment.aligned_sample_strokes,
+            sample_source_strokes,
+            strict=False,
+        ):
+            reference_heading = np.degrees(
+                np.arctan2(
+                    reference_path.tangent[[0, -1], 1],
+                    reference_path.tangent[[0, -1], 0],
+                )
+            )
+            sample_heading = np.degrees(
+                np.arctan2(
+                    aligned_sample_path.tangent[[0, -1], 1],
+                    aligned_sample_path.tangent[[0, -1], 0],
+                )
+            )
+            heading_difference = (sample_heading - reference_heading + 180.0) % 360.0 - 180.0
+            vertical_delta = (
+                aligned_sample_path.xy[[0, -1], 1] - reference_path.xy[[0, -1], 1]
+            ) / max(_glyph_height(result.reference), 1.0)
+            stroke_metrics.append(
+                {
+                    "start_heading_difference_deg": float(heading_difference[0]),
+                    "end_heading_difference_deg": float(heading_difference[1]),
+                    "start_vertical_placement_delta_over_glyph_height": float(vertical_delta[0]),
+                    "end_vertical_placement_delta_over_glyph_height": float(vertical_delta[1]),
+                }
+            )
+            stroke_weights.append(
+                0.5 * (reference_path.arc_length_px + sample_source_path.arc_length_px)
+            )
+        total_stroke_weight = max(sum(stroke_weights), 1e-12)
+        entry_exit_metrics = {
+            "direction_source": "inferred_from_static_image_geometry",
+            "per_stroke": stroke_metrics,
+            **{
+                key: float(
+                    sum(
+                        item[key] * weight
+                        for item, weight in zip(
+                            stroke_metrics,
+                            stroke_weights,
+                            strict=True,
+                        )
+                    )
+                    / total_stroke_weight
+                )
+                for key in (
+                    "start_heading_difference_deg",
+                    "end_heading_difference_deg",
+                    "start_vertical_placement_delta_over_glyph_height",
+                    "end_vertical_placement_delta_over_glyph_height",
+                )
+            },
+        }
+    else:
+        reference_path = reference.continuous_strokes[0]
+        sample_path = (
+            result.alignment.aligned_sample_path
+            if result.alignment is not None and result.alignment.aligned_sample_path is not None
+            else sample.continuous_strokes[0]
+        )
+        reference_heading = np.degrees(
+            np.arctan2(reference_path.tangent[[0, -1], 1], reference_path.tangent[[0, -1], 0])
+        )
+        sample_heading = np.degrees(
+            np.arctan2(sample_path.tangent[[0, -1], 1], sample_path.tangent[[0, -1], 0])
+        )
+        heading_difference = (sample_heading - reference_heading + 180.0) % 360.0 - 180.0
+        glyph_height = _glyph_height(result.reference)
+        vertical_delta = (sample_path.xy[[0, -1], 1] - reference_path.xy[[0, -1], 1]) / max(
+            glyph_height, 1.0
+        )
+        entry_exit_metrics = {
+            "direction_source": "inferred_from_static_image_geometry",
+            "start_heading_difference_deg": float(heading_difference[0]),
+            "end_heading_difference_deg": float(heading_difference[1]),
+            "start_vertical_placement_delta_over_glyph_height": float(vertical_delta[0]),
+            "end_vertical_placement_delta_over_glyph_height": float(vertical_delta[1]),
+        }
     return {
         "available": True,
         "direction_source": "inferred_from_static_image_geometry",
@@ -273,13 +346,7 @@ def _writing_metrics(result: ComparisonResult) -> dict[str, object]:
                 "component_count": component_mismatch,
             },
         },
-        "entry_exit": {
-            "direction_source": "inferred_from_static_image_geometry",
-            "start_heading_difference_deg": float(heading_difference[0]),
-            "end_heading_difference_deg": float(heading_difference[1]),
-            "start_vertical_placement_delta_over_glyph_height": float(vertical_delta[0]),
-            "end_vertical_placement_delta_over_glyph_height": float(vertical_delta[1]),
-        },
+        "entry_exit": entry_exit_metrics,
         "steering": {
             "reference_strokes": reference_models,
             "sample_strokes": sample_models,
@@ -324,8 +391,331 @@ def _writing_metrics(result: ComparisonResult) -> dict[str, object]:
                 selection.score.topology_event_compatibility_cost
             ),
             "total_cost": selection.score.total_cost,
+            "alignment_direction": (
+                result.route_alignment.direction if result.route_alignment is not None else None
+            ),
+            "alignment_strategy": (
+                result.route_alignment.strategy
+                if result.route_alignment is not None
+                else "single-path"
+            ),
+            "alignment_mean_squared_error_px2": (
+                result.route_alignment.mean_squared_error
+                if result.route_alignment is not None
+                else None
+            ),
+            "per_stroke_alignment_mean_squared_error_px2": (
+                list(result.route_alignment.stroke_mean_squared_errors)
+                if result.route_alignment is not None
+                else []
+            ),
         },
     }
+
+
+def _analyze_multistroke_comparison(
+    result: ComparisonResult,
+    route_event_guard_progress: float,
+) -> ComparisonAnalysis:
+    selection = result.route_selection
+    route_alignment = result.route_alignment
+    assert selection is not None and route_alignment is not None
+    reference_strokes = selection.reference.continuous_strokes
+    sample_source_strokes = selection.sample.continuous_strokes
+    if route_alignment.direction == "reversed-for-best-match":
+        sample_source_strokes = tuple(
+            reverse_continuous_path(stroke) for stroke in reversed(sample_source_strokes)
+        )
+    paired_count = min(len(reference_strokes), len(sample_source_strokes))
+    if paired_count == 0:
+        raise ValueError("route alignment must contain at least one paired stroke")
+    paired_reference = reference_strokes[:paired_count]
+    paired_sample = route_alignment.aligned_sample_strokes[:paired_count]
+    paired_sample_source = sample_source_strokes[:paired_count]
+    pair_weights = tuple(
+        0.5 * (reference.arc_length_px + sample.arc_length_px)
+        for reference, sample in zip(paired_reference, paired_sample_source, strict=True)
+    )
+    total_pair_weight = sum(pair_weights)
+    sample_budget = 256
+    minimum_per_stroke = 8
+    remaining_samples = sample_budget - minimum_per_stroke * paired_count
+    proportional_samples = remaining_samples * np.asarray(pair_weights) / total_pair_weight
+    sample_counts_array = np.floor(proportional_samples).astype(int) + minimum_per_stroke
+    remainder = sample_budget - int(sample_counts_array.sum())
+    if remainder:
+        largest_remainders = np.argsort(-(proportional_samples % 1.0))[:remainder]
+        sample_counts_array[largest_remainders] += 1
+    sample_counts = tuple(int(count) for count in sample_counts_array)
+    reference_paths = tuple(
+        resample_continuous_path(path, count)
+        for path, count in zip(paired_reference, sample_counts, strict=True)
+    )
+    sample_paths = tuple(
+        resample_continuous_path(path, count)
+        for path, count in zip(paired_sample, sample_counts, strict=True)
+    )
+    sample_source_paths = tuple(
+        resample_continuous_path(path, count)
+        for path, count in zip(paired_sample_source, sample_counts, strict=True)
+    )
+    reference_geometries = tuple(continuous_differential_geometry(path) for path in reference_paths)
+    sample_geometries = tuple(continuous_differential_geometry(path) for path in sample_paths)
+
+    reference_length = sum(path.arc_length_px for path in paired_reference)
+    sample_length = sum(path.arc_length_px for path in selection.sample.continuous_strokes)
+    aligned_sample_length = sum(path.arc_length_px for path in paired_sample)
+    cursor = 0.0
+    progress_parts = []
+    reference_event_progress = []
+    sample_event_progress = []
+    for reference_path, sample_path in zip(reference_paths, sample_paths, strict=True):
+        local_fraction = reference_path.arc_length_px / reference_length
+        progress_parts.append(cursor + reference_path.progress * local_fraction)
+        reference_event_progress.extend(
+            cursor + np.asarray(reference_path.route_event_progress) * local_fraction
+        )
+        sample_event_progress.extend(
+            cursor + np.asarray(sample_path.route_event_progress) * local_fraction
+        )
+        if cursor > 0.0:
+            reference_event_progress.append(cursor)
+            sample_event_progress.append(cursor)
+        cursor += local_fraction
+    progress = np.concatenate(progress_parts)
+    reference_xy = np.concatenate([path.xy for path in reference_paths], axis=0)
+    sample_xy = np.concatenate([path.xy for path in sample_paths], axis=0)
+    sample_source_xy = np.concatenate([path.xy for path in sample_source_paths], axis=0)
+
+    def combine_geometry(geometries: tuple[DifferentialGeometry, ...]) -> DifferentialGeometry:
+        heading = np.concatenate([geometry.heading_rad for geometry in geometries])
+        turn_rate = np.concatenate([geometry.turn_rate_rad_per_progress for geometry in geometries])
+        cumulative_turn_parts = []
+        turn_offset = 0.0
+        for geometry in geometries:
+            cumulative_turn_parts.append(geometry.cumulative_turn_rad + turn_offset)
+            turn_offset += float(geometry.cumulative_turn_rad[-1])
+        return DifferentialGeometry(
+            np.concatenate([geometry.xy for geometry in geometries], axis=0),
+            heading,
+            turn_rate,
+            np.concatenate(cumulative_turn_parts),
+        )
+
+    reference_geometry = combine_geometry(reference_geometries)
+    sample_geometry = combine_geometry(sample_geometries)
+    reference_width = np.concatenate([2.0 * path.radius_px for path in reference_paths])
+    sample_width = np.concatenate([2.0 * path.radius_px for path in sample_source_paths])
+    position_error = np.linalg.norm(sample_xy - reference_xy, axis=1) / reference_length
+    tangent_error_deg = np.degrees(
+        _angle_difference(reference_geometry.heading_rad, sample_geometry.heading_rad)
+    )
+    turn_rate_error = (
+        sample_geometry.turn_rate_rad_per_progress - reference_geometry.turn_rate_rad_per_progress
+    )
+    route_events = np.asarray([*reference_event_progress, *sample_event_progress], dtype=float)
+    turn_rate_summary_mask = np.ones(len(progress), dtype=bool)
+    for event_progress in route_events:
+        turn_rate_summary_mask &= np.abs(progress - event_progress) > route_event_guard_progress
+    scored_turn_rate_error = turn_rate_error[turn_rate_summary_mask]
+    scored_absolute_turn_rate_error = np.abs(scored_turn_rate_error)
+    position_summary = _summary(position_error)
+    normalized_origin = reference_xy[0]
+    reference_xy_normalized = (reference_xy - normalized_origin) / reference_length
+    sample_xy_normalized = (sample_xy - normalized_origin) / reference_length
+    reference_start_end = [path.xy[[0, -1]] for path in reference_paths]
+    sample_start_end = [path.xy[[0, -1]] for path in sample_paths]
+    endpoint_position_pairs = [
+        (
+            float(np.linalg.norm(sample_points[0] - reference_points[0]) / reference_length),
+            float(np.linalg.norm(sample_points[-1] - reference_points[-1]) / reference_length),
+        )
+        for reference_points, sample_points in zip(
+            reference_start_end,
+            sample_start_end,
+            strict=True,
+        )
+    ]
+    endpoint_heading_errors = [
+        np.degrees(
+            np.abs(_angle_difference(reference.heading_rad[[0, -1]], sample.heading_rad[[0, -1]]))
+        )
+        for reference, sample in zip(reference_geometries, sample_geometries, strict=True)
+    ]
+    reference_turn_total = sum(
+        float(geometry.cumulative_turn_rad[-1]) for geometry in reference_geometries
+    )
+    sample_turn_total = sum(
+        float(geometry.cumulative_turn_rad[-1]) for geometry in sample_geometries
+    )
+    reference_topology = result.reference.diagnostics.topology
+    sample_topology = result.sample.diagnostics.topology
+    reference_offsets = np.cumsum([0, *[len(path.xy) for path in reference_strokes]])
+    sample_offsets = np.cumsum(
+        [0, *[len(path.xy) for path in route_alignment.aligned_sample_strokes]]
+    )
+    resampled_offsets = np.cumsum([0, *sample_counts])
+    reference_raw = np.concatenate(
+        [walk.xy for walk in selection.reference.hypothesis.walks], axis=0
+    )
+    sample_raw = np.concatenate([walk.xy for walk in selection.sample.hypothesis.walks], axis=0)
+
+    def route_event_points(paths: tuple[Any, ...]) -> np.ndarray:
+        event_arrays = [
+            path.xy[list(path.route_event_indices)] for path in paths if path.route_event_indices
+        ]
+        return np.concatenate(event_arrays, axis=0) if event_arrays else np.empty((0, 2))
+
+    reference_route_event_xy = route_event_points(reference_strokes)
+    sample_route_event_xy = route_event_points(route_alignment.aligned_sample_strokes)
+    metrics: dict[str, Any] = {
+        "path": {
+            "reference_arc_length_px": reference_length,
+            "sample_arc_length_px": sample_length,
+            "raw_sample_to_reference_length_ratio": sample_length / reference_length,
+            "reference_arc_length_normalization_px": reference_length,
+            "reference_normalized_arc_length": 1.0,
+            "aligned_sample_normalized_arc_length": aligned_sample_length / reference_length,
+            "stroke_count_difference": abs(
+                len(selection.reference.continuous_strokes)
+                - len(selection.sample.continuous_strokes)
+            ),
+            "mean_error": position_summary["mean"],
+            "median_error": position_summary["median"],
+            "p90_error": position_summary["p90"],
+            "p95_error": position_summary["p95"],
+            "max_error": position_summary["maximum"],
+            "x_rmse": float(
+                np.sqrt(np.mean((sample_xy_normalized[:, 0] - reference_xy_normalized[:, 0]) ** 2))
+            ),
+            "y_rmse": float(
+                np.sqrt(np.mean((sample_xy_normalized[:, 1] - reference_xy_normalized[:, 1]) ** 2))
+            ),
+        },
+        "heading": {
+            "mean_abs_error_deg": float(np.mean(np.abs(tangent_error_deg))),
+            "median_abs_error_deg": float(np.median(np.abs(tangent_error_deg))),
+            "p95_abs_error_deg": float(np.percentile(np.abs(tangent_error_deg), 95.0)),
+            "maximum_abs_error_deg": float(np.max(np.abs(tangent_error_deg))),
+        },
+        "turn_rate": {
+            "units": "radians per normalized stroke progress",
+            "mae": float(np.mean(scored_absolute_turn_rate_error)),
+            "rmse": float(np.sqrt(np.mean(scored_turn_rate_error**2))),
+            "p95_abs": float(np.percentile(scored_absolute_turn_rate_error, 95.0)),
+            "maximum_abs": float(np.max(scored_absolute_turn_rate_error)),
+            "summary_sample_count": int(turn_rate_summary_mask.sum()),
+            "route_event_guard_progress": route_event_guard_progress,
+        },
+        "cumulative_turn": {
+            "reference_total_rad": reference_turn_total,
+            "sample_total_rad": sample_turn_total,
+            "difference_rad": sample_turn_total - reference_turn_total,
+        },
+        "endpoints": {
+            "direction_source": "inferred",
+            "per_stroke": [
+                {
+                    "start_error": start_error,
+                    "end_error": end_error,
+                    "start_tangent_error_deg": float(tangent_errors[0]),
+                    "end_tangent_error_deg": float(tangent_errors[1]),
+                    "reference_start_xy_px": reference_points[0].tolist(),
+                    "reference_end_xy_px": reference_points[-1].tolist(),
+                    "sample_start_xy_aligned_px": sample_points[0].tolist(),
+                    "sample_end_xy_aligned_px": sample_points[-1].tolist(),
+                }
+                for (
+                    (start_error, end_error),
+                    tangent_errors,
+                    reference_points,
+                    sample_points,
+                ) in zip(
+                    endpoint_position_pairs,
+                    endpoint_heading_errors,
+                    reference_start_end,
+                    sample_start_end,
+                    strict=True,
+                )
+            ],
+            "start_error": float(np.mean([pair[0] for pair in endpoint_position_pairs])),
+            "end_error": float(np.mean([pair[1] for pair in endpoint_position_pairs])),
+            "start_tangent_error_deg": float(
+                np.mean([pair[0] for pair in endpoint_heading_errors])
+            ),
+            "end_tangent_error_deg": float(np.mean([pair[1] for pair in endpoint_heading_errors])),
+        },
+        "topology": {
+            "reference": reference_topology.model_dump(mode="json"),
+            "sample": sample_topology.model_dump(mode="json"),
+            "reference_path_coverage": not selection.reference.hypothesis.uncovered_edge_ids,
+            "sample_path_coverage": not selection.sample.hypothesis.uncovered_edge_ids,
+        },
+        "width": {
+            "scored": False,
+            "source": "subpixel-cross-section",
+            "units": "pixels in each original crop",
+            "reference_median_px": float(np.median(reference_width)),
+            "sample_median_px": float(np.median(sample_width)),
+        },
+    }
+    metrics["writing"] = _writing_metrics(result)
+    metrics["reconstruction"], reconstruction_series = _reconstruction_metrics(result)
+    series = {
+        "progress": progress,
+        "position_error": position_error,
+        "reference_xy_normalized": reference_xy_normalized,
+        "sample_xy_normalized": sample_xy_normalized,
+        "reference_heading_deg": np.degrees(reference_geometry.heading_rad),
+        "sample_heading_deg": np.degrees(sample_geometry.heading_rad),
+        "tangent_error_deg": tangent_error_deg,
+        "reference_turn_rate": reference_geometry.turn_rate_rad_per_progress,
+        "sample_turn_rate": sample_geometry.turn_rate_rad_per_progress,
+        "turn_rate_error": turn_rate_error,
+        "reference_cumulative_turn": reference_geometry.cumulative_turn_rad,
+        "sample_cumulative_turn": sample_geometry.cumulative_turn_rad,
+        "reference_width_px": reference_width,
+        "sample_width_px": sample_width,
+        "reference_raw_xy": reference_raw,
+        "sample_raw_xy": sample_raw,
+        "reference_raw_skeleton_xy": np.column_stack(
+            np.nonzero(result.reference.diagnostics.skeleton)[::-1]
+        ).astype(float),
+        "sample_raw_skeleton_xy": np.column_stack(
+            np.nonzero(result.sample.diagnostics.skeleton)[::-1]
+        ).astype(float),
+        "reference_subpixel_xy": np.concatenate([path.xy for path in reference_strokes], axis=0),
+        "sample_subpixel_xy": np.concatenate(
+            [path.xy for path in route_alignment.aligned_sample_strokes], axis=0
+        ),
+        "reference_centerline_confidence": np.concatenate(
+            [path.confidence for path in reference_strokes]
+        ),
+        "sample_centerline_confidence": np.concatenate(
+            [path.confidence for path in route_alignment.aligned_sample_strokes]
+        ),
+        "reference_route_event_progress": np.asarray(reference_event_progress, dtype=float),
+        "sample_route_event_progress": np.asarray(sample_event_progress, dtype=float),
+        "reference_route_event_xy": reference_route_event_xy,
+        "sample_route_event_xy": sample_route_event_xy,
+        "reference_resampled_xy": reference_xy,
+        "sample_resampled_xy": sample_xy,
+        "sample_source_resampled_xy": sample_source_xy,
+        "reference_stroke_offsets": reference_offsets,
+        "sample_stroke_offsets": sample_offsets,
+        "reference_resampled_stroke_offsets": resampled_offsets,
+        "sample_resampled_stroke_offsets": resampled_offsets,
+    }
+    series.update(reconstruction_series)
+    return ComparisonAnalysis(
+        progress,
+        reference_geometry,
+        sample_geometry,
+        reference_width,
+        sample_width,
+        series,
+        metrics,
+    )
 
 
 def analyze_comparison(
@@ -333,6 +723,8 @@ def analyze_comparison(
     *,
     route_event_guard_progress: float = 0.005,
 ) -> ComparisonAnalysis:
+    if result.route_alignment is not None:
+        return _analyze_multistroke_comparison(result, route_event_guard_progress)
     continuous_inputs = _continuous_inputs(result)
     if continuous_inputs is None:
         reference_xy = result.reference.resampled_xy

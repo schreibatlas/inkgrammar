@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import numpy as np
 from PIL import Image, ImageChops, ImageDraw
 from typer.testing import CliRunner
 
 from inkgrammar import compare_letter_images as root_compare_letter_images
 from inkgrammar.cli import app
-from inkgrammar.comparison import compare_letter_images
+from inkgrammar.comparison import (
+    ComparisonIdentity,
+    CropRect,
+    analyze_comparison,
+    compare_extracted_letters,
+    compare_letter_images,
+    extract_letter,
+)
 
 
 def _write_letter_images(directory):
@@ -83,6 +91,51 @@ def test_compare_letter_images_api_writes_complete_report_and_keeps_crop_pixels(
     ):
         expected = source.crop((5, 5, 75, 67))
         assert ImageChops.difference(expected, retained).getbbox() is None
+
+
+def test_multistroke_comparison_preserves_and_scores_every_selected_stroke(tmp_path):
+    image_path = tmp_path / "crossing-strokes.png"
+    image = Image.new("RGB", (64, 64), "white")
+    draw = ImageDraw.Draw(image)
+    draw.line((10, 10, 50, 50), fill="black", width=3)
+    draw.line((10, 50, 50, 10), fill="black", width=3)
+    image.save(image_path)
+    extracted = extract_letter(image_path, CropRect(x=0, y=0, width=64, height=64))
+
+    result = compare_extracted_letters(
+        extracted,
+        extracted,
+        identity=ComparisonIdentity("sample", "reference", "x"),
+    )
+
+    selection = result.route_selection
+    assert selection is not None
+    stroke_count = len(selection.reference.continuous_strokes)
+    assert stroke_count > 1
+    assert result.reference.selected_route is selection.reference
+    assert result.reference.ordered_path is None
+    assert result.reference.continuous_path is None
+    assert result.reference.resampled_xy is None
+    assert result.alignment is None
+    assert result.route_alignment is not None
+    assert len(result.route_alignment.aligned_sample_strokes) == stroke_count
+
+    analysis = analyze_comparison(result)
+    assert analysis.series["reference_stroke_offsets"].tolist() == [
+        0,
+        *np.cumsum([len(path.xy) for path in selection.reference.continuous_strokes]),
+    ]
+    assert analysis.series["reference_resampled_stroke_offsets"][-1] == 256
+    assert len(analysis.series["reference_resampled_stroke_offsets"]) == stroke_count + 1
+    assert len(analysis.metrics["writing"]["entry_exit"]["per_stroke"]) == stroke_count
+    assert (
+        len(
+            analysis.metrics["writing"]["route_pair_score"][
+                "per_stroke_alignment_mean_squared_error_px2"
+            ]
+        )
+        == stroke_count
+    )
 
 
 def test_compare_letter_images_is_exported_from_package_root(tmp_path):

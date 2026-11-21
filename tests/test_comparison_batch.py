@@ -111,6 +111,13 @@ def test_batch_writes_pair_reports_summaries_and_reuses_hash_keyed_reference_cac
     summary = json.loads(first.json_path.read_text())
     assert len(summary["matches"]) == 3
     reference_segmentation = summary["reference"]["segmentation"]
+    assert summary["writing_direction_ambiguous_count"] == sum(
+        any(
+            source["source"] == "writing_direction_unresolved"
+            for source in item["ambiguity_sources"]
+        )
+        for item in summary["matches"]
+    )
     assert reference_segmentation["status"] == "ok"
     assert reference_segmentation["reference_profile"] == "alphabet"
     assert reference_segmentation["row_count"] == 1
@@ -124,6 +131,10 @@ def test_batch_writes_pair_reports_summaries_and_reuses_hash_keyed_reference_cac
     )
     assert "not a probability" in summary["matching"]["cost_interpretation"]
     assert "<img" in first.html_path.read_text()
+    batch_html = first.html_path.read_text()
+    assert 'width="100"' in batch_html
+    assert 'width="180"' in batch_html
+    readable_pair_diagnostic = False
     for match in summary["matches"]:
         sample_dir = output / match["sample_id"]
         assert (sample_dir / "sample.png").is_file()
@@ -133,6 +144,14 @@ def test_batch_writes_pair_reports_summaries_and_reuses_hash_keyed_reference_cac
         assert (sample_dir / "report.json").is_file()
         assert (sample_dir / "report.html").is_file()
         assert len(match["alternatives"]) == 2
+
+        pair_overlay = output / match["report_dir"] / "writing-path-overlay.png"
+        if pair_overlay.is_file():
+            with Image.open(pair_overlay) as diagnostic:
+                assert min(diagnostic.size) >= 640
+            readable_pair_diagnostic = True
+    assert readable_pair_diagnostic
+    assert all(f"{match['report_dir']}/report.html" in batch_html for match in summary["matches"])
 
     def no_rebuild(*args, **kwargs):
         raise AssertionError("reference segmentation should be loaded from the content-hash cache")

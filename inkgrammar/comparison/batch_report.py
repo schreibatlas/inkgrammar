@@ -162,6 +162,18 @@ def ambiguity_sources(
                     ),
                 }
             )
+        directions = [
+            writing.get(side, {}).get("orientation") or {} for side in ("reference", "sample")
+        ]
+        if any(item.get("interpretation") == "unresolved" for item in directions):
+            sources.append(
+                {
+                    "source": "writing_direction_unresolved",
+                    "reason": (
+                        "Static glyph geometry does not determine historical stroke direction."
+                    ),
+                }
+            )
     return sources
 
 
@@ -220,8 +232,21 @@ def write_batch_report(
     segmentation_ambiguous_count = sum(
         item["segmentation_status"] == "ambiguous" for item in samples
     )
+    writing_direction_ambiguous_count = sum(
+        any(
+            source["source"] == "writing_direction_unresolved"
+            for source in item["ambiguity_sources"]
+        )
+        for item in samples
+    )
     payload: dict[str, Any] = {
-        "status": ("ambiguous" if match_ambiguous_count or segmentation_ambiguous_count else "ok"),
+        "status": (
+            "ambiguous"
+            if match_ambiguous_count
+            or segmentation_ambiguous_count
+            or writing_direction_ambiguous_count
+            else "ok"
+        ),
         "reference": {
             "path": Path(reference_path).name,
             "sha256": reference_sha256,
@@ -235,6 +260,7 @@ def write_batch_report(
         "ambiguous_count": match_ambiguous_count,
         "match_ambiguous_count": match_ambiguous_count,
         "segmentation_ambiguous_count": segmentation_ambiguous_count,
+        "writing_direction_ambiguous_count": writing_direction_ambiguous_count,
         "reference_cache": {"hit": reference_cache_hit, "key": reference_sha256},
         "matching": {
             "cost_interpretation": "lower retrieval cost ranks ahead; it is not a probability",
@@ -269,7 +295,8 @@ def write_batch_report(
             f"limit: {reference_segmentation['search_limit']})."
         ),
         f"Status: **{payload['status']}**. Match ambiguities: {match_ambiguous_count}. "
-        f"Segmentation-ambiguous samples: {segmentation_ambiguous_count}.",
+        f"Segmentation-ambiguous samples: {segmentation_ambiguous_count}; "
+        f"writing directions unresolved: {writing_direction_ambiguous_count}.",
         "Retrieval costs rank candidates and are not correctness probabilities.",
         "",
         "| Sample | Best reference | Match status | Segmentation status | Cost | "
@@ -334,7 +361,8 @@ def write_batch_report(
             f"<p>Sample: {html.escape(Path(sample_path).name)}; "
             f"{expected_count} glyphs requested; status {payload['status']}.</p>",
             f"<p>Match ambiguities: {match_ambiguous_count}; "
-            f"segmentation-ambiguous samples: {segmentation_ambiguous_count}</p>",
+            f"segmentation-ambiguous samples: {segmentation_ambiguous_count}; "
+            f"writing directions unresolved: {writing_direction_ambiguous_count}</p>",
             f"<p>Reference segmentation: {reference_segmentation['status']}; "
             f"profile {html.escape(reference_segmentation['reference_profile'])}; "
             f"{reference_segmentation['row_count']} rows, "

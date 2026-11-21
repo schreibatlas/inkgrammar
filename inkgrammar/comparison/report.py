@@ -14,9 +14,13 @@ from skeletonpaths import SubpixelCenterlineOptions
 from .metrics import ComparisonAnalysis, analyze_comparison
 from .models import ComparisonResult, ExtractedLetter, TopologySummary, WritingRouteCandidate
 from .plots import PlotSeries, write_plot
+from .routes import ROUTE_REPORT_LIMIT, ROUTE_SEARCH_LIMIT
 
 _REFERENCE = (35, 105, 215)
 _SAMPLE = (225, 75, 55)
+
+_MIN_DIAGNOSTIC_SIDE = 640
+
 _PURPLE = (145, 55, 165)
 
 _ARTIFACTS = {
@@ -40,6 +44,7 @@ _ARTIFACTS = {
     "plot_cumulative_turn": "plot-cumulative-turn.png",
     "plot_width": "plot-width.png",
     "writing_path_overlay": "writing-path-overlay.png",
+    "writing_path_overlay_svg": "writing-path-overlay.svg",
     "steering_profile": "steering-profile.png",
     "ink_reconstruction_reference": "ink-reconstruction-reference.png",
     "ink_reconstruction_sample": "ink-reconstruction-sample.png",
@@ -49,6 +54,51 @@ _ARTIFACTS = {
     "report_markdown": "report.md",
     "report_html": "report.html",
 }
+
+
+def _alignment_transform(result: ComparisonResult) -> Any:
+    if result.alignment is not None:
+        return result.alignment.transform
+    if result.route_alignment is not None:
+        return result.route_alignment.transform
+    raise ValueError("comparison has no fitted alignment")
+
+
+def _alignment_direction(result: ComparisonResult) -> str:
+    if result.alignment is not None:
+        return result.alignment.direction
+    if result.route_alignment is not None:
+        return result.route_alignment.direction
+    raise ValueError("comparison has no fitted alignment")
+
+
+def _alignment_error(result: ComparisonResult) -> float:
+    if result.alignment is not None:
+        return result.alignment.mean_squared_error
+    if result.route_alignment is not None:
+        return result.route_alignment.mean_squared_error
+    raise ValueError("comparison has no fitted alignment")
+
+
+def _direction_label(candidate: WritingRouteCandidate) -> str:
+    return "inferred" if candidate.orientation_status == "resolved" else "unresolved"
+
+
+def _route_direction_interpretation(result: ComparisonResult) -> str:
+    selection = result.route_selection
+    if selection is None:
+        return "No jointly selected route is available, so direction is unavailable."
+    reference = _direction_label(selection.reference)
+    sample = _direction_label(selection.sample)
+    if reference == sample == "inferred":
+        return (
+            "Reference and sample directions are inferred from static image geometry, "
+            "not observed historical pen traces."
+        )
+    return (
+        f"Reference direction: {reference}; sample direction: {sample}. "
+        "Arrows show a plausible geometric alignment and do not establish historical pen order."
+    )
 
 
 @dataclass(frozen=True)
@@ -126,14 +176,29 @@ def _canvas_bounds(
     return int(minimum[0]), int(minimum[1]), int(maximum[0]), int(maximum[1])
 
 
-def _canvas_size(bounds: tuple[int, int, int, int]) -> tuple[int, int]:
+def _canvas_size(
+    bounds: tuple[int, int, int, int],
+    scale: float = 1.0,
+) -> tuple[int, int]:
     left, top, right, bottom = bounds
-    return max(1, right - left + 1), max(1, bottom - top + 1)
+    return (
+        max(1, int(np.ceil((right - left + 1) * scale))),
+        max(1, int(np.ceil((bottom - top + 1) * scale))),
+    )
 
 
-def _canvas_points(points: np.ndarray, bounds: tuple[int, int, int, int]) -> list[tuple[int, int]]:
+def _viewport_scale(bounds: tuple[int, int, int, int]) -> float:
+    width, height = _canvas_size(bounds)
+    return max(1.0, _MIN_DIAGNOSTIC_SIDE / min(width, height))
+
+
+def _canvas_points(
+    points: np.ndarray,
+    bounds: tuple[int, int, int, int],
+    scale: float = 1.0,
+) -> list[tuple[int, int]]:
     left, top, _, _ = bounds
-    coordinates = np.rint(points - np.array((left, top))).astype(int)
+    coordinates = np.rint((points - np.array((left, top))) * scale).astype(int)
     return list(zip(coordinates[:, 0].tolist(), coordinates[:, 1].tolist(), strict=True))
 
 
@@ -150,6 +215,8 @@ def _draw_centerline_overlay(
     sample_transform: Any | None = None,
     reference_event_xy: np.ndarray | None = None,
     sample_event_xy: np.ndarray | None = None,
+    reference_stroke_offsets: np.ndarray | None = None,
+    sample_stroke_offsets: np.ndarray | None = None,
 ) -> None:
     reference_points_for_bounds = [reference_xy]
     sample_points_for_bounds = [sample_xy]
@@ -165,27 +232,54 @@ def _draw_centerline_overlay(
         np.concatenate(reference_points_for_bounds, axis=0),
         np.concatenate(sample_points_for_bounds, axis=0),
     )
-    image = Image.new("RGB", _canvas_size(bounds), "white")
+    scale = _viewport_scale(bounds)
+    image = Image.new("RGB", _canvas_size(bounds, scale), "white")
     draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=max(12, round(2 * scale)))
 
     if reference_raw_skeleton_xy is not None:
-        draw.point(_canvas_points(reference_raw_skeleton_xy, bounds), fill=(130, 145, 140))
+        draw.point(_canvas_points(reference_raw_skeleton_xy, bounds, scale), fill=(130, 145, 140))
     if sample_raw_skeleton_xy is not None:
-        draw.point(_canvas_points(sample_raw_skeleton_xy, bounds), fill=(75, 165, 105))
-    reference_points = _canvas_points(reference_xy, bounds)
-    sample_points = _canvas_points(sample_xy, bounds)
-    draw.line(reference_points, fill=_REFERENCE, width=2)
-    draw.line(sample_points, fill=_SAMPLE, width=2)
+        draw.point(_canvas_points(sample_raw_skeleton_xy, bounds, scale), fill=(75, 165, 105))
 
-    for points, color, start_label, end_label in (
-        (reference_points, _REFERENCE, "R start", "R end"),
-        (sample_points, _SAMPLE, "S start", "S end"),
+    def split_strokes(points: np.ndarray, offsets: np.ndarray | None) -> tuple[np.ndarray, ...]:
+        if offsets is None:
+            return (points,)
+        boundaries = np.asarray(offsets, dtype=int)
+        return tuple(
+            points[start:end]
+            for start, end in zip(boundaries[:-1], boundaries[1:], strict=True)
+            if end > start
+        )
+
+    reference_segments = split_strokes(
+        _canvas_points(reference_xy, bounds, scale), reference_stroke_offsets
+    )
+    sample_segments = split_strokes(_canvas_points(sample_xy, bounds, scale), sample_stroke_offsets)
+    for side, segments, color in (
+        ("R", reference_segments, _REFERENCE),
+        ("S", sample_segments, _SAMPLE),
     ):
-        for point, label in ((points[0], start_label), (points[-1], end_label)):
-            x, y = point
-            draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=color, outline="white", width=1)
-            draw.text((x + 5, y - 8), label, fill=color, font=ImageFont.load_default())
-
+        for stroke_index, points in enumerate(segments, start=1):
+            draw.line(points, fill=color, width=max(2, round(2 * scale)))
+            for endpoint, label in (
+                (points[0], f"{side}{stroke_index} start"),
+                (points[-1], f"{side}{stroke_index} end"),
+            ):
+                x, y = endpoint
+                radius = max(4, round(4 * scale))
+                draw.ellipse(
+                    (x - radius, y - radius, x + radius, y + radius),
+                    fill=color,
+                    outline="white",
+                    width=max(1, round(scale)),
+                )
+                draw.text(
+                    (x + max(5, round(5 * scale)), y - max(8, round(8 * scale))),
+                    label,
+                    fill=color,
+                    font=font,
+                )
     for topology, transform in (
         (reference_topology, None),
         (sample_topology, sample_transform),
@@ -199,24 +293,49 @@ def _draw_centerline_overlay(
             points = np.asarray(coordinates, dtype=float).reshape((-1, 2))
             if transform is not None and len(points):
                 points = transform.apply(points)
-            for x, y in _canvas_points(points, bounds):
-                draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=color, outline="white", width=1)
-                draw.text((x + 3, y - 7), label, fill=color, font=ImageFont.load_default())
+            for x, y in _canvas_points(points, bounds, scale):
+                radius = max(3, round(3 * scale))
+                draw.ellipse(
+                    (x - radius, y - radius, x + radius, y + radius),
+                    fill=color,
+                    outline="white",
+                    width=max(1, round(scale)),
+                )
+                draw.text((x + radius, y - radius), label, fill=color, font=font)
 
     for event_xy in (reference_event_xy, sample_event_xy):
         if event_xy is None:
             continue
-        for x, y in _canvas_points(event_xy, bounds):
-            draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=(235, 165, 20))
+        for x, y in _canvas_points(event_xy, bounds, scale):
+            radius = max(3, round(3 * scale))
+            draw.ellipse(
+                (x - radius, y - radius, x + radius, y + radius),
+                fill=(235, 165, 20),
+            )
     if error_vectors:
-        indexes = np.linspace(0, len(reference_points) - 1, 24).round().astype(int)
-        for index in indexes:
-            start = reference_points[index]
-            end = sample_points[index]
-            draw.line((start, end), fill=(55, 55, 55), width=1)
-            draw.ellipse((start[0] - 2, start[1] - 2, start[0] + 2, start[1] + 2), fill=_REFERENCE)
-            draw.ellipse((end[0] - 2, end[1] - 2, end[0] + 2, end[1] + 2), fill=_SAMPLE)
-    output.parent.mkdir(parents=True, exist_ok=True)
+        for reference_segment, sample_segment in zip(
+            reference_segments,
+            sample_segments,
+            strict=False,
+        ):
+            indexes = np.linspace(0, len(reference_segment) - 1, 24).round().astype(int)
+            for index in indexes:
+                start = reference_segment[index]
+                sample_index = round(
+                    index * (len(sample_segment) - 1) / max(len(reference_segment) - 1, 1)
+                )
+                end = sample_segment[sample_index]
+                draw.line((start, end), fill=(55, 55, 55), width=max(1, round(scale)))
+                radius = max(2, round(2 * scale))
+                draw.ellipse(
+                    (start[0] - radius, start[1] - radius, start[0] + radius, start[1] + radius),
+                    fill=_REFERENCE,
+                )
+                radius = max(2, round(2 * scale))
+                draw.ellipse(
+                    (end[0] - radius, end[1] - radius, end[0] + radius, end[1] + radius),
+                    fill=_SAMPLE,
+                )
     image.save(output, format="PNG")
 
 
@@ -262,18 +381,27 @@ def _draw_arrow(
     bounds: tuple[int, int, int, int],
     progress: float,
     color: tuple[int, int, int],
+    scale: float = 1.0,
 ) -> None:
     lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
     cumulative = np.concatenate(([0.0], np.cumsum(lengths)))
     target = float(progress) * cumulative[-1]
     segment = min(int(np.searchsorted(cumulative, target, side="right") - 1), len(lengths) - 1)
-    first, second = _canvas_points(points[[segment, segment + 1]], bounds)
-    draw.line((first, second), fill=color, width=2)
+    first, second = _canvas_points(points[[segment, segment + 1]], bounds, scale)
+    draw.line((first, second), fill=color, width=max(2, round(2 * scale)))
     dx, dy = second[0] - first[0], second[1] - first[1]
     magnitude = max(float(np.hypot(dx, dy)), 1e-12)
     ux, uy = dx / magnitude, dy / magnitude
-    left = (round(second[0] - 5 * ux - 3 * uy), round(second[1] - 5 * uy + 3 * ux))
-    right = (round(second[0] - 5 * ux + 3 * uy), round(second[1] - 5 * uy - 3 * ux))
+    arrow_length = 5 * scale
+    arrow_width = 3 * scale
+    left = (
+        round(second[0] - arrow_length * ux - arrow_width * uy),
+        round(second[1] - arrow_length * uy + arrow_width * ux),
+    )
+    right = (
+        round(second[0] - arrow_length * ux + arrow_width * uy),
+        round(second[1] - arrow_length * uy - arrow_width * ux),
+    )
     draw.polygon((second, left, right), fill=color)
 
 
@@ -281,13 +409,20 @@ def _write_writing_path_overlay(result: ComparisonResult, output: Path) -> None:
     selection = result.route_selection
     if selection is None:
         return
-    reverse_sample = result.alignment.direction == "reversed-for-best-match"
+    reverse_sample = _alignment_direction(result) == "reversed-for-best-match"
     reference_strokes = _display_strokes(selection.reference, False)
-    sample_strokes = _display_strokes(selection.sample, reverse_sample)
+    sample_strokes = (
+        tuple(path.xy for path in result.route_alignment.aligned_sample_strokes)
+        if result.route_alignment is not None
+        else tuple(
+            _alignment_transform(result).apply(points)
+            for points in _display_strokes(selection.sample, reverse_sample)
+        )
+    )
     reference_junctions = np.asarray(
         result.reference.diagnostics.topology.junctions, dtype=float
     ).reshape((-1, 2))
-    sample_junctions = result.alignment.transform.apply(
+    sample_junctions = _alignment_transform(result).apply(
         np.asarray(result.sample.diagnostics.topology.junctions, dtype=float).reshape((-1, 2))
     )
     all_points = [*reference_strokes, *sample_strokes]
@@ -296,34 +431,91 @@ def _write_writing_path_overlay(result: ComparisonResult, output: Path) -> None:
     if len(sample_junctions):
         all_points.append(sample_junctions)
     bounds = _canvas_bounds(np.concatenate(all_points, axis=0), np.empty((0, 2), dtype=float))
-    image = Image.new("RGB", _canvas_size(bounds), "white")
+    left, top, right, bottom = bounds
+    bounds = (left, top - 24, right, bottom)
+    scale = _viewport_scale(bounds)
+    image = Image.new("RGB", _canvas_size(bounds, scale), "white")
     draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=max(12, round(2.5 * scale)))
+    status_font = ImageFont.load_default(size=max(12, round(2.5 * scale)))
+    draw.text(
+        (round(4 * scale), round(2 * scale)),
+        f"R direction: {_direction_label(selection.reference)}",
+        fill=_REFERENCE,
+        font=status_font,
+    )
+    draw.text(
+        (round(4 * scale), round(7 * scale)),
+        f"S direction: {_direction_label(selection.sample)}",
+        fill=_SAMPLE,
+        font=status_font,
+    )
+    draw.text(
+        (round(4 * scale), round(12 * scale)),
+        "Alignment arrows are not observed historical pen traces.",
+        fill=(65, 65, 65),
+        font=status_font,
+    )
     for side, strokes, color in (
         ("R", reference_strokes, _REFERENCE),
         ("S", sample_strokes, _SAMPLE),
     ):
-        for stroke_index, points in enumerate(strokes):
-            pixel_points = _canvas_points(points, bounds)
-            draw.line(pixel_points, fill=color, width=3)
+        for stroke_index, points in enumerate(strokes, start=1):
+            pixel_points = _canvas_points(points, bounds, scale)
+            draw.line(pixel_points, fill=color, width=max(2, round(3 * scale)))
             for fraction in (0.25, 0.5, 0.75):
-                _draw_arrow(draw, points, bounds, fraction, color)
-            if stroke_index == 0:
-                x, y = pixel_points[0]
-                draw.ellipse((x - 5, y - 5, x + 5, y + 5), fill=color, outline="white", width=1)
-                draw.text(
-                    (x + 6, y - 8), f"{side} start", fill=color, font=ImageFont.load_default()
-                )
-            if stroke_index == len(strokes) - 1:
-                x, y = pixel_points[-1]
-                draw.rectangle((x - 4, y - 4, x + 4, y + 4), fill=color, outline="white", width=1)
-                draw.text((x + 6, y - 8), f"{side} end", fill=color, font=ImageFont.load_default())
+                _draw_arrow(draw, points, bounds, fraction, color, scale)
+            start_x, start_y = pixel_points[0]
+            start_radius = max(4, round(4 * scale))
+            draw.ellipse(
+                (
+                    start_x - start_radius,
+                    start_y - start_radius,
+                    start_x + start_radius,
+                    start_y + start_radius,
+                ),
+                fill=color,
+                outline="white",
+                width=max(1, round(scale)),
+            )
+            label_offset = max(6, round(6 * scale))
+            draw.text(
+                (start_x + label_offset, start_y - label_offset),
+                f"{side}{stroke_index} start",
+                fill=color,
+                font=font,
+            )
+            end_x, end_y = pixel_points[-1]
+            end_radius = max(4, round(4 * scale))
+            draw.rectangle(
+                (end_x - end_radius, end_y - end_radius, end_x + end_radius, end_y + end_radius),
+                fill=color,
+                outline="white",
+                width=max(1, round(scale)),
+            )
+            draw.text(
+                (end_x + label_offset, end_y - label_offset),
+                f"{side}{stroke_index} end",
+                fill=color,
+                font=font,
+            )
+    junction_radius = max(7, round(7 * scale))
     for points, color in ((reference_junctions, _REFERENCE), (sample_junctions, _SAMPLE)):
-        for x, y in _canvas_points(points, bounds):
-            draw.ellipse((x - 7, y - 7, x + 7, y + 7), outline=color, width=2)
-            draw.text((x + 7, y - 12), "J", fill=color, font=ImageFont.load_default())
+        for x, y in _canvas_points(points, bounds, scale):
+            draw.ellipse(
+                (
+                    x - junction_radius,
+                    y - junction_radius,
+                    x + junction_radius,
+                    y + junction_radius,
+                ),
+                outline=color,
+                width=max(2, round(2 * scale)),
+            )
+            draw.text((x + junction_radius, y - junction_radius), "J", fill=color, font=font)
     for _side, candidate, reverse, transform in (
         ("R", selection.reference, False, None),
-        ("S", selection.sample, reverse_sample, result.alignment.transform),
+        ("S", selection.sample, reverse_sample, _alignment_transform(result)),
     ):
         for encounter_index, event in enumerate(
             (item for item in candidate.events if item.kind == "junction-encounter"),
@@ -332,11 +524,141 @@ def _write_writing_path_overlay(result: ComparisonResult, output: Path) -> None:
             point = _route_event_point(candidate, event.progress, reverse)
             if transform is not None:
                 point = transform.apply(point)
-            x, y = _canvas_points(point.reshape((1, 2)), bounds)[0]
-            draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=(245, 165, 20))
-            draw.text((x + 3, y + 2), str(event.occurrence or encounter_index), fill=(95, 70, 5))
+            x, y = _canvas_points(point.reshape((1, 2)), bounds, scale)[0]
+            event_radius = max(3, round(3 * scale))
+            draw.ellipse(
+                (x - event_radius, y - event_radius, x + event_radius, y + event_radius),
+                fill=(245, 165, 20),
+            )
+            draw.text(
+                (x + event_radius, y + event_radius),
+                str(event.occurrence or encounter_index),
+                fill=(95, 70, 5),
+                font=font,
+            )
     output.parent.mkdir(parents=True, exist_ok=True)
     image.save(output, format="PNG")
+
+
+def _write_writing_path_overlay_svg(result: ComparisonResult, output: Path) -> None:
+    selection = result.route_selection
+    if selection is None:
+        return
+    reverse_sample = _alignment_direction(result) == "reversed-for-best-match"
+    reference_strokes = _display_strokes(selection.reference, False)
+    sample_strokes = (
+        tuple(path.xy for path in result.route_alignment.aligned_sample_strokes)
+        if result.route_alignment is not None
+        else tuple(
+            _alignment_transform(result).apply(points)
+            for points in _display_strokes(selection.sample, reverse_sample)
+        )
+    )
+    reference_junctions = np.asarray(
+        result.reference.diagnostics.topology.junctions, dtype=float
+    ).reshape((-1, 2))
+    sample_junctions = _alignment_transform(result).apply(
+        np.asarray(result.sample.diagnostics.topology.junctions, dtype=float).reshape((-1, 2))
+    )
+    all_points = [*reference_strokes, *sample_strokes]
+    if len(reference_junctions):
+        all_points.append(reference_junctions)
+    if len(sample_junctions):
+        all_points.append(sample_junctions)
+    bounds = _canvas_bounds(np.concatenate(all_points, axis=0), np.empty((0, 2), dtype=float))
+    left, top, right, bottom = bounds
+    bounds = (left, top - 24, right, bottom)
+    scale = _viewport_scale(bounds)
+    width, height = _canvas_size(bounds, scale)
+    stroke_width = max(2.0, 3.0 * scale)
+    font_size = max(12.0, 2.5 * scale)
+    lines = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}" role="img">',
+        f'<rect width="{width}" height="{height}" fill="white"/>',
+        f'<g font-family="sans-serif" font-size="{font_size:g}">',
+        f'<text x="{4 * scale:g}" y="{14 * scale:g}" fill="#235fd7">'
+        f"Reference direction: {_direction_label(selection.reference)}</text>",
+        f'<text x="{4 * scale:g}" y="{19 * scale:g}" fill="#e14b37">'
+        f"Sample direction: {_direction_label(selection.sample)}</text>",
+        f'<text x="{4 * scale:g}" y="{24 * scale:g}" fill="#414141">'
+        "Alignment arrows are not observed historical pen traces.</text>",
+    ]
+    colors = (("R", reference_strokes, "#2369d7"), ("S", sample_strokes, "#e14b37"))
+    for side, strokes, color in colors:
+        for stroke_index, points in enumerate(strokes, start=1):
+            pixels = _canvas_points(points, bounds, scale)
+            point_list = " ".join(f"{x},{y}" for x, y in pixels)
+            lines.append(
+                f'<polyline points="{point_list}" fill="none" stroke="{color}" '
+                f'stroke-width="{stroke_width:g}" stroke-linecap="round" '
+                'stroke-linejoin="round"/>'
+            )
+            start_x, start_y = pixels[0]
+            end_x, end_y = pixels[-1]
+            marker_radius = max(4.0, 4.0 * scale)
+            lines.append(
+                f'<circle cx="{start_x}" cy="{start_y}" r="{marker_radius:g}" '
+                f'fill="{color}" stroke="white"/> '
+                f'<text x="{start_x + 6 * scale:g}" y="{start_y - 6 * scale:g}" '
+                f'fill="{color}">{side}{stroke_index} start</text>'
+            )
+            end_size = max(8.0, 8.0 * scale)
+            lines.append(
+                f'<rect x="{end_x - end_size / 2:g}" y="{end_y - end_size / 2:g}" '
+                f'width="{end_size:g}" height="{end_size:g}" fill="{color}" '
+                f'stroke="white"/> <text x="{end_x + 6 * scale:g}" '
+                f'y="{end_y - 6 * scale:g}" fill="{color}">{side}{stroke_index} end</text>'
+            )
+            lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+            cumulative = np.concatenate(([0.0], np.cumsum(lengths)))
+            target = 0.5 * cumulative[-1]
+            segment = min(
+                int(np.searchsorted(cumulative, target, side="right") - 1), len(lengths) - 1
+            )
+            first, second = np.asarray(
+                _canvas_points(points[[segment, segment + 1]], bounds, scale)
+            )
+            dx, dy = second - first
+            magnitude = max(float(np.hypot(dx, dy)), 1e-12)
+            ux, uy = dx / magnitude, dy / magnitude
+            arrow_length, arrow_width = 5 * scale, 3 * scale
+            arrow_points = (
+                second,
+                second - arrow_length * np.array((ux, uy)) + arrow_width * np.array((-uy, ux)),
+                second - arrow_length * np.array((ux, uy)) - arrow_width * np.array((-uy, ux)),
+            )
+            arrow = " ".join(f"{x:.2f},{y:.2f}" for x, y in arrow_points)
+            lines.append(f'<polygon points="{arrow}" fill="{color}"/>')
+    for points, color in ((reference_junctions, "#2369d7"), (sample_junctions, "#e14b37")):
+        for x, y in _canvas_points(points, bounds, scale):
+            radius = max(7.0, 7.0 * scale)
+            lines.append(
+                f'<circle cx="{x}" cy="{y}" r="{radius:g}" fill="none" '
+                f'stroke="{color}" stroke-width="{max(2.0, 2.0 * scale):g}"/>'
+                f'<text x="{x + radius:g}" y="{y - radius:g}" fill="{color}">J</text>'
+            )
+    for _side, candidate, reverse, transform in (
+        ("R", selection.reference, False, None),
+        ("S", selection.sample, reverse_sample, _alignment_transform(result)),
+    ):
+        for encounter_index, event in enumerate(
+            (item for item in candidate.events if item.kind == "junction-encounter"),
+            start=1,
+        ):
+            point = _route_event_point(candidate, event.progress, reverse)
+            if transform is not None:
+                point = transform.apply(point)
+            x, y = _canvas_points(point.reshape((1, 2)), bounds, scale)[0]
+            radius = max(3.0, 3.0 * scale)
+            label = event.occurrence or encounter_index
+            lines.append(
+                f'<circle cx="{x}" cy="{y}" r="{radius:g}" fill="#f5a514"/>'
+                f'<text x="{x + radius:g}" y="{y + radius:g}" fill="#5f4605">{label}</text>'
+            )
+    lines.extend(("</g>", "</svg>"))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _route_event_annotations(
@@ -378,7 +700,7 @@ def _write_steering_profile(result: ComparisonResult, output: Path) -> None:
         (
             "Sample",
             selection.sample,
-            result.alignment.direction == "reversed-for-best-match",
+            _alignment_direction(result) == "reversed-for-best-match",
             _SAMPLE,
         ),
     ):
@@ -455,7 +777,7 @@ def _write_raster_overlay(result: ComparisonResult, output: Path) -> None:
     reference_yx = np.argwhere(result.reference.mask_result.mask)
     sample_yx = np.argwhere(result.sample.mask_result.mask)
     reference_xy = reference_yx[:, ::-1].astype(float)
-    sample_xy = result.alignment.transform.apply(sample_yx[:, ::-1].astype(float))
+    sample_xy = _alignment_transform(result).apply(sample_yx[:, ::-1].astype(float))
     bounds = _canvas_bounds(reference_xy, sample_xy, padding=4)
     width, height = _canvas_size(bounds)
     left, top, _, _ = bounds
@@ -591,6 +913,13 @@ def _route_candidate_diagnostics(
     extracted: ExtractedLetter,
     selected_rank: int | None,
 ) -> list[dict[str, Any]]:
+    ranked_candidates = list(enumerate(extracted.route_candidates, start=1))
+    reported_candidates = ranked_candidates[:ROUTE_REPORT_LIMIT]
+    if selected_rank is not None and selected_rank > ROUTE_REPORT_LIMIT and reported_candidates:
+        reported_candidates[-1] = (
+            selected_rank,
+            extracted.route_candidates[selected_rank - 1],
+        )
     return [
         {
             "rank": rank,
@@ -623,7 +952,7 @@ def _route_candidate_diagnostics(
                 "intrinsic_cost": candidate.score.intrinsic_cost,
             },
         }
-        for rank, candidate in enumerate(extracted.route_candidates, start=1)
+        for rank, candidate in reported_candidates
     ]
 
 
@@ -631,7 +960,9 @@ def _writing_payload(result: ComparisonResult, writing_metrics: dict[str, Any]) 
     selection = result.route_selection
     payload: dict[str, Any] = {
         "available": bool(writing_metrics.get("available")),
-        "direction_source": "inferred_from_static_image_geometry",
+        "direction_source": "static_image_geometry_not_observed",
+        "direction_status": "unavailable",
+        "direction_interpretation": _route_direction_interpretation(result),
         "route_ambiguous": selection.ambiguous if selection is not None else None,
         "reference_candidate_count": len(result.reference.route_candidates),
         "sample_candidate_count": len(result.sample.route_candidates),
@@ -641,13 +972,20 @@ def _writing_payload(result: ComparisonResult, writing_metrics: dict[str, Any]) 
             "unavailable_reason", "joint writing-route selection is unavailable"
         )
         payload["reference"] = {
-            "physical_junction_count": result.reference.diagnostics.topology.junction_count
+            "orientation": None,
+            "writing_prior": None,
+            "physical_junction_count": result.reference.diagnostics.topology.junction_count,
         }
         payload["sample"] = {
             "physical_junction_count": result.sample.diagnostics.topology.junction_count
         }
         payload["differences"] = {}
         return payload
+    payload["direction_status"] = (
+        "inferred"
+        if _direction_label(selection.reference) == _direction_label(selection.sample) == "inferred"
+        else "unresolved"
+    )
 
     for side, candidate in (("reference", selection.reference), ("sample", selection.sample)):
         payload[side] = {
@@ -665,6 +1003,26 @@ def _writing_payload(result: ComparisonResult, writing_metrics: dict[str, Any]) 
             "cycle_count": candidate.cycle_count,
             "retrace_ratio": candidate.score.repeat_cost,
             "full_coverage": not candidate.hypothesis.uncovered_edge_ids,
+            "orientation": {
+                "status": candidate.orientation_status,
+                "interpretation": _direction_label(candidate),
+                "selected": ("forward" if candidate.orientation_variant == "native" else "reverse"),
+                "variant": candidate.orientation_variant,
+                "reason": candidate.orientation_evidence,
+                "margin": candidate.orientation_margin,
+            },
+            "writing_prior": (
+                {
+                    "pen_lift_cost": candidate.writing_prior.pen_lift_cost,
+                    "start_endpoint_cost": candidate.writing_prior.start_endpoint_cost,
+                    "end_endpoint_cost": candidate.writing_prior.end_endpoint_cost,
+                    "direction_cost": candidate.writing_prior.direction_cost,
+                    "junction_continuity_cost": (candidate.writing_prior.junction_continuity_cost),
+                    "total": candidate.writing_prior.total,
+                }
+                if candidate.writing_prior is not None
+                else None
+            ),
             "steering_models": writing_metrics["steering"][f"{side}_strokes"],
             "width": writing_metrics["width"][side],
             "path_allocation": writing_metrics["path_allocation"][side],
@@ -690,19 +1048,22 @@ def _writing_payload(result: ComparisonResult, writing_metrics: dict[str, Any]) 
             "topology_event_compatibility_cost": (
                 selection.score.topology_event_compatibility_cost
             ),
+            "geometry_cost": selection.score.geometry_cost,
+            "writing_prior_cost": selection.score.writing_prior_cost,
+            "pen_lift_count": selection.score.pen_lift_count,
         },
     }
     return payload
 
 
 def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> dict[str, Any]:
-    transform = result.alignment.transform
+    transform = _alignment_transform(result)
     reference_path = result.reference.continuous_path
     sample_path = result.sample.continuous_path
     continuous_geometry = (
         reference_path is not None
         and sample_path is not None
-        and result.alignment.aligned_sample_path is not None
+        and (result.alignment is not None and result.alignment.aligned_sample_path is not None)
     )
     selection = result.route_selection
 
@@ -783,6 +1144,14 @@ def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> d
         "reference": _route_candidate_diagnostics(result.reference, reference_rank),
         "sample": _route_candidate_diagnostics(result.sample, sample_rank),
     }
+    route_search = {
+        "hypothesis_limit": ROUTE_SEARCH_LIMIT,
+        "report_limit": ROUTE_REPORT_LIMIT,
+        "reference_candidates_available": len(result.reference.route_candidates),
+        "sample_candidates_available": len(result.sample.route_candidates),
+        "reference_candidates_reported": len(candidate_routes["reference"]),
+        "sample_candidates_reported": len(candidate_routes["sample"]),
+    }
     selected_route_pair = (
         None
         if selection is None
@@ -797,6 +1166,9 @@ def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> d
                 "topology_event_compatibility_cost": (
                     selection.score.topology_event_compatibility_cost
                 ),
+                "geometry_cost": selection.score.geometry_cost,
+                "writing_prior_cost": selection.score.writing_prior_cost,
+                "pen_lift_count": selection.score.pen_lift_count,
                 "total_cost": selection.score.total_cost,
             },
             "alternatives": [
@@ -834,7 +1206,11 @@ def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> d
     primary_artifacts = [_ARTIFACTS["input_reference"], _ARTIFACTS["input_sample"]]
     if selection is not None:
         primary_artifacts.extend(
-            (_ARTIFACTS["writing_path_overlay"], _ARTIFACTS["steering_profile"])
+            (
+                _ARTIFACTS["writing_path_overlay"],
+                _ARTIFACTS["writing_path_overlay_svg"],
+                _ARTIFACTS["steering_profile"],
+            )
         )
     if analysis.metrics["reconstruction"]["available"]:
         primary_artifacts.extend(
@@ -846,6 +1222,7 @@ def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> d
                 "ink_residual_sample",
             )
         )
+    writing_payload = _writing_payload(result, analysis.metrics["writing"])
     return {
         "format": "inkgrammar-letter-comparison",
         "format_version": 3,
@@ -856,7 +1233,9 @@ def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> d
             "label": result.identity.label,
         },
         "interpretation": {
-            "direction_source": "inferred_from_static_image_geometry",
+            "direction_source": "static_image_geometry_not_observed",
+            "direction_status": writing_payload["direction_status"],
+            "direction_summary": writing_payload["direction_interpretation"],
             "route_ambiguous": selection.ambiguous if selection is not None else None,
             "reference_candidate_count": len(result.reference.route_candidates),
             "sample_candidate_count": len(result.sample.route_candidates),
@@ -867,7 +1246,7 @@ def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> d
             "ordered_path": (
                 result.reference.ordered_path is not None and result.sample.ordered_path is not None
             ),
-            "continuous_centerline": continuous_geometry,
+            "continuous_centerline": continuous_geometry or result.route_alignment is not None,
             "writing_routes": selection is not None,
             "ink_reconstruction": analysis.metrics["reconstruction"]["available"],
         },
@@ -876,9 +1255,7 @@ def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> d
             "discrete_skeleton_topology": (
                 "SkeletonPaths graph derived from the observed raster mask"
             ),
-            "route_orientation": (
-                "inferred from static image geometry; not observed historical pen order"
-            ),
+            "route_orientation": writing_payload["direction_interpretation"],
             "continuous_centerline": (
                 "reconstructed continuous centerline consistent with raster evidence and route "
                 "hypothesis; not a proven historical pen trace"
@@ -892,15 +1269,25 @@ def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> d
             "sample": input_payload(result.sample, "sample"),
         },
         "alignment": {
-            "orientation": result.alignment.direction,
+            "orientation": _alignment_direction(result),
+            "strategy": (
+                result.route_alignment.strategy
+                if result.route_alignment is not None
+                else "single-path"
+            ),
+            "per_stroke_mean_squared_error_px2": (
+                list(result.route_alignment.stroke_mean_squared_errors)
+                if result.route_alignment is not None
+                else []
+            ),
             "scale": transform.scale,
             "rotation_deg": transform.rotation_deg,
             "translation_xy": [transform.dx, transform.dy],
             "reflection": False,
-            "mean_squared_error_px2": result.alignment.mean_squared_error,
+            "mean_squared_error_px2": _alignment_error(result),
             "interpretation": "Nuisance normalization, not a handwriting-quality score.",
         },
-        "writing": _writing_payload(result, analysis.metrics["writing"]),
+        "writing": writing_payload,
         "reconstruction": analysis.metrics["reconstruction"],
         "diagnostics": {
             "geometry": {
@@ -937,6 +1324,7 @@ def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> d
             "writing_metrics": analysis.metrics["writing"],
             "series": _json_series(analysis),
             "candidate_routes": candidate_routes,
+            "route_search": route_search,
             "selected_route_pair": selected_route_pair,
         },
         "artifacts": {
@@ -979,6 +1367,12 @@ def _writing_summary_rows(writing: dict[str, Any]) -> list[tuple[str, str, str, 
             str(reference["stroke_count"]),
             str(sample["stroke_count"]),
             f"difference {differences['stroke_count']:+d}; inferred route structure",
+        ),
+        (
+            "Direction interpretation",
+            reference["orientation"]["interpretation"],
+            sample["orientation"]["interpretation"],
+            writing["direction_interpretation"],
         ),
         (
             "Physical junctions / encounters",
@@ -1044,8 +1438,7 @@ def _markdown(result: ComparisonResult, payload: dict[str, Any]) -> str:
         "",
         "## 1. Writing summary",
         "",
-        "Route orientation and direction are inferred from static image geometry. "
-        "They are not observed historical pen traces.",
+        writing["direction_interpretation"],
         "",
         "| Feature | Reference | My writing | Difference / interpretation |",
         "| --- | --- | --- | --- |",
@@ -1057,15 +1450,19 @@ def _markdown(result: ComparisonResult, payload: dict[str, Any]) -> str:
     rows.extend(
         (
             "",
-            "## 2. How the inferred pen path differs",
+            "## 2. How the selected route differs",
             "",
             "The route is a plausible reconstruction from raster and topology evidence, "
             "not a proven historical trace.",
-            "",
         )
     )
     if writing["available"]:
-        rows.append("![Aligned inferred routes](writing-path-overlay.png)")
+        rows.extend(
+            (
+                "![Aligned plausible routes](writing-path-overlay.png)",
+                "[SVG route overlay](writing-path-overlay.svg)",
+            )
+        )
     else:
         rows.append(f"Route overlay unavailable: {writing['unavailable_reason']}")
     rows.extend(("", "## 3. Fitted steering profile", ""))
@@ -1151,21 +1548,22 @@ def _html(result: ComparisonResult, payload: dict[str, Any]) -> str:
         image(_ARTIFACTS["input_sample"], "My writing crop"),
         "</div>",
         "<h2>1. Writing summary</h2>",
-        "<p>Route orientation and direction are inferred from static image geometry. "
-        "They are not observed historical pen traces. "
+        f"<p>{html.escape(writing['direction_interpretation'])} "
         "Differences are descriptive, not correctness scores.</p>",
         "<table><thead><tr><th>Feature</th><th>Reference</th><th>My writing</th>"
         "<th>Difference / interpretation</th></tr></thead><tbody>",
         summary_rows,
         "</tbody></table>",
-        "<h2>2. How the inferred pen path differs</h2>",
+        "<h2>2. How the selected route differs</h2>",
     ]
     if writing["available"]:
         rows.extend(
             (
-                "<p>Centerline arrows show inferred direction. "
-                "Junction circles mark physical semantic regions; nearby numbers "
-                "identify ordered encounters.</p>",
+                f"<p>{html.escape(writing['direction_interpretation'])} "
+                "Centerline arrows show the displayed geometric alignment, which may reverse "
+                "a sample route for comparison. Junction circles mark physical semantic regions; "
+                "nearby numbers identify ordered encounters.</p>",
+                '<p><a href="writing-path-overlay.svg">Open SVG route overlay</a></p>',
                 '<div class="grid">',
                 image(
                     _ARTIFACTS["writing_path_overlay"],
@@ -1328,6 +1726,10 @@ def _write_raster_only_report(
         "available": False,
         "unavailable_reason": unavailable,
         "direction_source": "unavailable_without_jointly_selected_route",
+        "direction_status": "unavailable",
+        "direction_interpretation": (
+            "No jointly selected route is available, so direction is unavailable."
+        ),
         "route_ambiguous": None,
         "reference_candidate_count": len(reference.route_candidates),
         "sample_candidate_count": len(sample.route_candidates),
@@ -1362,6 +1764,8 @@ def _write_raster_only_report(
         },
         "interpretation": {
             "direction_source": "unavailable_without_jointly_selected_route",
+            "direction_status": "unavailable",
+            "direction_summary": writing["direction_interpretation"],
             "route_ambiguous": None,
             "reference_candidate_count": len(reference.route_candidates),
             "sample_candidate_count": len(sample.route_candidates),
@@ -1477,12 +1881,11 @@ def _write_raster_only_report(
         "",
         "## 1. Writing summary",
         "",
-        "Route orientation and direction are inferred from static image geometry, "
-        "not observed historical pen traces.",
+        writing["direction_interpretation"],
         "",
         f"Route-based writing measurements are unavailable: {unavailable}",
         "",
-        "## 2. How the inferred pen path differs",
+        "## 2. Route geometry comparison",
         "",
         "No comparable jointly selected route is available. No historical route, "
         "direction, speed, elapsed time, pressure, or force is inferred.",
@@ -1525,10 +1928,9 @@ def _write_raster_only_report(
         "details{margin-top:2rem}</style></head><body>"
         f"<h1>{html.escape(report_title)}</h1><div>{image_html}</div>"
         "<h2>1. Writing summary</h2>"
-        "<p>Route orientation and direction are inferred from static image geometry, "
-        "not observed historical pen traces.</p>"
+        f"<p>{html.escape(writing['direction_interpretation'])}</p>"
         f"<p>Route-based writing measurements are unavailable: {html.escape(unavailable)}</p>"
-        "<h2>2. How the inferred pen path differs</h2>"
+        "<h2>2. Route geometry comparison</h2>"
         "<p>No comparable jointly selected route is available. No historical route, "
         "direction, speed, elapsed time, pressure, or force is inferred.</p>"
         "<h2>3. Fitted steering profile</h2><p>Unavailable without a jointly selected route.</p>"
@@ -1549,7 +1951,7 @@ def write_comparison_report(
 ) -> WrittenComparisonReport:
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
-    if result.alignment is None:
+    if result.alignment is None and result.route_alignment is None:
         return _write_raster_only_report(result, destination)
 
     analysis = analyze_comparison(result)
@@ -1559,32 +1961,34 @@ def write_comparison_report(
     _write_extraction_images(result.sample, destination, "sample")
     _write_raster_overlay(result, destination / _ARTIFACTS["overlay_raster"])
     reference_continuous = result.reference.continuous_path
-    sample_continuous = result.alignment.aligned_sample_path
+    sample_continuous = (
+        result.alignment.aligned_sample_path if result.alignment is not None else None
+    )
     reference_centerline = (
         reference_continuous.xy
         if reference_continuous is not None
-        else result.reference.resampled_xy
+        else analysis.series["reference_resampled_xy"]
     )
     sample_centerline = (
         sample_continuous.xy
         if sample_continuous is not None
-        else result.alignment.aligned_sample_xy
+        else analysis.series["sample_resampled_xy"]
     )
     reference_raw_skeleton_xy = np.argwhere(result.reference.diagnostics.skeleton)[:, ::-1].astype(
         float
     )
-    sample_raw_skeleton_xy = result.alignment.transform.apply(
+    sample_raw_skeleton_xy = _alignment_transform(result).apply(
         np.argwhere(result.sample.diagnostics.skeleton)[:, ::-1].astype(float)
     )
     reference_event_xy = (
         reference_continuous.xy[list(reference_continuous.route_event_indices)]
         if reference_continuous is not None
-        else np.empty((0, 2), dtype=float)
+        else analysis.series.get("reference_route_event_xy", np.empty((0, 2), dtype=float))
     )
     sample_event_xy = (
         sample_continuous.xy[list(sample_continuous.route_event_indices)]
         if sample_continuous is not None
-        else np.empty((0, 2), dtype=float)
+        else analysis.series.get("sample_route_event_xy", np.empty((0, 2), dtype=float))
     )
     _draw_centerline_overlay(
         destination / _ARTIFACTS["overlay_centerline"],
@@ -1594,18 +1998,23 @@ def write_comparison_report(
         sample_raw_skeleton_xy=sample_raw_skeleton_xy,
         reference_topology=result.reference.diagnostics.topology,
         sample_topology=result.sample.diagnostics.topology,
-        sample_transform=result.alignment.transform,
+        sample_transform=_alignment_transform(result),
         reference_event_xy=reference_event_xy,
         sample_event_xy=sample_event_xy,
+        reference_stroke_offsets=analysis.series.get("reference_resampled_stroke_offsets"),
+        sample_stroke_offsets=analysis.series.get("sample_resampled_stroke_offsets"),
     )
     _draw_centerline_overlay(
         destination / _ARTIFACTS["overlay_error_vectors"],
-        result.reference.resampled_xy,
-        result.alignment.aligned_sample_xy,
+        reference_centerline,
+        sample_centerline,
         error_vectors=True,
+        reference_stroke_offsets=analysis.series.get("reference_resampled_stroke_offsets"),
+        sample_stroke_offsets=analysis.series.get("sample_resampled_stroke_offsets"),
     )
     _write_plots(analysis, destination)
     _write_writing_path_overlay(result, destination / _ARTIFACTS["writing_path_overlay"])
+    _write_writing_path_overlay_svg(result, destination / _ARTIFACTS["writing_path_overlay_svg"])
     _write_steering_profile(result, destination / _ARTIFACTS["steering_profile"])
     if analysis.metrics["reconstruction"]["available"]:
         _write_ink_reconstruction_panels(analysis, destination)
