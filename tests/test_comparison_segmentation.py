@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -9,9 +10,11 @@ from PIL import Image, ImageDraw
 
 from inkgrammar.comparison.models import WritingStructurePolicy
 from inkgrammar.comparison.segmentation import (
+    ReferenceSheetProfile,
     SegmentationError,
     _adapt_candidates,
     detect_ink_rows,
+    evaluate_reference_segmentation,
     segment_reference_gallery,
     segment_sample_glyphs,
 )
@@ -75,7 +78,17 @@ def test_reference_gallery_segments_rows_and_reports_detached_mark_ambiguity(tmp
     assert (output / "reference-mask.png").is_file()
     assert (output / "reference-candidates.png").is_file()
     assert (output / "reference-segmentation-hypotheses.json").is_file()
+    for filename in (
+        "reference-anchor-regions.png",
+        "reference-selected-regions.png",
+        "reference-cleanup-overlay.png",
+        "reference-segmentation-decision.json",
+        "reference-segmentation.md",
+    ):
+        assert (output / filename).is_file()
     manifest = json.loads((output / "reference-candidates.json").read_text())
+    assert "component_decisions" in manifest["cleanup_diagnostics"]
+    assert "secondary_mark_assignments" in manifest["cleanup_diagnostics"]
     assert manifest["candidate_count"] == 8
     assert manifest["candidates"][2]["id"] == "ref-002"
 
@@ -199,10 +212,22 @@ def test_generated_anchor_first_reference_has_63_disjoint_candidates(tmp_path):
     path = _anchor_first_reference_page(tmp_path / "anchor-reference.png")
     output = tmp_path / "anchor-reference-diagnostics"
 
-    gallery = segment_reference_gallery(path, ink_mode="dark", output_dir=output)
+    gallery = segment_reference_gallery(
+        path,
+        ink_mode="dark",
+        output_dir=output,
+        reference_profile="alphabet",
+    )
 
     assert len(gallery.candidates) == 63
     assert [row.candidate_count for row in gallery.segmentation.rows] == row_counts
+    assert gallery.decision is not None
+    assert gallery.decision.accepted
+    assert gallery.decision.accepted_count == 63
+    assert gallery.decision.anchor_row_counts == tuple(row_counts)
+    assert gallery.decision.selected_row_counts == tuple(row_counts)
+    assert gallery.decision.search_truncated
+    assert gallery.decision.retained_secondary_count > 0
     assert all(row.included for row in gallery.segmentation.rows)
     assert gallery.segmentation.search_truncated is True
     assert gallery.segmentation.search_limit is None
@@ -230,6 +255,11 @@ def test_generated_anchor_first_reference_has_63_disjoint_candidates(tmp_path):
         str(index): count for index, count in enumerate(row_counts)
     }
 
+    decision_payload = json.loads(
+        (output / "reference-segmentation-decision.json").read_text()
+    )
+    assert decision_payload["accepted"] is True
+    assert decision_payload["accepted_count"] == 63
 
 def test_reference_hypothesis_invariant_falls_back_to_detected_anchor_counts(tmp_path, monkeypatch):
     row_counts = [12, 8, 6, 11, 11, 5, 10]
@@ -243,7 +273,12 @@ def test_reference_hypothesis_invariant_falls_back_to_detected_anchor_counts(tmp
         "inkgrammar.comparison.segmentation.rr.detect_spaced_region_hypotheses",
         fail_hypothesis_conversion,
     )
-    gallery = segment_reference_gallery(path, ink_mode="dark", output_dir=output)
+    gallery = segment_reference_gallery(
+        path,
+        ink_mode="dark",
+        output_dir=output,
+        reference_profile="alphabet",
+    )
 
     assert len(gallery.candidates) == 63
     assert [row.candidate_count for row in gallery.segmentation.rows] == row_counts
@@ -287,7 +322,12 @@ def test_alphabet_profile_excludes_title_and_year_and_isolates_all_glyph_rows(tm
     path = _alphabet_like_page(tmp_path / "synthetic-alphabet.png")
     output = tmp_path / "reference-diagnostics"
 
-    gallery = segment_reference_gallery(path, ink_mode="dark", output_dir=output)
+    gallery = segment_reference_gallery(
+        path,
+        ink_mode="dark",
+        output_dir=output,
+        reference_profile="alphabet",
+    )
 
     assert [row.candidate_count for row in gallery.segmentation.rows] == [
         1,
@@ -488,3 +528,125 @@ def test_segmented_glyph_preserves_rasterregions_component_roles_and_mark_centro
     assert candidate.expected_stroke_count(WritingStructurePolicy(preferred_body_strokes=2)) == 3
     assert candidate.component_role_sequence == ("secondary", "primary", "ambiguous")
     assert len(candidate.secondary_mark_centroids) == 1
+
+
+
+def _reference_decision_fixture(
+    monkeypatch,
+    *,
+    anchor_counts,
+    selected_counts,
+    profile=None,
+    assignments=(),
+    component_decisions=(),
+):
+
+    monkeypatch.setattr(
+        "inkgrammar.comparison.segmentation._reference_ownership_error",
+        lambda result: None,
+    )
+    row_diagnostics = tuple(
+        SimpleNamespace(
+            row_index=index,
+            anchor_count=anchor_count,
+            repair_count=max(0, selected_count - anchor_count),
+            split_anchor_indices=(),
+            merged_anchor_groups=(),
+            truncated_counts=(),
+            split_evidence=(),
+        )
+        for index, (anchor_count, selected_count) in enumerate(
+            zip(anchor_counts, selected_counts, strict=True)
+        )
+    )
+    diagnostics = SimpleNamespace(
+        raw_component_count=sum(selected_counts),
+        row_segmentation=row_diagnostics,
+        secondary_mark_assignments=tuple(assignments),
+        search_truncated=False,
+    )
+    result = SimpleNamespace(
+        diagnostics=diagnostics,
+        regions=(),
+        components=(),
+        component_decisions=tuple(component_decisions),
+    )
+    segmentation_rows = tuple(
+        SimpleNamespace(
+            row_index=index,
+            candidate_count=count,
+            included=True,
+            classification="glyph",
+            warnings=(),
+        )
+        for index, count in enumerate(selected_counts)
+    )
+    candidates = tuple(
+        SimpleNamespace(ambiguous_component_indices=(), warnings=())
+        for _ in range(sum(selected_counts))
+    )
+    segmentation = SimpleNamespace(rows=segmentation_rows, candidates=candidates)
+    hypotheses = SimpleNamespace(truncated=False, page_hypotheses=())
+    return evaluate_reference_segmentation(
+        result,
+        segmentation,
+        hypotheses,
+        profile or ReferenceSheetProfile(name="alphabet"),
+    )
+
+
+def test_reference_decision_rejects_65_candidate_repairs_against_safe_63_anchor_layout(
+    monkeypatch,
+):
+    decision = _reference_decision_fixture(
+        monkeypatch,
+        anchor_counts=(12, 8, 6, 11, 11, 5, 10),
+        selected_counts=(13, 9, 6, 11, 11, 5, 10),
+    )
+
+    assert decision.accepted is False
+    assert decision.accepted_count is None
+    assert decision.recognized_layout == (12, 8, 6, 11, 11, 5, 10)
+    assert decision.detected_count == 65
+    assert "unresolved count-changing split/merge ambiguity" in decision.reasons
+    assert any("conflict with safe recognized layout" in reason for reason in decision.reasons)
+
+
+def test_reference_decision_accepts_generic_counts_and_nonblocking_removed_noise(
+    monkeypatch,
+):
+    decision = _reference_decision_fixture(
+        monkeypatch,
+        anchor_counts=(3, 4),
+        selected_counts=(3, 4),
+        profile=ReferenceSheetProfile(name="generic"),
+        assignments=(SimpleNamespace(status="assigned", component_index=99),),
+        component_decisions=(SimpleNamespace(action="removed", role="micro-noise"),),
+    )
+
+    assert ReferenceSheetProfile(name="generic").allowed_row_count_patterns == ()
+    assert ReferenceSheetProfile().name == "generic"
+    assert ReferenceSheetProfile().allowed_row_count_patterns == ()
+    assert decision.accepted
+    assert decision.recognized_layout is None
+    assert decision.removed_micro_noise_count == 1
+    assert decision.retained_secondary_count == 1
+
+
+def test_reference_decision_rejects_uncertain_bbox_changing_secondary_mark(monkeypatch):
+    decision = _reference_decision_fixture(
+        monkeypatch,
+        anchor_counts=(12, 8, 6, 11, 11, 5, 10),
+        selected_counts=(12, 8, 6, 11, 11, 5, 10),
+        assignments=(
+            SimpleNamespace(
+                status="ambiguous",
+                component_index=99,
+                bbox_expansion_ratio=1.2,
+            ),
+        ),
+    )
+
+    assert decision.accepted is False
+    assert decision.uncertain_secondary_count == 1
+    assert "uncertain secondary ownership can change candidate bounds" in decision.reasons

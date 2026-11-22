@@ -77,6 +77,11 @@ def test_batch_writes_pair_reports_summaries_and_reuses_hash_keyed_reference_cac
         "reference-rows.png",
         "reference-components.png",
         "reference-gallery.png",
+        "reference-anchor-regions.png",
+        "reference-selected-regions.png",
+        "reference-cleanup-overlay.png",
+        "reference-segmentation-decision.json",
+        "reference-segmentation.md",
         "ref-000-mask.png",
         "reference-candidates.png",
         "reference-candidates.json",
@@ -96,10 +101,12 @@ def test_batch_writes_pair_reports_summaries_and_reuses_hash_keyed_reference_cac
     reference_manifest = json.loads(
         (output / "segmentation" / "reference-candidates.json").read_text()
     )
-    assert reference_manifest["reference_profile"] == "alphabet"
+    assert reference_manifest["reference_profile"] == "generic"
     assert reference_manifest["row_count"] == 1
     assert reference_manifest["per_row_candidate_counts"] == {"0": 3}
     assert isinstance(reference_manifest["search_truncated"], bool)
+    assert reference_manifest["cleanup_diagnostics"]["component_decisions"]
+    assert reference_manifest["segmentation_decision"]["accepted"] is True
     assert reference_manifest["search_limit"] is None
     assert isinstance(reference_manifest["anchor_region_count"], int)
     candidate = reference_manifest["candidates"][0]
@@ -123,7 +130,7 @@ def test_batch_writes_pair_reports_summaries_and_reuses_hash_keyed_reference_cac
         for item in summary["matches"]
     )
     assert reference_segmentation["status"] == "ok"
-    assert reference_segmentation["reference_profile"] == "alphabet"
+    assert reference_segmentation["reference_profile"] == "generic"
     assert reference_segmentation["row_count"] == 1
     assert reference_segmentation["candidate_count"] == 3
     assert reference_segmentation["per_row_candidate_counts"] == {"0": 3}
@@ -239,7 +246,11 @@ def test_reference_cache_rebuilds_for_old_versions_profiles_and_mask_changes(tmp
     metadata_path = cache_dir / "gallery.json"
     metadata = json.loads(metadata_path.read_text())
     candidate_ids = [item["id"] for item in metadata["candidates"]]
-    metadata["segmentation_algorithm_version"] = "3"
+    assert metadata["cleanup_diagnostics"]["component_decisions"]
+    assert metadata["semantic_config_fingerprint"]
+    assert metadata["cleanup_config_fingerprint"]
+    assert metadata["reference_profile_fingerprint"]
+    metadata["segmentation_policy_version"] = "0"
     metadata_path.write_text(json.dumps(metadata))
 
     old_cache = compare_letter_page(
@@ -251,7 +262,8 @@ def test_reference_cache_rebuilds_for_old_versions_profiles_and_mask_changes(tmp
     )
     assert old_cache.payload["reference_cache"]["hit"] is False
     rebuilt_metadata = json.loads(metadata_path.read_text())
-    assert rebuilt_metadata["segmentation_algorithm_version"] == "5"
+    assert rebuilt_metadata["segmentation_algorithm_version"] == "6"
+    assert rebuilt_metadata["segmentation_policy_version"] == "2"
     assert [item["id"] for item in rebuilt_metadata["candidates"]] == candidate_ids
 
     reused_cache = compare_letter_page(
@@ -263,13 +275,19 @@ def test_reference_cache_rebuilds_for_old_versions_profiles_and_mask_changes(tmp
     )
     assert reused_cache.payload["reference_cache"]["hit"] is True
 
+    from inkgrammar.comparison.segmentation import ReferenceSheetProfile
+
+    profile = ReferenceSheetProfile(
+        name="generic",
+        allowed_row_count_patterns=((3,),),
+    )
     generic = compare_letter_page(
         reference,
         sample,
         expected_letters=3,
         output_dir=output,
         refinement_limit=1,
-        reference_profile="generic",
+        reference_profile=profile,
     )
     assert generic.payload["reference_cache"]["hit"] is False
     public_gallery = json.loads((output / "reference-index" / "gallery.json").read_text())
@@ -284,7 +302,7 @@ def test_reference_cache_rebuilds_for_old_versions_profiles_and_mask_changes(tmp
         expected_letters=3,
         output_dir=output,
         refinement_limit=1,
-        reference_profile="generic",
+        reference_profile=profile,
     )
     assert corrupted_mask.payload["reference_cache"]["hit"] is False
     assert first.payload["reference_cache"]["hit"] is False
@@ -314,7 +332,7 @@ def test_progress_and_run_files_cover_success_failure_and_quiet_mode(tmp_path, c
     assert all("elapsed_seconds" in event["details"] for event in extraction_events)
     segmentation_events = [event for event in events if event["stage"] == "reference_segmentation"]
     assert segmentation_events
-    assert segmentation_events[0]["details"]["reference_profile"] == "alphabet"
+    assert segmentation_events[0]["details"]["reference_profile"] == "generic"
     assert segmentation_events[0]["details"]["candidate_count"] == 3
     assert isinstance(segmentation_events[0]["details"]["search_truncated"], bool)
     assert {
@@ -688,3 +706,98 @@ def test_refinement_cap_with_a_viable_candidate_marks_batch_result_ambiguous(tmp
     assert any(
         source["source"] == "reference_search_truncated" for source in match["ambiguity_sources"]
     )
+
+
+
+def test_rejected_reference_segmentation_stops_before_downstream_work(tmp_path, monkeypatch):
+    import inkgrammar.comparison.batch as comparison_batch
+    from inkgrammar.comparison.segmentation import SegmentationError
+
+    reference = _page(tmp_path / "reference.png", ("e", "e", "l"), y=22)
+    sample = _page(tmp_path / "sample.png", ("e", "n", "l"), y=30)
+    output = tmp_path / "rejected-reference"
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("rejected reference segmentation reached downstream work")
+
+    for name in (
+        "build_reference_index",
+        "segment_sample_glyphs",
+        "extract_segmented_glyph",
+        "rank_reference_candidates",
+        "refine_matches_progressively",
+        "fit_writing_route_candidates",
+        "analyze_skeleton",
+    ):
+        monkeypatch.setattr(comparison_batch, name, fail_if_called)
+
+    with pytest.raises(SegmentationError, match="Reference segmentation rejected"):
+        compare_letter_page(
+            reference,
+            sample,
+            expected_letters=3,
+            output_dir=output,
+            reference_profile="alphabet",
+            no_progress=True,
+        )
+
+    segmentation_dir = output / "segmentation"
+    assert (segmentation_dir / "reference-candidates.json").is_file()
+    assert (segmentation_dir / "reference-segmentation-hypotheses.json").is_file()
+    assert (segmentation_dir / "reference-segmentation-decision.json").is_file()
+    assert not (segmentation_dir / "sample-segmentation.json").exists()
+    assert not (output / "reference-index" / "gallery.json").exists()
+    events = [
+        json.loads(line) for line in (output / "progress.jsonl").read_text().splitlines()
+    ]
+    validation = next(event for event in events if event["stage"] == "reference_segmentation")
+    assert validation["details"]["status"] == "rejected"
+    assert validation["details"]["accepted"] is False
+    assert "recognized alphabet layout" in " ".join(validation["details"]["reasons"])
+
+
+
+def test_reference_cache_round_trips_cleanup_evidence_and_rejects_old_policy(tmp_path):
+    import shutil
+
+    from inkgrammar.comparison.batch import _load_reference_cache, _save_reference_cache
+    from inkgrammar.comparison.matching import build_reference_index
+    from inkgrammar.comparison.segmentation import segment_reference_gallery
+
+    reference = _page(tmp_path / "reference.png", ("e", "e", "l"), y=22)
+    diagnostics_dir = tmp_path / "reference-diagnostics"
+    gallery = segment_reference_gallery(
+        reference,
+        ink_mode="dark",
+        output_dir=diagnostics_dir,
+        reference_profile="generic",
+    )
+    assert gallery.decision is not None and gallery.decision.accepted
+    index = build_reference_index(gallery)
+    cache_dir = tmp_path / "reference-cache"
+    shutil.copytree(diagnostics_dir, cache_dir / "segmentation")
+    metadata = _save_reference_cache(cache_dir, gallery, index, "dark", "generic")
+
+    restored, restored_index, loaded_metadata = _load_reference_cache(
+        cache_dir,
+        reference,
+        gallery.source_sha256,
+        "dark",
+        "generic",
+    )
+    assert restored.decision == gallery.decision
+    assert restored.cleanup_diagnostics == json.loads(json.dumps(gallery.cleanup_diagnostics))
+    assert len(restored_index.descriptors) == len(index.descriptors)
+    assert loaded_metadata["semantic_config_fingerprint"] == metadata["semantic_config_fingerprint"]
+    assert loaded_metadata["cleanup_config_fingerprint"] == metadata["cleanup_config_fingerprint"]
+
+    metadata["segmentation_policy_version"] = "1"
+    (cache_dir / "gallery.json").write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match="reference cache metadata"):
+        _load_reference_cache(
+            cache_dir,
+            reference,
+            gallery.source_sha256,
+            "dark",
+            "generic",
+        )

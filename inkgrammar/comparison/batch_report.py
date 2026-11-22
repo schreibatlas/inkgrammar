@@ -396,6 +396,21 @@ def write_batch_report(
             f"search truncated: {reference_segmentation['search_truncated']}, "
             f"limit: {reference_segmentation['search_limit']})."
         ),
+            f"Acceptance decision: {reference_segmentation['decision']['status']}.",
+        (
+            f"Cleanup: {reference_segmentation['raw_component_count']} raw components; "
+            f"{reference_segmentation['removed_page_artifact_count']} page artifacts and "
+            f"{reference_segmentation['removed_micro_noise_count']} micro-noise removed; "
+            f"{reference_segmentation['retained_secondary_count']} secondary marks retained, "
+            f"{reference_segmentation['unassigned_secondary_count']} unassigned."
+        ),
+        (
+            f"Anchor row counts: {reference_segmentation['anchor_row_counts']}; "
+            f"selected row counts: {reference_segmentation['selected_row_counts']}; "
+            f"foreground ownership valid: {reference_segmentation['foreground_ownership_valid']}."
+        ),
+        "Detailed reference diagnostics: [segmentation/reference-segmentation.md]("
+        "segmentation/reference-segmentation.md).",
         f"Status: **{payload['status']}**. Match ambiguities: {match_ambiguous_count}. "
         f"Segmentation-ambiguous samples: {segmentation_ambiguous_count}; "
         f"writing directions unresolved: {writing_direction_ambiguous_count}.",
@@ -471,6 +486,16 @@ def write_batch_report(
             f"{reference_segmentation['candidate_count']} candidates; "
             f"search truncated {reference_segmentation['search_truncated']} "
             f"(limit {reference_segmentation['search_limit']}).</p>",
+            f"<p>Acceptance decision: {reference_segmentation['decision']['status']}.</p>",
+            f"<p>Cleanup: {reference_segmentation['raw_component_count']} raw components; "
+            f"{reference_segmentation['removed_page_artifact_count']} page artifacts and "
+            f"{reference_segmentation['removed_micro_noise_count']} micro-noise removed; "
+            f"{reference_segmentation['retained_secondary_count']} secondary marks retained, "
+            f"{reference_segmentation['unassigned_secondary_count']} unassigned.</p>",
+            f"<p>Anchor row counts: {reference_segmentation['anchor_row_counts']}; "
+            f"selected row counts: {reference_segmentation['selected_row_counts']}; "
+            f"foreground ownership valid: {reference_segmentation['foreground_ownership_valid']}. "
+            '<a href="segmentation/reference-segmentation.md">Detailed diagnostics</a></p>',
             "<table><thead><tr><th>Sample</th><th>Reference decision</th>"
             "<th>Match status</th><th>Segmentation status</th><th>Cost</th>"
             "<th>Match reason</th><th>Ambiguity sources</th>"

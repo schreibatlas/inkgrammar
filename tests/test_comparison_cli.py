@@ -95,6 +95,11 @@ def test_compare_letter_cli_automatic_mode_writes_batch_summary(tmp_path):
 
     gallery = json.loads((output / "reference-index" / "gallery.json").read_text())
     assert gallery["reference_profile"] == "generic"
+    report_markdown = (output / "summary.md").read_text()
+    assert "micro-noise removed" in report_markdown
+    assert "Detailed reference diagnostics" in report_markdown
+    assert "Acceptance decision: accepted" in report_markdown
+    assert (output / "segmentation" / "reference-segmentation.md").is_file()
     assert all(1 <= len(match["alternatives"]) <= 3 for match in summary["matches"])
     events = [json.loads(line) for line in (output / "progress.jsonl").read_text().splitlines()]
     extraction = [event for event in events if event["stage"] == "reference_extraction"]
@@ -155,6 +160,7 @@ def test_compare_letter_help_describes_automatic_controls():
     result = CliRunner().invoke(app, ["compare-letter", "--help"])
 
     assert result.exit_code == 0
+    assert "generic (default)" in result.output
     assert "exactly N visibly" in result.output
     assert "standalone" in result.output
     for option in (
@@ -165,6 +171,34 @@ def test_compare_letter_help_describes_automatic_controls():
         "--segment-only",
     ):
         assert option in result.output
+
+
+def test_compare_letter_cli_stops_on_rejected_reference_layout(tmp_path):
+    reference = _page(tmp_path / "reference.png", ("e", "e", "l"))
+    sample = _page(tmp_path / "sample.png", ("e", "n", "l"))
+    output = tmp_path / "rejected-reference"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "compare-letter",
+            str(reference),
+            str(sample),
+            "--letters",
+            "3",
+            "--reference-profile",
+            "alphabet",
+            "--output",
+            str(output),
+        ],
+    )
+
+    decision_path = output / "segmentation" / "reference-segmentation-decision.json"
+    assert result.exit_code == 2
+    assert "Reference segmentation rejected" in result.output
+    assert decision_path.is_file()
+    assert not (output / "reference-index" / "gallery.json").exists()
+    assert not (output / "segmentation" / "sample-segmentation.json").exists()
 
 
 def test_compare_letter_cli_segment_only_honors_quiet_mode_and_profiles(tmp_path):

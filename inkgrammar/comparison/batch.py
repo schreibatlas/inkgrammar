@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
-from dataclasses import replace
+from dataclasses import asdict, replace
 from importlib.metadata import version as package_version
 from pathlib import Path
 from time import perf_counter
@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 from PIL import Image, ImageDraw
-from rasterregions import MaskMode, MaskResult
+from rasterregions import DetectionConfig, MaskMode, MaskResult
 from skeletonpaths import SkeletonAnalysis
 
 from .api import compare_extracted_letters, extract_segmented_glyph
@@ -44,10 +44,13 @@ from .models import (
 from .progress import ProgressReporter
 from .report import write_comparison_report
 from .segmentation import (
+    REFERENCE_PROFILE_VERSION,
+    REFERENCE_SEGMENTATION_POLICY_VERSION,
     REFERENCE_SEGMENTATION_VERSION,
     PageSegmentation,
     ReferenceGallery,
     ReferenceRowDiagnostic,
+    ReferenceSegmentationDecision,
     ReferenceSheetProfile,
     SegmentationError,
     SegmentedGlyph,
@@ -57,7 +60,7 @@ from .segmentation import (
 from .skeleton import analyze_skeleton
 from .steering import fit_writing_route_candidates
 
-_REFERENCE_CACHE_VERSION = 5
+_REFERENCE_CACHE_VERSION = 6
 _DESCRIPTOR_SIZE = 96
 
 _REFERENCE_DIAGNOSTICS = (
@@ -68,6 +71,11 @@ _REFERENCE_DIAGNOSTICS = (
     "reference-candidates.json",
     "reference-segmentation-hypotheses.json",
     "reference-gallery.png",
+    "reference-segmentation-decision.json",
+    "reference-anchor-regions.png",
+    "reference-selected-regions.png",
+    "reference-cleanup-overlay.png",
+    "reference-segmentation.md",
 )
 
 
@@ -110,14 +118,55 @@ def _reference_profile_settings(
 ) -> dict[str, Any]:
     selected = ReferenceSheetProfile(name=profile) if isinstance(profile, str) else profile
     return {
+        "profile_version": REFERENCE_PROFILE_VERSION,
         "name": selected.name,
         "include_rows": list(selected.include_rows) if selected.include_rows is not None else None,
         "exclude_rows": list(selected.exclude_rows),
+        "allowed_row_count_patterns": [
+            list(pattern) for pattern in selected.allowed_row_count_patterns or ()
+        ],
         "classifier": "adaptive-repeated-row-geometry-v1",
         "minimum_repeated_row_fraction": 0.5,
         "metadata_row_fraction": 0.55,
         "unassigned_ink_fraction_limit": 0.02,
     }
+
+def _payload_fingerprint(payload: dict[str, Any]) -> str:
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _reference_cache_semantics(
+    ink_mode: MaskMode,
+    profile: str | ReferenceSheetProfile,
+) -> dict[str, Any]:
+    profile_settings = _reference_profile_settings(profile)
+    rasterregions_config = asdict(DetectionConfig())
+    rasterregions_version = package_version("rasterregions")
+    semantic_configuration = {
+        "rasterregions_version": rasterregions_version,
+        "reference_segmentation_version": REFERENCE_SEGMENTATION_VERSION,
+        "segmentation_policy_version": REFERENCE_SEGMENTATION_POLICY_VERSION,
+        "reference_profile_version": REFERENCE_PROFILE_VERSION,
+        "reference_profile_settings": profile_settings,
+        "ink_mode": ink_mode,
+        "rasterregions_config": rasterregions_config,
+    }
+    semantic_configuration = json.loads(
+        json.dumps(semantic_configuration, ensure_ascii=False, sort_keys=True)
+    )
+    cleanup_configuration = {
+        "rasterregions_version": rasterregions_version,
+        "cleanup_policy_version": REFERENCE_SEGMENTATION_POLICY_VERSION,
+        "cleanup_config": rasterregions_config["cleanup"],
+    }
+    return {
+        "semantic_configuration": semantic_configuration,
+        "semantic_config_fingerprint": _payload_fingerprint(semantic_configuration),
+        "cleanup_config_fingerprint": _payload_fingerprint(cleanup_configuration),
+        "reference_profile_fingerprint": _payload_fingerprint(profile_settings),
+    }
+
 
 
 def _cache_metadata(
@@ -127,6 +176,7 @@ def _cache_metadata(
     profile: str | ReferenceSheetProfile,
 ) -> dict[str, Any]:
     profile_settings = _reference_profile_settings(profile)
+    cache_semantics = _reference_cache_semantics(ink_mode, profile)
     rows = [
         {
             "row": row.row_index,
@@ -154,6 +204,14 @@ def _cache_metadata(
         "reference_profile": profile_settings["name"],
         "reference_profile_settings": profile_settings,
         "row_classification_settings": profile_settings,
+        "reference_profile_version": REFERENCE_PROFILE_VERSION,
+        "segmentation_policy_version": REFERENCE_SEGMENTATION_POLICY_VERSION,
+        "cleanup_policy_version": REFERENCE_SEGMENTATION_POLICY_VERSION,
+        "semantic_configuration": cache_semantics["semantic_configuration"],
+        "semantic_config_fingerprint": cache_semantics["semantic_config_fingerprint"],
+        "cleanup_config_fingerprint": cache_semantics["cleanup_config_fingerprint"],
+        "reference_profile_fingerprint": cache_semantics["reference_profile_fingerprint"],
+        "cleanup_diagnostics": gallery.cleanup_diagnostics or {},
         "segmentation_algorithm_version": REFERENCE_SEGMENTATION_VERSION,
         "rasterregions_version": package_version("rasterregions"),
         "mask_mode": ink_mode,
@@ -162,6 +220,9 @@ def _cache_metadata(
         "mask_warnings": list(gallery.mask_result.warnings),
         "segmentation_status": gallery.segmentation.status,
         "segmentation_warnings": list(gallery.segmentation.warnings),
+        "segmentation_decision": (
+            asdict(gallery.decision) if gallery.decision is not None else None
+        ),
         "unassigned_ink_fraction": gallery.segmentation.unassigned_ink_fraction,
         "segmentation_hypothesis_count": gallery.segmentation.hypothesis_count,
         "segmentation_search_truncated": gallery.segmentation.search_truncated,
@@ -264,11 +325,28 @@ def _load_reference_cache(
 ) -> tuple[ReferenceGallery, ReferenceIndex, dict[str, Any]]:
     metadata = json.loads((cache_dir / "gallery.json").read_text(encoding="utf-8"))
     profile_settings = _reference_profile_settings(profile)
+    cache_semantics = _reference_cache_semantics(ink_mode, profile)
     if (
         metadata.get("cache_version") != _REFERENCE_CACHE_VERSION
         or metadata.get("descriptor_size") != _DESCRIPTOR_SIZE
         or metadata.get("ink_mode") != ink_mode
         or metadata.get("mask_mode") != ink_mode
+        or metadata.get("reference_profile_version") != REFERENCE_PROFILE_VERSION
+        or metadata.get("segmentation_policy_version") != REFERENCE_SEGMENTATION_POLICY_VERSION
+        or metadata.get("cleanup_policy_version") != REFERENCE_SEGMENTATION_POLICY_VERSION
+        or metadata.get("semantic_configuration") != cache_semantics["semantic_configuration"]
+        or (
+            metadata.get("semantic_config_fingerprint")
+            != cache_semantics["semantic_config_fingerprint"]
+        )
+        or (
+            metadata.get("cleanup_config_fingerprint")
+            != cache_semantics["cleanup_config_fingerprint"]
+        )
+        or (
+            metadata.get("reference_profile_fingerprint")
+            != cache_semantics["reference_profile_fingerprint"]
+        )
         or metadata.get("source_sha256") != source_sha256
         or metadata.get("reference_profile_settings") != profile_settings
         or metadata.get("row_classification_settings") != profile_settings
@@ -276,6 +354,16 @@ def _load_reference_cache(
         or metadata.get("rasterregions_version") != package_version("rasterregions")
     ):
         raise ValueError("reference cache metadata does not match this input")
+    decision_payload = metadata.get("segmentation_decision")
+    if not isinstance(decision_payload, dict):
+        raise ValueError("reference cache has no segmentation acceptance decision")
+    try:
+        decision = ReferenceSegmentationDecision(**decision_payload)
+    except (TypeError, ValueError) as error:
+        raise ValueError("reference cache has an invalid segmentation decision") from error
+    cleanup_diagnostics = metadata.get("cleanup_diagnostics")
+    if not isinstance(cleanup_diagnostics, dict):
+        raise ValueError("reference cache has no cleanup diagnostics")
     if not (cache_dir / "descriptors.npz").is_file():
         raise ValueError("reference descriptor cache is missing")
     if not (cache_dir / "segmentation" / "reference-mask.png").is_file():
@@ -315,6 +403,8 @@ def _load_reference_cache(
             )
         )
 
+    if not decision.accepted or decision.accepted_count != len(candidates):
+        raise ValueError("reference cache acceptance decision does not match its candidates")
     with Image.open(cache_dir / "segmentation" / "reference-mask.png") as mask_image:
         page_mask = np.asarray(mask_image.convert("L"), dtype=np.uint8) > 0
     mask_result = MaskResult(
@@ -361,6 +451,8 @@ def _load_reference_cache(
         candidates=tuple(candidates),
         mask_result=mask_result,
         segmentation=segmentation,
+        decision=decision,
+        cleanup_diagnostics=metadata.get("cleanup_diagnostics", {}),
     )
 
     candidate_by_id = {candidate.glyph_id: candidate for candidate in candidates}
@@ -655,6 +747,14 @@ def _write_reference_manifest(
         "source_image": gallery.source_path.name,
         "source_sha256": gallery.source_sha256,
         "algorithm_version": metadata["segmentation_algorithm_version"],
+        "reference_profile_version": metadata["reference_profile_version"],
+        "cleanup_policy_version": metadata["cleanup_policy_version"],
+        "reference_profile_fingerprint": metadata["reference_profile_fingerprint"],
+        "segmentation_policy_version": metadata["segmentation_policy_version"],
+        "cleanup_diagnostics": metadata["cleanup_diagnostics"],
+        "segmentation_decision": metadata["segmentation_decision"],
+        "semantic_config_fingerprint": metadata["semantic_config_fingerprint"],
+        "cleanup_config_fingerprint": metadata["cleanup_config_fingerprint"],
         "reference_profile": metadata["reference_profile"],
         "row_count": metadata["row_count"],
         "rows": metadata["rows"],
@@ -900,7 +1000,7 @@ def compare_letter_page(
     sample_ink_mode: MaskMode = "auto",
     top_k: int = DEFAULT_TOP_K,
     refinement_limit: int = DEFAULT_REFINEMENT_LIMIT,
-    reference_profile: str | ReferenceSheetProfile = "alphabet",
+    reference_profile: str | ReferenceSheetProfile = "generic",
     no_progress: bool = False,
     verbose: bool = False,
     segment_only: bool = False,
@@ -1054,32 +1154,62 @@ def _compare_letter_page_impl(
             ) from error
 
     assert gallery is not None
+    if not segment_only:
+        _copy_reference_diagnostics(cache_dir, segmentation_dir)
+    decision = gallery.decision
+    if decision is None:
+        raise SegmentationError(
+            "Reference segmentation has no acceptance decision.",
+            diagnostic_path=segmentation_dir / "reference-segmentation-hypotheses.json",
+            details={"failure_phase": "reference_segmentation_acceptance"},
+        )
     progress.stage(
         "reference_segmentation",
         completed=len(gallery.candidates),
         total=len(gallery.candidates),
         details={
-            "message": (
-                f"Segment reference glyphs: {len(gallery.candidates)} candidates across "
-                f"{len(gallery.segmentation.rows)} rows"
-            ),
-            "status": gallery.segmentation.status,
-            "reference_profile": gallery.segmentation.reference_profile,
+            "message": decision.summary,
+            "status": decision.status,
+            "accepted": decision.accepted,
+            "reference_profile": decision.profile_name,
             "row_count": len(gallery.segmentation.rows),
-            "candidate_count": len(gallery.candidates),
+            "candidate_count": decision.detected_count,
+            "anchor_row_counts": list(decision.anchor_row_counts),
+            "selected_row_counts": list(decision.selected_row_counts),
+            "recognized_layout": (
+                list(decision.recognized_layout)
+                if decision.recognized_layout is not None
+                else None
+            ),
+            "reasons": list(decision.reasons),
+            "warnings": list(decision.warnings),
+            "search_truncated": decision.search_truncated,
+            "removed_micro_noise_count": decision.removed_micro_noise_count,
+            "retained_secondary_count": decision.retained_secondary_count,
+            "unassigned_secondary_count": decision.unassigned_secondary_count,
+            "excluded_row_count": sum(not row.included for row in gallery.segmentation.rows),
             "per_row_candidate_counts": {
                 str(row.row_index): sum(
                     candidate.row_index == row.row_index for candidate in gallery.candidates
                 )
                 for row in gallery.segmentation.rows
             },
-            "excluded_row_count": sum(not row.included for row in gallery.segmentation.rows),
-            "search_truncated": gallery.segmentation.search_truncated,
-            "search_limit": gallery.segmentation.search_limit,
             "anchor_region_count": gallery.segmentation.anchor_region_count,
             "unassigned_ink_fraction": gallery.segmentation.unassigned_ink_fraction,
         },
     )
+    if not segment_only and not decision.accepted:
+        diagnostic_path = segmentation_dir / "reference-segmentation-decision.json"
+        if not diagnostic_path.is_file():
+            diagnostic_path = segmentation_dir / "reference-segmentation-hypotheses.json"
+        raise SegmentationError(
+            decision.summary,
+            diagnostic_path=diagnostic_path,
+            details={
+                "failure_phase": "reference_segmentation_acceptance",
+                "reference_segmentation_decision": asdict(decision),
+            },
+        )
 
     if not segment_only:
         if cache_hit:
@@ -1348,6 +1478,16 @@ def _compare_letter_page_impl(
             "search_truncated": gallery.segmentation.search_truncated,
             "search_limit": gallery.segmentation.search_limit,
             "anchor_region_count": gallery.segmentation.anchor_region_count,
+            "anchor_row_counts": list(decision.anchor_row_counts),
+            "selected_row_counts": list(decision.selected_row_counts),
+            "raw_component_count": decision.raw_component_count,
+            "removed_page_artifact_count": decision.removed_page_artifact_count,
+            "removed_micro_noise_count": decision.removed_micro_noise_count,
+            "retained_secondary_count": decision.retained_secondary_count,
+            "unassigned_secondary_count": decision.unassigned_secondary_count,
+            "uncertain_secondary_count": decision.uncertain_secondary_count,
+            "foreground_ownership_valid": decision.foreground_ownership_valid,
             "unassigned_ink_fraction": gallery.segmentation.unassigned_ink_fraction,
-        },
+            "decision": asdict(decision),
+        }
     )

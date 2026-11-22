@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import median
 from typing import Any, Literal
@@ -85,11 +85,20 @@ class SegmentedGlyph:
         )
 
 
+ALPHABET_ROW_COUNT_PATTERNS = (
+    (12, 8, 6, 11, 10, 5, 10),
+    (12, 8, 6, 11, 11, 5, 10),
+)
+REFERENCE_SEGMENTATION_POLICY_VERSION = "2"
+REFERENCE_PROFILE_VERSION = "1"
+
+
 @dataclass(frozen=True)
 class ReferenceSheetProfile:
-    name: Literal["alphabet", "generic"] = "alphabet"
+    name: Literal["alphabet", "generic"] = "generic"
     include_rows: tuple[int, ...] | None = None
     exclude_rows: tuple[int, ...] = ()
+    allowed_row_count_patterns: tuple[tuple[int, ...], ...] | None = None
 
     def __post_init__(self) -> None:
         if self.include_rows is not None and self.exclude_rows:
@@ -106,6 +115,93 @@ class ReferenceSheetProfile:
         )
         object.__setattr__(self, "exclude_rows", tuple(self.exclude_rows))
 
+        patterns = self.allowed_row_count_patterns
+        if patterns is None:
+            patterns = ALPHABET_ROW_COUNT_PATTERNS if self.name == "alphabet" else ()
+        patterns = tuple(tuple(pattern) for pattern in patterns)
+        if any(
+            not pattern
+            or any(
+                isinstance(count, bool) or not isinstance(count, int) or count < 1
+                for count in pattern
+            )
+            for pattern in patterns
+        ):
+            raise ValueError("allowed row-count patterns must contain positive integer counts")
+        object.__setattr__(self, "allowed_row_count_patterns", patterns)
+
+
+@dataclass(frozen=True)
+class ReferenceCountChangingRepair:
+    row_index: int
+    anchor_count: int
+    selected_count: int
+    repair_count: int
+    split_anchor_indices: tuple[int, ...] = ()
+    merged_anchor_groups: tuple[tuple[int, ...], ...] = ()
+    strongly_supported: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "split_anchor_indices", tuple(self.split_anchor_indices))
+        object.__setattr__(
+            self,
+            "merged_anchor_groups",
+            tuple(tuple(group) for group in self.merged_anchor_groups),
+        )
+
+
+@dataclass(frozen=True)
+class ReferenceSegmentationDecision:
+    profile_name: str
+    anchor_row_counts: tuple[int, ...]
+    selected_row_counts: tuple[int, ...]
+    recognized_layout: tuple[int, ...] | None
+    detected_count: int
+    accepted_count: int | None
+    accepted: bool
+    status: Literal["accepted", "rejected"]
+    raw_component_count: int
+    removed_page_artifact_count: int
+    removed_micro_noise_count: int
+    retained_secondary_count: int
+    unassigned_secondary_count: int
+    uncertain_secondary_count: int
+    count_changing_repairs: tuple[ReferenceCountChangingRepair, ...]
+    search_truncated: bool
+    foreground_ownership_valid: bool
+    reasons: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "anchor_row_counts", tuple(self.anchor_row_counts))
+        object.__setattr__(self, "selected_row_counts", tuple(self.selected_row_counts))
+        if self.recognized_layout is not None:
+            object.__setattr__(self, "recognized_layout", tuple(self.recognized_layout))
+        repairs = tuple(
+            repair
+            if isinstance(repair, ReferenceCountChangingRepair)
+            else ReferenceCountChangingRepair(**repair)
+            for repair in self.count_changing_repairs
+        )
+        object.__setattr__(self, "count_changing_repairs", repairs)
+        object.__setattr__(self, "reasons", tuple(self.reasons))
+        object.__setattr__(self, "warnings", tuple(self.warnings))
+        if self.accepted != (self.accepted_count is not None):
+            raise ValueError("accepted_count must be set exactly for accepted decisions")
+        if self.status != ("accepted" if self.accepted else "rejected"):
+            raise ValueError("decision status must agree with accepted")
+
+    @property
+    def summary(self) -> str:
+        if self.accepted:
+            return f"Reference segmentation accepted: {self.accepted_count} candidates."
+        lines = [
+            "Reference segmentation rejected:",
+            f"  anchor layout:   {list(self.anchor_row_counts)}",
+            f"  selected layout: {list(self.selected_row_counts)}",
+        ]
+        lines.extend(f"  reason: {reason}" for reason in self.reasons)
+        return "\n".join(lines)
 
 @dataclass(frozen=True)
 class ReferenceRowDiagnostic:
@@ -148,7 +244,9 @@ class ReferenceGallery:
     candidates: tuple[SegmentedGlyph, ...]
     mask_result: MaskResult
     segmentation: PageSegmentation
+    decision: ReferenceSegmentationDecision | None = None
 
+    cleanup_diagnostics: dict[str, Any] | None = None
 
 class SegmentationError(ValueError):
     def __init__(
@@ -168,7 +266,7 @@ RowBand = rr.RowBand
 detect_ink_rows = rr.detect_rows
 
 
-REFERENCE_SEGMENTATION_VERSION = "5"
+REFERENCE_SEGMENTATION_VERSION = "6"
 
 
 def _coerce_reference_profile(
@@ -434,16 +532,153 @@ def _write_page_mask(mask: np.ndarray, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(np.asarray(mask, dtype=np.uint8) * 255).save(output, format="PNG")
 
+def _diagnostics_payload(diagnostics: rr.DetectionDiagnostics | None) -> dict[str, Any]:
+    return asdict(diagnostics) if diagnostics is not None else {}
+
+
+def _write_bbox_overlay(
+    image: Image.Image,
+    boxes: list[tuple[str, tuple[int, int, int, int]]],
+    output: Path,
+    color: tuple[int, int, int],
+) -> None:
+    preview = image.convert("RGB")
+    draw = ImageDraw.Draw(preview)
+    for label, (x0, y0, x1, y1) in boxes:
+        draw.rectangle((x0, y0, x1 - 1, y1 - 1), outline=color, width=2)
+        draw.text((x0, max(0, y0 - 12)), label, fill=color)
+    preview.save(output, format="PNG")
+
+
+def _write_cleanup_overlay(result: rr.DetectionResult, output: Path) -> None:
+    preview = result.image.convert("RGB")
+    draw = ImageDraw.Draw(preview)
+    assignments = {
+        assignment.component_index: assignment.status
+        for assignment in (
+            result.diagnostics.secondary_mark_assignments if result.diagnostics else ()
+        )
+    }
+    colors = {
+        "primary": (35, 155, 55),
+        "secondary": (35, 105, 220),
+        "secondary-candidate": (35, 105, 220),
+        "ambiguous": (230, 80, 200),
+        "micro-noise": (225, 35, 35),
+        "artifact": (125, 50, 170),
+        "noise": (225, 35, 35),
+    }
+    for decision in result.component_decisions:
+        assignment_status = assignments.get(decision.component_index)
+        role = decision.role
+        color = (
+            (245, 185, 20)
+            if assignment_status == "unassigned"
+            else (230, 80, 200)
+            if assignment_status == "ambiguous"
+            else colors.get(role, (100, 100, 100))
+        )
+        box = decision.bbox
+        draw.rectangle((box.x0, box.y0, box.x1 - 1, box.y1 - 1), outline=color, width=2)
+        draw.text(
+            (box.x0, max(0, box.y0 - 12)),
+            f"c{decision.component_index}:{role}",
+            fill=color,
+        )
+    legend = (
+        ("primary body", colors["primary"]),
+        ("retained detached mark", colors["secondary"]),
+        ("removed micro-noise", colors["micro-noise"]),
+        ("unassigned secondary", (245, 185, 20)),
+    )
+    draw.rectangle((3, 3, 188, 67), fill="white", outline="black")
+    for index, (label, color) in enumerate(legend):
+        draw.text((7, 7 + index * 14), label, fill=color)
+    preview.save(output, format="PNG")
+
+
+def _write_reference_report(
+    result: rr.DetectionResult,
+    segmentation: PageSegmentation,
+    decision: ReferenceSegmentationDecision,
+    output: Path,
+) -> None:
+    diagnostics = result.diagnostics
+    search_limit = diagnostics.search_limit if diagnostics is not None else None
+    repairs = decision.count_changing_repairs
+    lines = [
+        "# Reference segmentation",
+        "",
+        f"- Profile: {decision.profile_name}",
+        f"- Raw connected components: {decision.raw_component_count}",
+        f"- Page artifacts removed: {decision.removed_page_artifact_count}",
+        f"- Micro-noise removed: {decision.removed_micro_noise_count}",
+        f"- Plausible detached marks retained: {decision.retained_secondary_count}",
+        f"- Unassigned secondary marks: {decision.unassigned_secondary_count}",
+        f"- Uncertain secondary marks: {decision.uncertain_secondary_count}",
+        f"- Anchor row counts: {list(decision.anchor_row_counts)}",
+        f"- Selected row counts: {list(decision.selected_row_counts)}",
+        f"- Detected candidates: {decision.detected_count}",
+        f"- Accepted candidate count: {decision.accepted_count}",
+        f"- Count-changing repairs: {len(repairs)}",
+        f"- Search truncated: {'yes' if decision.search_truncated else 'no'}"
+        + (f" ({search_limit})" if search_limit else ""),
+        f"- Foreground ownership valid: {'yes' if decision.foreground_ownership_valid else 'no'}",
+        f"- Status: {decision.status}",
+    ]
+    if repairs:
+        lines.extend(("", "## Count-changing repair evidence", ""))
+        lines.extend(f"- {repair}" for repair in repairs)
+    if decision.reasons:
+        lines.extend(("", "## Blocking reasons", ""))
+        lines.extend(f"- {reason}" for reason in decision.reasons)
+    if decision.warnings or segmentation.warnings:
+        lines.extend(("", "## Warnings", ""))
+        lines.extend(f"- {warning}" for warning in (*decision.warnings, *segmentation.warnings))
+    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 
 def _write_reference_diagnostics(
     result: rr.DetectionResult,
     segmentation: PageSegmentation,
     hypotheses: rr.SpacedSegmentationHypotheses,
     output_dir: Path,
+    decision: ReferenceSegmentationDecision,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_page_mask(result.clean_mask, output_dir / "reference-mask.png")
     _write_overlay(result.image, segmentation.candidates, output_dir / "reference-candidates.png")
+    _write_bbox_overlay(
+        result.image,
+        [
+            (
+                f"anchor-{region.reading_order:03d}",
+                (region.bbox.x0, region.bbox.y0, region.bbox.x1, region.bbox.y1),
+            )
+            for region in result.regions
+        ],
+        output_dir / "reference-anchor-regions.png",
+        (35, 105, 220),
+    )
+    _write_bbox_overlay(
+        result.image,
+        [
+            (
+                candidate.glyph_id,
+                (
+                    candidate.bbox.x,
+                    candidate.bbox.y,
+                    candidate.bbox.x + candidate.bbox.width,
+                    candidate.bbox.y + candidate.bbox.height,
+                ),
+            )
+            for candidate in segmentation.candidates
+        ],
+        output_dir / "reference-selected-regions.png",
+        (230, 45, 35),
+    )
+    _write_cleanup_overlay(result, output_dir / "reference-cleanup-overlay.png")
 
     rows_preview = result.image.convert("RGB")
     rows_draw = ImageDraw.Draw(rows_preview)
@@ -534,6 +769,9 @@ def _write_reference_diagnostics(
     payload = {
         "source_image": segmentation.source_path.name,
         "algorithm_version": REFERENCE_SEGMENTATION_VERSION,
+        "segmentation_policy_version": REFERENCE_SEGMENTATION_POLICY_VERSION,
+        "reference_profile_version": REFERENCE_PROFILE_VERSION,
+        "cleanup_policy_version": REFERENCE_SEGMENTATION_POLICY_VERSION,
         "hypothesis_count": segmentation.hypothesis_count,
         "search_truncated": segmentation.search_truncated,
         "reference_profile": segmentation.reference_profile,
@@ -550,6 +788,7 @@ def _write_reference_diagnostics(
         "status": segmentation.status,
         "warnings": list(segmentation.warnings),
         "candidates": [_candidate_record(candidate) for candidate in segmentation.candidates],
+        "cleanup_diagnostics": _diagnostics_payload(result.diagnostics),
     }
     (output_dir / "reference-candidates.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -559,6 +798,18 @@ def _write_reference_diagnostics(
         encoding="utf-8",
     )
     write_spaced_hypotheses(hypotheses, output_dir / "reference-hypotheses")
+    decision_payload = asdict(decision)
+    decision_payload["summary"] = decision.summary
+    (output_dir / "reference-segmentation-decision.json").write_text(
+        json.dumps(decision_payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _write_reference_report(
+        result,
+        segmentation,
+        decision,
+        output_dir / "reference-segmentation.md",
+    )
 
 
 def _reference_ownership_error(result: rr.DetectionResult) -> str | None:
@@ -595,6 +846,225 @@ def _reference_ownership_error(result: rr.DetectionResult) -> str | None:
         if not np.isclose(actual_fraction, result.diagnostics.unassigned_ink_fraction):
             return "Cleaned foreground ownership disagrees with rasterregions diagnostics."
     return None
+
+
+def _region_row_index(region) -> int:
+    if hasattr(region, "row_index"):
+        return region.row_index
+    return region.frame.row_index
+
+
+def _region_identity_signature(regions, components) -> tuple:
+    component_by_index = {component.index: component for component in components}
+    signatures = []
+    for region in regions:
+        mask = np.zeros(region.mask.shape, dtype=bool)
+        for component_index in region.primary_component_indices:
+            component = component_by_index[component_index]
+            local_y = component.ys - region.bbox.y0
+            local_x = component.xs - region.bbox.x0
+            inside = (
+                (local_y >= 0)
+                & (local_y < mask.shape[0])
+                & (local_x >= 0)
+                & (local_x < mask.shape[1])
+            )
+            mask[local_y[inside], local_x[inside]] = True
+        if not region.primary_component_indices:
+            mask = np.asarray(region.mask, dtype=bool)
+        ys, xs = np.nonzero(mask)
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        signatures.append(
+            (
+                _region_row_index(region),
+                (
+                    region.bbox.x0 + x0,
+                    region.bbox.y0 + y0,
+                    region.bbox.x0 + x1,
+                    region.bbox.y0 + y1,
+                ),
+                tuple(region.primary_component_indices),
+                mask[y0:y1, x0:x1].tobytes(),
+            )
+        )
+    return tuple(signatures)
+
+
+def _strongly_supported_split(row, count_delta: int) -> bool:
+    if count_delta <= 0 or count_delta != len(row.split_anchor_indices):
+        return False
+    if row.repair_count != count_delta or row.merged_anchor_groups or row.truncated_counts:
+        return False
+    evidence = {
+        item.anchor_index: item
+        for item in row.split_evidence
+        if item.anchor_index in row.split_anchor_indices
+    }
+    return len(evidence) == count_delta and all(item.accepted for item in evidence.values())
+
+
+def evaluate_reference_segmentation(
+    result: rr.DetectionResult,
+    segmentation: PageSegmentation,
+    hypotheses: rr.SpacedSegmentationHypotheses,
+    profile: ReferenceSheetProfile,
+    *,
+    ownership_error: str | None = None,
+) -> ReferenceSegmentationDecision:
+    diagnostics = result.diagnostics
+    included_rows = tuple(row for row in segmentation.rows if row.included)
+    selected_counts = tuple(row.candidate_count for row in included_rows)
+    selected_by_row = {row.row_index: row.candidate_count for row in included_rows}
+    package_rows = {
+        row.row_index: row for row in diagnostics.row_segmentation
+    } if diagnostics is not None else {}
+    anchor_counts = tuple(
+        package_rows[row.row_index].anchor_count
+        if row.row_index in package_rows and package_rows[row.row_index].anchor_count is not None
+        else row.candidate_count
+        for row in included_rows
+    )
+    patterns = profile.allowed_row_count_patterns or ()
+    selected_layout = next((pattern for pattern in patterns if pattern == selected_counts), None)
+    anchor_layout = next((pattern for pattern in patterns if pattern == anchor_counts), None)
+    recognized_layout = selected_layout or anchor_layout
+
+    repairs = []
+    for row in included_rows:
+        package_row = package_rows.get(row.row_index)
+        if package_row is None:
+            continue
+        anchor_count = (
+            package_row.anchor_count
+            if package_row.anchor_count is not None
+            else selected_by_row[row.row_index]
+        )
+        selected_count = selected_by_row[row.row_index]
+        count_delta = selected_count - anchor_count
+        if count_delta or package_row.repair_count:
+            repairs.append(
+                ReferenceCountChangingRepair(
+                    row_index=row.row_index,
+                    anchor_count=anchor_count,
+                    selected_count=selected_count,
+                    repair_count=package_row.repair_count,
+                    split_anchor_indices=package_row.split_anchor_indices,
+                    merged_anchor_groups=package_row.merged_anchor_groups,
+                    strongly_supported=_strongly_supported_split(package_row, count_delta),
+                )
+            )
+
+    assignments = diagnostics.secondary_mark_assignments if diagnostics is not None else ()
+    uncertain_assignments = tuple(
+        assignment
+        for assignment in assignments
+        if assignment.status == "ambiguous"
+        and (assignment.bbox_expansion_ratio is None or assignment.bbox_expansion_ratio > 1.0)
+    )
+    retained_secondary = {
+        index for region in result.regions for index in region.secondary_component_indices
+    }
+    retained_secondary.update(
+        assignment.component_index
+        for assignment in assignments
+        if assignment.status == "assigned"
+    )
+    unassigned_secondary_count = sum(
+        assignment.status == "unassigned" for assignment in assignments
+    )
+    ownership_error = ownership_error or _reference_ownership_error(result)
+
+    reasons = []
+    warnings = []
+    if not segmentation.candidates:
+        reasons.append("no candidate regions")
+    if ownership_error is not None:
+        reasons.append(ownership_error)
+    if any(candidate.ambiguous_component_indices for candidate in segmentation.candidates):
+        reasons.append("candidate bounds depend on ambiguous component ownership")
+    if uncertain_assignments:
+        reasons.append("uncertain secondary ownership can change candidate bounds")
+    if any(row.classification == "uncertain" and row.included for row in segmentation.rows):
+        reasons.append("reference row inclusion is uncertain")
+    if any(candidate.warnings for candidate in segmentation.candidates):
+        reasons.append("candidate geometry is uncertain")
+
+    if patterns:
+        if recognized_layout is None:
+            reasons.append("recognized alphabet layout has no compatible hypothesis")
+        elif selected_layout is None:
+            reasons.append(
+                "selected candidate counts conflict with safe recognized layout "
+                f"{list(recognized_layout)}"
+            )
+    if repairs and any(not repair.strongly_supported for repair in repairs):
+        reasons.append("unresolved count-changing split/merge ambiguity")
+
+    selected_signature = _region_identity_signature(result.regions, result.components)
+    competing_identity = any(
+        _region_identity_signature(page.regions, result.components) != selected_signature
+        for page in hypotheses.page_hypotheses[1:]
+    )
+    if competing_identity:
+        reasons.append("segmentation hypotheses disagree on candidate identity")
+    identity_unstable = (
+        selected_counts != anchor_counts
+        and any(not repair.strongly_supported for repair in repairs)
+    ) or bool(uncertain_assignments) or competing_identity
+    search_truncated = hypotheses.truncated or bool(diagnostics and diagnostics.search_truncated)
+    if search_truncated and identity_unstable:
+        reasons.append("segmentation search was truncated while candidate identity was unstable")
+
+    component_decisions = result.component_decisions
+    raw_component_count = (
+        diagnostics.raw_component_count
+        if diagnostics is not None
+        else len(component_decisions)
+    )
+    removed_page_artifact_count = sum(
+        decision.action == "removed" and decision.role == "artifact"
+        for decision in component_decisions
+    )
+    removed_micro_noise_count = sum(
+        decision.action == "removed" and decision.role == "micro-noise"
+        for decision in component_decisions
+    )
+    if removed_micro_noise_count:
+        warnings.append(
+            f"Rasterregions removed {removed_micro_noise_count} micro-noise components."
+        )
+    if unassigned_secondary_count:
+        warnings.append(
+            f"{unassigned_secondary_count} plausible secondary marks remain unassigned."
+        )
+    if search_truncated and not identity_unstable:
+        warnings.append(
+            "Segmentation search was truncated, but selected candidate identity is stable."
+        )
+
+    accepted = not reasons
+    return ReferenceSegmentationDecision(
+        profile_name=profile.name,
+        anchor_row_counts=anchor_counts,
+        selected_row_counts=selected_counts,
+        recognized_layout=recognized_layout,
+        detected_count=len(segmentation.candidates),
+        accepted_count=len(segmentation.candidates) if accepted else None,
+        accepted=accepted,
+        status="accepted" if accepted else "rejected",
+        raw_component_count=raw_component_count,
+        removed_page_artifact_count=removed_page_artifact_count,
+        removed_micro_noise_count=removed_micro_noise_count,
+        retained_secondary_count=len(retained_secondary),
+        unassigned_secondary_count=unassigned_secondary_count,
+        uncertain_secondary_count=len(uncertain_assignments),
+        count_changing_repairs=tuple(repairs),
+        search_truncated=search_truncated,
+        foreground_ownership_valid=ownership_error is None,
+        reasons=tuple(dict.fromkeys(reasons)),
+        warnings=tuple(dict.fromkeys(warnings)),
+    )
 
 
 def _write_reference_failure_diagnostics(
@@ -690,6 +1160,9 @@ def _write_reference_failure_diagnostics(
     manifest = {
         "source_image": source_path.name,
         "algorithm_version": REFERENCE_SEGMENTATION_VERSION,
+        "segmentation_policy_version": REFERENCE_SEGMENTATION_POLICY_VERSION,
+        "reference_profile_version": REFERENCE_PROFILE_VERSION,
+        "cleanup_policy_version": REFERENCE_SEGMENTATION_POLICY_VERSION,
         "reference_profile": reference_profile,
         "status": "failed",
         "candidate_count": 0,
@@ -785,7 +1258,7 @@ def segment_reference_gallery(
     *,
     ink_mode: MaskMode = "auto",
     output_dir: str | Path | None = None,
-    reference_profile: str | ReferenceSheetProfile = "alphabet",
+    reference_profile: str | ReferenceSheetProfile = "generic",
 ) -> ReferenceGallery:
     """Detect anonymous reference glyphs with an application-level row profile."""
     source_path = Path(image_path)
@@ -882,12 +1355,19 @@ def segment_reference_gallery(
         search_limit=search_limit,
         anchor_region_count=anchor_region_count,
     )
+    decision = evaluate_reference_segmentation(
+        result,
+        segmentation,
+        hypotheses,
+        profile,
+        ownership_error=ownership_error,
+    )
 
     diagnostics_dir = Path(output_dir) if output_dir is not None else None
     if diagnostics_dir is None and status == "failed":
         diagnostics_dir = Path(tempfile.mkdtemp(prefix="inkgrammar-reference-segmentation-"))
     if diagnostics_dir is not None:
-        _write_reference_diagnostics(result, segmentation, hypotheses, diagnostics_dir)
+        _write_reference_diagnostics(result, segmentation, hypotheses, diagnostics_dir, decision)
     if status == "failed":
         assert diagnostics_dir is not None
         diagnostic_path = diagnostics_dir / "reference-segmentation-hypotheses.json"
@@ -928,6 +1408,8 @@ def segment_reference_gallery(
             warnings=list(result.warnings),
         ),
         segmentation=segmentation,
+        decision=decision,
+        cleanup_diagnostics=_diagnostics_payload(result.diagnostics),
     )
 
 
