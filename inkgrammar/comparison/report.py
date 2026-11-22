@@ -11,7 +11,7 @@ from PIL import Image, ImageDraw, ImageFont
 from planarcurve.trajectory import evaluate_heading_rate
 from skeletonpaths import SubpixelCenterlineOptions
 
-from .metrics import ComparisonAnalysis, analyze_comparison
+from .metrics import ComparisonAnalysis, analyze_comparison, reconstruction_model_payload
 from .models import ComparisonResult, ExtractedLetter, TopologySummary, WritingRouteCandidate
 from .plots import PlotSeries, write_plot
 from .routes import ROUTE_REPORT_LIMIT, ROUTE_SEARCH_LIMIT, align_writing_routes
@@ -742,9 +742,10 @@ def _write_ink_reconstruction_panels(analysis: ComparisonAnalysis, output_dir: P
         under = np.asarray(analysis.series[f"{side}_under_coverage"], dtype=bool)
         over = np.asarray(analysis.series[f"{side}_over_coverage"], dtype=bool)
         height, width = observed.shape
-        label_height = 20
+        scale = _viewport_scale((0, 0, width - 1, height - 1))
+        panel_size = _canvas_size((0, 0, width - 1, height - 1), scale)
+        label_height = 22
         gap = 8
-        panels = []
         observed_image = np.full((height, width, 3), 255, dtype=np.uint8)
         observed_image[observed] = (25, 25, 25)
         rendered_gray = np.rint(255 * (1.0 - coverage)).astype(np.uint8)
@@ -753,27 +754,35 @@ def _write_ink_reconstruction_panels(analysis: ComparisonAnalysis, output_dir: P
         under_image[under] = (225, 70, 45)
         over_image = np.full((height, width, 3), 255, dtype=np.uint8)
         over_image[over] = (135, 55, 165)
-        panels.extend(
+        nearest = Image.Resampling.NEAREST
+        panels = (
+            ("Observed ink", Image.fromarray(observed_image).resize(panel_size, nearest)),
             (
-                ("Observed ink", Image.fromarray(observed_image)),
-                ("Rendered coverage", Image.fromarray(rendered_image)),
-                ("Under-coverage", Image.fromarray(under_image)),
-                ("Over-coverage", Image.fromarray(over_image)),
-            )
+                "Rendered coverage",
+                Image.fromarray(rendered_image).resize(panel_size, Image.Resampling.BILINEAR),
+            ),
+            ("Under-coverage", Image.fromarray(under_image).resize(panel_size, nearest)),
+            ("Over-coverage", Image.fromarray(over_image).resize(panel_size, nearest)),
         )
-        sheet = Image.new("RGB", (2 * width + gap, 2 * (height + label_height) + gap), "white")
+        panel_width, panel_height = panel_size
+        sheet = Image.new(
+            "RGB",
+            (2 * panel_width + gap, 2 * (panel_height + label_height) + gap),
+            "white",
+        )
         draw = ImageDraw.Draw(sheet)
+        font = ImageFont.load_default(size=14)
         for index, (label, panel) in enumerate(panels):
-            x = (index % 2) * (width + gap)
-            y = (index // 2) * (height + label_height + gap)
-            draw.text((x + 2, y + 2), label, fill=(30, 30, 30), font=ImageFont.load_default())
+            x = (index % 2) * (panel_width + gap)
+            y = (index // 2) * (panel_height + label_height + gap)
+            draw.text((x + 2, y + 2), label, fill=(30, 30, 30), font=font)
             sheet.paste(panel, (x, y + label_height))
         sheet.save(output_dir / _ARTIFACTS[f"ink_reconstruction_{side}"], format="PNG")
 
         residual = np.full((height, width, 3), 255, dtype=np.uint8)
         residual[under] = (225, 70, 45)
         residual[over] = (135, 55, 165)
-        Image.fromarray(residual).save(
+        Image.fromarray(residual).resize(panel_size, nearest).save(
             output_dir / _ARTIFACTS[f"ink_residual_{side}"], format="PNG"
         )
 
@@ -921,10 +930,13 @@ def _route_candidate_diagnostics(
     ranked_candidates = list(enumerate(extracted.route_candidates, start=1))
     reported_candidates = ranked_candidates[:ROUTE_REPORT_LIMIT]
     if selected_rank is not None and selected_rank > ROUTE_REPORT_LIMIT and reported_candidates:
-        reported_candidates[-1] = (
-            selected_rank,
-            extracted.route_candidates[selected_rank - 1],
+        selected_candidate = (
+            extracted.route_candidates[selected_rank - 1]
+            if selected_rank <= len(extracted.route_candidates)
+            else extracted.selected_route
         )
+        if selected_candidate is not None:
+            reported_candidates[-1] = (selected_rank, selected_candidate)
     return [
         {
             "rank": rank,
@@ -956,9 +968,31 @@ def _route_candidate_diagnostics(
                 "steering_complexity_cost": candidate.score.steering_complexity_cost,
                 "intrinsic_cost": candidate.score.intrinsic_cost,
             },
+            "minimum_complexity_reconstruction": reconstruction_model_payload(
+                candidate,
+                route_rank=rank,
+            ),
         }
         for rank, candidate in reported_candidates
     ]
+
+
+def _route_candidate_for_rank(
+    result: ComparisonResult,
+    side: str,
+    rank: int,
+) -> WritingRouteCandidate | None:
+    selection = result.route_selection
+    if selection is not None:
+        selected_rank = (
+            selection.score.reference_rank if side == "reference" else selection.score.sample_rank
+        )
+        if rank == selected_rank:
+            return selection.reference if side == "reference" else selection.sample
+    extracted = result.reference if side == "reference" else result.sample
+    if 1 <= rank <= len(extracted.route_candidates):
+        return extracted.route_candidates[rank - 1]
+    return None
 
 
 def _route_pairs_payload(result: ComparisonResult) -> dict[str, Any]:
@@ -969,8 +1003,8 @@ def _route_pairs_payload(result: ComparisonResult) -> dict[str, Any]:
     selected_key = (selection.score.reference_rank, selection.score.sample_rank)
     pairs = []
     for pair_rank, score in enumerate(selection.alternatives, start=1):
-        reference = result.reference.route_candidates[score.reference_rank - 1]
-        sample = result.sample.route_candidates[score.sample_rank - 1]
+        reference = _route_candidate_for_rank(result, "reference", score.reference_rank)
+        sample = _route_candidate_for_rank(result, "sample", score.sample_rank)
         pairs.append(
             {
                 "pair_rank": pair_rank,
@@ -979,14 +1013,32 @@ def _route_pairs_payload(result: ComparisonResult) -> dict[str, Any]:
                 "selected": (score.reference_rank, score.sample_rank) == selected_key,
                 "eligible": score.eligible,
                 "reference": {
-                    "stroke_count": len(reference.continuous_strokes),
-                    "pen_lift_count": reference.hypothesis.pen_lift_count,
-                    "ambiguous": reference.ambiguous,
+                    "available": reference is not None,
+                    "stroke_count": (
+                        len(reference.continuous_strokes) if reference is not None else None
+                    ),
+                    "pen_lift_count": (
+                        reference.hypothesis.pen_lift_count if reference is not None else None
+                    ),
+                    "ambiguous": reference.ambiguous if reference is not None else None,
+                    "minimum_complexity_reconstruction": (
+                        reconstruction_model_payload(reference, route_rank=score.reference_rank)
+                        if reference is not None
+                        else None
+                    ),
                 },
                 "sample": {
-                    "stroke_count": len(sample.continuous_strokes),
-                    "pen_lift_count": sample.hypothesis.pen_lift_count,
-                    "ambiguous": sample.ambiguous,
+                    "available": sample is not None,
+                    "stroke_count": len(sample.continuous_strokes) if sample is not None else None,
+                    "pen_lift_count": (
+                        sample.hypothesis.pen_lift_count if sample is not None else None
+                    ),
+                    "ambiguous": sample.ambiguous if sample is not None else None,
+                    "minimum_complexity_reconstruction": (
+                        reconstruction_model_payload(sample, route_rank=score.sample_rank)
+                        if sample is not None
+                        else None
+                    ),
                 },
                 "pen_lift_count": score.pen_lift_count,
                 "geometry_cost": score.geometry_cost,
@@ -1028,8 +1080,37 @@ def _write_route_alternatives(
         left, top = column * 600 + 8, 42 + row * panel_height + 4
         right, bottom = left + 584, top + panel_height - 8
         draw.rectangle((left, top, right, bottom), outline=(190, 190, 190), width=1)
-        reference = result.reference.route_candidates[pair["reference_route_rank"] - 1]
-        sample = result.sample.route_candidates[pair["sample_route_rank"] - 1]
+        reference = _route_candidate_for_rank(
+            result,
+            "reference",
+            pair["reference_route_rank"],
+        )
+        sample = _route_candidate_for_rank(result, "sample", pair["sample_route_rank"])
+        if reference is None or sample is None:
+            state = "selected" if pair["selected"] else "alternative"
+            eligibility = "eligible" if pair["eligible"] else "not eligible"
+            draw.text(
+                (left + 12, top + 8),
+                f"Pair #{pair['pair_rank']}: R{pair['reference_route_rank']} / "
+                f"S{pair['sample_route_rank']} ({state}, {eligibility})",
+                fill=(20, 20, 20),
+                font=body_font,
+            )
+            draw.text(
+                (left + 12, top + 26),
+                f"Candidate geometry unavailable; total cost {pair['total_cost']:.4f}",
+                fill=(55, 55, 55),
+                font=body_font,
+            )
+            costs = pair["cost_breakdown"]
+            draw.text(
+                (left + 12, top + 44),
+                f"Ink fit {costs['reconstruction_fit_cost']:.3f}; "
+                f"model complexity {costs['model_complexity_cost']:.3f}",
+                fill=(75, 75, 75),
+                font=body_font,
+            )
+            continue
         alignment = align_writing_routes(reference, sample)
         reference_strokes = reference.continuous_strokes
         sample_strokes = alignment.aligned_sample_strokes
@@ -1092,6 +1173,14 @@ def _write_route_alternatives(
             fill=(55, 55, 55),
             font=body_font,
         )
+        costs = pair["cost_breakdown"]
+        draw.text(
+            (left + 12, top + 44),
+            f"Ink fit {costs['reconstruction_fit_cost']:.3f}; "
+            f"model complexity {costs['model_complexity_cost']:.3f}",
+            fill=(75, 75, 75),
+            font=body_font,
+        )
         draw.text((left + 14, bottom - 22), "Reference", fill=_REFERENCE, font=body_font)
         draw.text((left + 92, bottom - 22), "Aligned sample", fill=_SAMPLE, font=body_font)
     image.save(output, format="PNG")
@@ -1118,6 +1207,8 @@ def _write_route_cost_breakdown(route_pairs: dict[str, Any], output: Path) -> No
         ("steering_profile_cost", "steering", (225, 75, 55)),
         ("topology_event_compatibility_cost", "topology", (20, 145, 95)),
         ("writing_prior_cost", "writing prior", (230, 160, 35)),
+        ("reconstruction_fit_cost", "ink fit", (60, 150, 190)),
+        ("model_complexity_cost", "complexity", (125, 85, 155)),
     )
     maximum = max(max(pair["total_cost"] for pair in pairs), 1e-12)
     bar_left, bar_width = 240, 780
@@ -1149,7 +1240,7 @@ def _write_route_cost_breakdown(route_pairs: dict[str, Any], output: Path) -> No
     for _key, label, color in terms:
         draw.rectangle((x, legend_y, x + 12, legend_y + 12), fill=color)
         draw.text((x + 17, legend_y - 1), label, fill=(40, 40, 40), font=body_font)
-        x += 190
+        x += 145
     image.save(output, format="PNG")
 
 

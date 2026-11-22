@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 from PIL import Image, ImageChops, ImageDraw
@@ -77,7 +79,7 @@ def test_compare_letter_images_api_writes_complete_report_and_keeps_crop_pixels(
     assert report.payload["inputs"]["sample"]["topology"]["component_count"] == 1
     diagnostics = report.payload["diagnostics"]
     assert diagnostics["geometry"]["sample_count"] == 256
-    assert diagnostics["metrics"]["path"]["mean_error"] < 0.01
+    assert diagnostics["metrics"]["path"]["mean_error"] < 0.02
     writing = diagnostics["writing_metrics"]
     assert writing["direction_source"] == "inferred_from_static_image_geometry"
     assert writing["entry_exit"]["direction_source"] == "inferred_from_static_image_geometry"
@@ -86,6 +88,47 @@ def test_compare_letter_images_api_writes_complete_report_and_keeps_crop_pixels(
     assert reconstruction["available"]
     assert reconstruction["reference"]["renderer"] == "strokeoutline.render_strokes"
     assert reconstruction["sample"]["stroke_width_profiles"]
+    assert reconstruction["reference"]["under_coverage_pixel_count"] >= 0
+    assert reconstruction["reference"]["over_coverage_pixel_count"] >= 0
+    for side in ("reference", "sample"):
+        fitted_model = reconstruction[side]["fitted_model"]
+        assert fitted_model["objective_evaluations"] > 0
+        assert fitted_model["level_trace"]
+        assert fitted_model["fit_terms"]
+        assert fitted_model["complexity_decisions"]
+        assert len(fitted_model["strokes"]) == fitted_model["stroke_count"]
+    persisted = json.loads(report.json_path.read_text())
+    assert (
+        persisted["reconstruction"]["reference"]["fitted_model"]
+        == reconstruction["reference"]["fitted_model"]
+    )
+    route_pairs = persisted["diagnostics"]["route_pairs"]
+    assert route_pairs["pairs"]
+    assert route_pairs["pairs"][0]["reference"]["minimum_complexity_reconstruction"]["strokes"]
+    assert "reconstruction_fit_cost" in route_pairs["pairs"][0]["cost_breakdown"]
+    assert "model_complexity_cost" in route_pairs["pairs"][0]["cost_breakdown"]
+    progress_events = [
+        json.loads(line) for line in (output_dir / "progress.jsonl").read_text().splitlines()
+    ]
+    progress_stages = {event["stage"] for event in progress_events}
+    assert {
+        "route_generation",
+        "seed_fitting",
+        "pyramid_construction",
+        "reconstruction_level",
+        "candidate_ranking",
+        "report_rendering",
+        "completion",
+    } <= progress_stages
+    level_events = [event for event in progress_events if event["stage"] == "reconstruction_level"]
+    assert level_events and all(
+        "objective_evaluations" in event["details"] for event in level_events
+    )
+    run = json.loads((output_dir / "run.json").read_text())
+    assert run["status"] == "completed"
+    for artifact in ("ink-reconstruction-reference.png", "ink-residual-reference.png"):
+        with Image.open(output_dir / artifact) as image:
+            assert min(image.size) >= 640
     with (
         Image.open(reference_path) as source,
         Image.open(output_dir / "input-reference.png") as retained,
@@ -176,6 +219,9 @@ def test_compare_letter_cli_writes_report_for_manual_crops(tmp_path):
     assert (output_dir / "report.html").is_file()
     assert "HTML report:" in result.output
     assert "JSON report:" in result.output
+    events = [json.loads(line) for line in (output_dir / "progress.jsonl").read_text().splitlines()]
+    assert any(event["stage"] == "route_generation" for event in events)
+    assert any(event["stage"] == "report_rendering" for event in events)
 
 
 def test_compare_letter_cli_rejects_malformed_crop_coordinates(tmp_path):

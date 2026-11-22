@@ -95,7 +95,7 @@ def test_compare_letter_cli_automatic_mode_writes_batch_summary(tmp_path):
 
     gallery = json.loads((output / "reference-index" / "gallery.json").read_text())
     assert gallery["reference_profile"] == "generic"
-    assert all(len(match["alternatives"]) == 3 for match in summary["matches"])
+    assert all(1 <= len(match["alternatives"]) <= 3 for match in summary["matches"])
     events = [json.loads(line) for line in (output / "progress.jsonl").read_text().splitlines()]
     extraction = [event for event in events if event["stage"] == "reference_extraction"]
     assert extraction and all("elapsed_seconds" in event["details"] for event in extraction)

@@ -412,6 +412,18 @@ def evaluate_writing_route_pairs(
                 reference_descriptors[reference_rank - 1],
                 sample_descriptors[sample_rank - 1],
             )
+            reconstruction_fit_cost = sum(
+                value
+                for candidate in (reference, sample)
+                if candidate.reconstruction is not None
+                for _, value in candidate.reconstruction.fit_terms
+            )
+            model_complexity_cost = sum(
+                value
+                for candidate in (reference, sample)
+                if candidate.reconstruction is not None
+                for _, value in candidate.reconstruction.complexity_terms
+            )
             selection_cost = sum(
                 (
                     intrinsic,
@@ -420,6 +432,8 @@ def evaluate_writing_route_pairs(
                     topology,
                     writing_prior_cost,
                     descriptor_cost,
+                    reconstruction_fit_cost,
+                    model_complexity_cost,
                 )
             )
             pair_scores.append(
@@ -434,6 +448,8 @@ def evaluate_writing_route_pairs(
                     geometry_cost=geometry_cost,
                     writing_prior_cost=writing_prior_cost,
                     descriptor_matching_cost=descriptor_cost,
+                    reconstruction_fit_cost=reconstruction_fit_cost,
+                    model_complexity_cost=model_complexity_cost,
                     pen_lift_count=(
                         reference.hypothesis.pen_lift_count + sample.hypothesis.pen_lift_count
                     ),
@@ -531,13 +547,20 @@ def evaluate_writing_route_pairs(
         + best.topology_event_compatibility_cost
         + best.descriptor_matching_cost
     )
+    reference_ambiguous = near_tie or reference.ambiguous or reference_status == "ambiguous"
+    sample_ambiguous = near_tie or sample.ambiguous or sample_status == "ambiguous"
     reference = replace(
         reference,
         score=replace(reference.score, counterpart_similarity_cost=counterpart_cost),
         orientation_status=reference_status,
         orientation_evidence=reference_evidence,
         orientation_margin=reference_margin,
-        ambiguous=reference.ambiguous or reference_status == "ambiguous",
+        ambiguous=reference_ambiguous,
+        reconstruction=(
+            replace(reference.reconstruction, ambiguous=reference_ambiguous)
+            if reference.reconstruction is not None
+            else None
+        ),
     )
     sample = replace(
         sample,
@@ -545,7 +568,12 @@ def evaluate_writing_route_pairs(
         orientation_status=sample_status,
         orientation_evidence=sample_evidence,
         orientation_margin=sample_margin,
-        ambiguous=sample.ambiguous or sample_status == "ambiguous",
+        ambiguous=sample_ambiguous,
+        reconstruction=(
+            replace(sample.reconstruction, ambiguous=sample_ambiguous)
+            if sample.reconstruction is not None
+            else None
+        ),
     )
     return WritingRoutePairSelection(
         reference=reference,

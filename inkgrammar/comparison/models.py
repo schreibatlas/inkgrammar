@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from planarcurve.fitting import TrajectoryModelSelectionResult
 
     from .descriptors import RouteDescriptor
+    from .refinement import MinimumComplexityReconstruction
 InkMode = MaskMode
 InkMaskResult = MaskResult
 
@@ -254,6 +255,9 @@ class WritingRouteCandidate:
     orientation_group: int = 0
     glyph_endpoints: tuple[tuple[float, float], ...] = ()
     writing_prior: WritingPriorScore | None = None
+    reconstruction: MinimumComplexityReconstruction | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
 @dataclass(frozen=True)
@@ -266,6 +270,8 @@ class WritingRoutePairScore:
     topology_event_compatibility_cost: float
     total_cost: float
     geometry_cost: float = 0.0
+    reconstruction_fit_cost: float = 0.0
+    model_complexity_cost: float = 0.0
     writing_prior_cost: float = 0.0
     pen_lift_count: int = 0
     descriptor_matching_cost: float = 0.0
@@ -281,6 +287,8 @@ class WritingRoutePairScore:
             "topology_event_compatibility_cost": self.topology_event_compatibility_cost,
             "writing_prior_cost": self.writing_prior_cost,
             "descriptor_matching_cost": self.descriptor_matching_cost,
+            "reconstruction_fit_cost": self.reconstruction_fit_cost,
+            "model_complexity_cost": self.model_complexity_cost,
         }
 
     def __post_init__(self) -> None:

@@ -12,7 +12,7 @@ from .geometry import (
     continuous_differential_geometry,
     legacy_differential_geometry_from_polyline,
 )
-from .models import ComparisonResult
+from .models import ComparisonResult, WritingRouteCandidate
 from .path import resample_continuous_path, reverse_continuous_path
 from .reconstruction import reconstruct_route_ink
 from .steering import steering_model_summary
@@ -27,6 +27,94 @@ class ComparisonAnalysis:
     sample_width_px: np.ndarray
     series: dict[str, np.ndarray]
     metrics: dict[str, Any]
+
+
+def reconstruction_model_payload(
+    candidate: WritingRouteCandidate,
+    *,
+    route_rank: int | None = None,
+) -> dict[str, Any] | None:
+    reconstruction = candidate.reconstruction
+    if reconstruction is None:
+        return None
+
+    strokes = []
+    for stroke in reconstruction.strokes:
+        heading_rate = stroke.trajectory.heading_rate
+        strokes.append(
+            {
+                "trajectory": {
+                    "length": float(stroke.trajectory.length),
+                    "start_heading_deg": float(stroke.trajectory.start_heading_deg),
+                    "heading_rate": {
+                        "start_rate_deg_per_u": float(heading_rate.start_rate_deg_per_u),
+                        "end_rate_deg_per_u": float(heading_rate.end_rate_deg_per_u),
+                        "interpolation": heading_rate.interpolation,
+                        "changes": [
+                            {
+                                "at": float(change.at),
+                                "heading_rate_deg_per_u": float(change.heading_rate_deg_per_u),
+                            }
+                            for change in heading_rate.changes
+                        ],
+                    },
+                },
+                "transform": {
+                    "scale": float(stroke.transform.scale),
+                    "rotation_deg": float(stroke.transform.rotation_deg),
+                    "dx": float(stroke.transform.dx),
+                    "dy": float(stroke.transform.dy),
+                },
+                "width_profile": {
+                    "start_width_px": float(stroke.width.start_width_px),
+                    "end_width_px": float(stroke.width.end_width_px),
+                    "changes": [
+                        {"at": float(change.at), "width_px": float(change.width_px)}
+                        for change in stroke.width.changes
+                    ],
+                },
+            }
+        )
+
+    return {
+        "route_rank": route_rank,
+        "ambiguous": bool(candidate.ambiguous or reconstruction.ambiguous),
+        "stroke_count": len(reconstruction.strokes),
+        "pen_lift_count": candidate.hypothesis.pen_lift_count,
+        "energy": float(reconstruction.energy),
+        "fit_terms": dict(reconstruction.fit_terms),
+        "complexity_terms": dict(reconstruction.complexity_terms),
+        "objective_evaluations": reconstruction.objective_evaluations,
+        "topology_preserved": reconstruction.topology_preserved,
+        "strokes": strokes,
+        "level_trace": [
+            {
+                "level_index": level.level_index,
+                "scale_x": float(level.scale_x),
+                "scale_y": float(level.scale_y),
+                "objective_before": float(level.objective_before),
+                "objective_after": float(level.objective_after),
+                "iterations": level.iterations,
+                "accepted_geometry_changes": level.accepted_geometry_changes,
+                "accepted_width_changes": level.accepted_width_changes,
+            }
+            for level in reconstruction.levels
+        ],
+        "complexity_decisions": {
+            "accepted_geometry_changes": sum(
+                level.accepted_geometry_changes for level in reconstruction.levels
+            ),
+            "accepted_width_changes": sum(
+                level.accepted_width_changes for level in reconstruction.levels
+            ),
+            "final_heading_rate_change_count": sum(
+                len(stroke.trajectory.heading_rate.changes) for stroke in reconstruction.strokes
+            ),
+            "final_width_change_count": sum(
+                len(stroke.width.changes) for stroke in reconstruction.strokes
+            ),
+        },
+    }
 
 
 def _angle_difference(first: np.ndarray, second: np.ndarray) -> np.ndarray:
@@ -159,9 +247,9 @@ def _reconstruction_metrics(
         "sample": {},
     }
     series: dict[str, np.ndarray] = {}
-    for side, extracted, candidate in (
-        ("reference", result.reference, selection.reference),
-        ("sample", result.sample, selection.sample),
+    for side, extracted, candidate, route_rank in (
+        ("reference", result.reference, selection.reference, selection.score.reference_rank),
+        ("sample", result.sample, selection.sample, selection.score.sample_rank),
     ):
         evidence = extracted.foreground_evidence
         if evidence is None:
@@ -176,6 +264,7 @@ def _reconstruction_metrics(
                 }
                 for profile in reconstruction.width_profiles
             ],
+            "fitted_model": reconstruction_model_payload(candidate, route_rank=route_rank),
         }
         series[f"{side}_observed_ink"] = reconstruction.observed_mask
         series[f"{side}_rendered_coverage"] = reconstruction.rendered_coverage

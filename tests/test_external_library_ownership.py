@@ -100,3 +100,24 @@ def test_external_geometry_libraries_do_not_depend_on_inkgrammar() -> None:
         package_root = Path(spec.origin).parent
         offenders = [path for path in package_root.rglob("*.py") if _imports_inkgrammar(path)]
         assert not offenders, f"{package_name} imports InkGrammar: {offenders}"
+
+
+def test_reconstruction_delegates_math_pyramid_and_raster_ownership() -> None:
+    assert {
+        "TrajectoryFitOptions",
+        "fit_trajectory",
+        "refine_trajectory_model",
+    } <= _imports_from("comparison/refinement.py", "planarcurve.fitting")
+    assert "evaluate_trajectory" in _imports_from(
+        "comparison/refinement.py", "planarcurve.trajectory"
+    )
+    assert "Similarity2D" in _imports_from("comparison/refinement.py", "planarcurve.transforms")
+    assert "foreground_pyramid" in _imports_from("comparison/refinement.py", "rasterregions")
+    assert "trajectory_to_cubic_path" in _imports_from(
+        "comparison/reconstruction.py", "planarcurve.trajectory"
+    )
+    assert "transform_cubic_path" in _imports_from(
+        "comparison/reconstruction.py", "planarcurve.transforms"
+    )
+    assert "render_strokes" in _imports_from("comparison/reconstruction.py", "strokeoutline")
+    assert "covering_walk" in _imports_from("comparison/path.py", "skeletonpaths")

@@ -258,6 +258,7 @@ def test_reference_hypothesis_invariant_falls_back_to_detected_anchor_counts(tmp
 
 def test_reference_ownership_validation_rejects_overlapping_regions(tmp_path):
     from dataclasses import replace
+    from types import SimpleNamespace
 
     from inkgrammar.comparison.segmentation import _reference_ownership_error
 
@@ -268,7 +269,14 @@ def test_reference_ownership_validation_rejects_overlapping_regions(tmp_path):
     result = rr.detect_spaced_regions(path, mode="dark")
     region = result.regions[0]
     duplicate = replace(region, reading_order=region.reading_order + 1)
-    overlapping = replace(result, regions=(region, duplicate))
+    overlapping = SimpleNamespace(
+        status=result.status,
+        clean_mask=result.clean_mask,
+        rows=result.rows,
+        regions=(region, duplicate),
+        unassigned_mask=result.unassigned_mask,
+        diagnostics=result.diagnostics,
+    )
 
     assert _reference_ownership_error(overlapping) == (
         "Reference regions have overlapping foreground ownership."

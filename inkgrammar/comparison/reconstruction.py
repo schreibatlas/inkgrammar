@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 from planarcurve import Affine2D
-from rasterregions import ForegroundEvidence
+from planarcurve.trajectory import trajectory_to_cubic_path
+from planarcurve.transforms import transform_cubic_path
+from rasterregions import ForegroundEvidence, ForegroundPyramidLevel
 from strokeoutline import (
     OutlineConfig,
     RasterFrame,
@@ -15,6 +18,9 @@ from strokeoutline import (
 )
 
 from .models import ContinuousPath, WritingRouteCandidate
+
+if TYPE_CHECKING:
+    from .refinement import ReconstructedStrokeModel
 
 
 @dataclass(frozen=True)
@@ -90,6 +96,49 @@ def _interpolate_width_profile(
     return width_at
 
 
+def render_reconstructed_strokes(
+    strokes: tuple[ReconstructedStrokeModel, ...],
+    level: ForegroundPyramidLevel,
+    supersampling: int,
+) -> np.ndarray:
+    frame = RasterFrame(level.shape[1], level.shape[0], Affine2D.identity())
+    inputs = []
+    width_scale = float(np.sqrt(level.scale_x * level.scale_y))
+    for index, stroke in enumerate(strokes):
+        path = trajectory_to_cubic_path(stroke.trajectory)
+        path = transform_cubic_path(path, stroke.transform)
+        path = transform_cubic_path(
+            path,
+            Affine2D.scale(level.scale_x, level.scale_y),
+        )
+        inputs.append(
+            StrokeInput(
+                id=f"stroke-{index + 1}",
+                path=path,
+                width=lambda progress, profile=stroke.width: (
+                    profile.width_at(float(progress)) * width_scale
+                ),
+                outline_config=OutlineConfig(
+                    width_parameterization="arclength",
+                    max_normal_angle_degrees=12.0 if supersampling <= 2 else 6.0,
+                ),
+            )
+        )
+    rendered = render_strokes(inputs, raster_frame=frame, supersampling=supersampling)
+    assert rendered.combined_coverage is not None
+    return rendered.combined_coverage
+
+
+def _reconstructed_width_profiles(
+    strokes: tuple[ReconstructedStrokeModel, ...],
+) -> tuple[tuple[tuple[float, float], ...], ...]:
+    progress = np.linspace(0.0, 1.0, 33)
+    return tuple(
+        tuple((float(position), stroke.width.width_at(float(position))) for position in progress)
+        for stroke in strokes
+    )
+
+
 def render_route_coverage(
     candidate: WritingRouteCandidate,
     *,
@@ -97,6 +146,14 @@ def render_route_coverage(
     frame_height: int,
     supersampling: int = 4,
 ) -> tuple[np.ndarray, tuple[tuple[tuple[float, float], ...], ...]]:
+    reconstruction = candidate.reconstruction
+    if reconstruction is not None:
+        if reconstruction.rendered_coverage.shape != (frame_height, frame_width):
+            raise ValueError("reconstructed coverage must match the requested rendering frame")
+        return (
+            reconstruction.rendered_coverage,
+            _reconstructed_width_profiles(reconstruction.strokes),
+        )
     frame = RasterFrame(frame_width, frame_height, Affine2D.identity())
     strokes = []
     width_profiles = []

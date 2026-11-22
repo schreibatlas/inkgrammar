@@ -23,6 +23,12 @@ _STAGE_INDEX = {
     "batch_summary": 12,
     "completion": 13,
     "failure": 13,
+    "route_generation": 1,
+    "seed_fitting": 2,
+    "pyramid_construction": 3,
+    "reconstruction_level": 4,
+    "candidate_ranking": 5,
+    "report_rendering": 11,
 }
 
 

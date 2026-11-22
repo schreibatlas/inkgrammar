@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
-from rasterregions import MaskMode, MaskResult, foreground_evidence
+from rasterregions import MaskMode, MaskResult, foreground_evidence, foreground_pyramid
 from skeletonpaths import (
     SkeletonAnalysis,
     SubpixelReconstructionError,
@@ -36,15 +36,25 @@ from .path import (
     recover_ordered_path,
     resample_path,
 )
+from .progress import ProgressReporter
+from .reconstruction import render_reconstructed_strokes
 from .report import WrittenComparisonReport, write_comparison_report
 from .routes import (
+    ROUTE_REPORT_LIMIT,
     align_writing_routes,
     evaluate_writing_route_pairs,
     generate_writing_route_candidates,
 )
 from .segmentation import SegmentedGlyph
 from .skeleton import analyze_skeleton, diagnostics_from_analysis
-from .steering import fit_writing_route_candidates, steering_profile_distance
+from .steering import (
+    fit_writing_route_candidate,
+    fit_writing_route_candidates,
+    steering_profile_distance,
+)
+
+if TYPE_CHECKING:
+    from .refinement import ReconstructionRefinementConfig
 
 
 def _route_paths(
@@ -126,6 +136,173 @@ def _with_selected_route(
         resampled_xy=resample_path(path.xy),
         selected_route=candidate,
     )
+
+
+def _candidate_descriptors(
+    extracted: ExtractedLetter,
+    candidates: tuple[WritingRouteCandidate, ...],
+):
+    if not extracted.route_descriptors:
+        return tuple(route_descriptor(candidate, extracted) for candidate in candidates)
+    descriptors = {
+        (candidate.orientation_group, candidate.orientation_variant): descriptor
+        for candidate, descriptor in zip(
+            extracted.route_candidates,
+            extracted.route_descriptors,
+            strict=True,
+        )
+    }
+    return tuple(
+        descriptors.get(
+            (candidate.orientation_group, candidate.orientation_variant),
+            route_descriptor(candidate, extracted),
+        )
+        for candidate in candidates
+    )
+
+
+def _shortlist_route_candidates(
+    reference: ExtractedLetter,
+    sample: ExtractedLetter,
+    config: ReconstructionRefinementConfig,
+) -> tuple[tuple[WritingRouteCandidate, ...], tuple[WritingRouteCandidate, ...]]:
+    attempt_limit = max(5, 3 * config.max_route_candidates)
+    pool_limit = min(
+        min(len(reference.route_candidates), len(sample.route_candidates)),
+        max(12, 2 * attempt_limit),
+    )
+    reference_pool = tuple(
+        sorted(reference.route_candidates, key=lambda candidate: candidate.score.intrinsic_cost)[
+            :pool_limit
+        ]
+    )
+    sample_pool = tuple(
+        sorted(sample.route_candidates, key=lambda candidate: candidate.score.intrinsic_cost)[
+            :pool_limit
+        ]
+    )
+    preliminary = evaluate_writing_route_pairs(
+        reference_pool,
+        sample_pool,
+        reference_descriptors=_candidate_descriptors(reference, reference_pool),
+        sample_descriptors=_candidate_descriptors(sample, sample_pool),
+    )
+    reference_ranks = []
+    sample_ranks = []
+    for pair in preliminary.alternatives:
+        if pair.reference_rank not in reference_ranks:
+            reference_ranks.append(pair.reference_rank)
+        if pair.sample_rank not in sample_ranks:
+            sample_ranks.append(pair.sample_rank)
+        if len(reference_ranks) >= attempt_limit and len(sample_ranks) >= attempt_limit:
+            break
+    return (
+        tuple(reference_pool[rank - 1] for rank in reference_ranks),
+        tuple(sample_pool[rank - 1] for rank in sample_ranks),
+    )
+
+
+def _reconstruction_rank(candidate: WritingRouteCandidate) -> tuple[float, float, int, str]:
+    reconstruction = candidate.reconstruction
+    fit_cost = (
+        sum(value for _, value in reconstruction.fit_terms) if reconstruction is not None else 0.0
+    )
+    complexity_cost = (
+        sum(value for _, value in reconstruction.complexity_terms)
+        if reconstruction is not None
+        else 0.0
+    )
+    return (
+        candidate.score.intrinsic_cost + fit_cost + complexity_cost,
+        candidate.score.intrinsic_cost,
+        candidate.orientation_group,
+        candidate.orientation_variant,
+    )
+
+
+def _reconstruct_route_candidates(
+    extracted: ExtractedLetter,
+    candidates: tuple[WritingRouteCandidate, ...],
+    config: ReconstructionRefinementConfig,
+    *,
+    side_label: str,
+    progress_callback: Callable[..., None] | None = None,
+) -> tuple[WritingRouteCandidate, ...]:
+    from .refinement import fit_minimum_complexity_reconstruction, seed_reconstructed_strokes
+
+    evidence = extracted.foreground_evidence
+    if evidence is None:
+        evidence = foreground_evidence(extracted.image, mode=extracted.mask_result.method)
+    attempt_limit = min(len(candidates), max(5, 3 * config.max_route_candidates))
+    fitted = []
+    ordered_candidates = sorted(candidates, key=lambda candidate: candidate.score.intrinsic_cost)[
+        :attempt_limit
+    ]
+    for attempt_index, source in enumerate(ordered_candidates, start=1):
+        if progress_callback is not None:
+            progress_callback(
+                "seed_fitting",
+                completed=attempt_index,
+                total=attempt_limit,
+                details={
+                    "message": f"Fit {side_label} route seed {attempt_index}/{attempt_limit}",
+                    "side": side_label,
+                    "candidate_index": attempt_index,
+                    "candidate_count": attempt_limit,
+                },
+            )
+        candidate = fit_writing_route_candidate(source)
+        strokes = seed_reconstructed_strokes(candidate)
+        if any(stroke.transform.scale * stroke.trajectory.length <= 1e-6 for stroke in strokes):
+            continue
+        fitted.append(candidate)
+        if len(fitted) == config.max_route_candidates:
+            break
+    if not fitted:
+        raise PathExtractionError("no bounded route candidate has a renderable trajectory seed")
+
+    if progress_callback is not None:
+        progress_callback(
+            "pyramid_construction",
+            completed=1,
+            total=1,
+            details={"message": f"Build {side_label} foreground pyramid"},
+        )
+    pyramid = foreground_pyramid(evidence, scales=config.scales)
+    reconstructed = tuple(
+        replace(
+            candidate,
+            reconstruction=fit_minimum_complexity_reconstruction(
+                candidate,
+                evidence,
+                render_reconstructed_strokes,
+                config=config,
+                pyramid=pyramid,
+                progress_callback=progress_callback,
+                candidate_index=candidate_index,
+                candidate_count=len(fitted),
+            ),
+        )
+        for candidate_index, candidate in enumerate(fitted, start=1)
+    )
+    ranked = tuple(sorted(reconstructed, key=_reconstruction_rank))
+    if progress_callback is not None:
+        progress_callback(
+            "candidate_ranking",
+            completed=len(ranked),
+            total=len(ranked),
+            details={
+                "message": f"Rank {side_label} reconstructed routes",
+                "side": side_label,
+                "candidate_count": len(ranked),
+                "objective_evaluations": sum(
+                    candidate.reconstruction.objective_evaluations
+                    for candidate in ranked
+                    if candidate.reconstruction is not None
+                ),
+            },
+        )
+    return ranked
 
 
 def extract_letter(
@@ -227,6 +404,8 @@ def compare_extracted_letters(
     writing_direction_policy: WritingDirectionPolicy | None = None,
     route_pair_selection: WritingRoutePairSelection | None = None,
     identity_status: Literal["accepted", "candidate_diagnostic"] = "accepted",
+    reconstruction_config: ReconstructionRefinementConfig | None = None,
+    progress_callback: Callable[..., None] | None = None,
 ) -> ComparisonResult:
     """Compare extracted glyphs, using jointly selected routes when available."""
     warnings = [
@@ -236,26 +415,94 @@ def compare_extracted_letters(
     ]
     route_selection = route_pair_selection
     if reference.route_candidates and sample.route_candidates:
-        reference_candidates = fit_writing_route_candidates(reference.route_candidates)
-        sample_candidates = fit_writing_route_candidates(sample.route_candidates)
-        reference = replace(reference, route_candidates=reference_candidates)
-        sample = replace(sample, route_candidates=sample_candidates)
-        route_selection = route_selection or evaluate_writing_route_pairs(
-            reference_candidates,
-            sample_candidates,
-            steering_distance=steering_profile_distance,
-            direction_policy=writing_direction_policy,
-            reference_descriptors=(
-                reference.route_descriptors
-                or tuple(
-                    route_descriptor(candidate, reference) for candidate in reference_candidates
+        if route_selection is None and reconstruction_config is not None:
+            if progress_callback is not None:
+                progress_callback(
+                    "candidate_ranking",
+                    completed=0,
+                    total=1,
+                    details={"message": "Shortlist route candidates"},
                 )
-            ),
-            sample_descriptors=(
-                sample.route_descriptors
-                or tuple(route_descriptor(candidate, sample) for candidate in sample_candidates)
-            ),
+            reference_shortlist, sample_shortlist = _shortlist_route_candidates(
+                reference, sample, reconstruction_config
+            )
+            if progress_callback is not None:
+                progress_callback(
+                    "candidate_ranking",
+                    completed=1,
+                    total=1,
+                    details={"message": "Shortlisted route candidates"},
+                )
+            reference_candidates = _reconstruct_route_candidates(
+                reference,
+                reference_shortlist,
+                reconstruction_config,
+                side_label="reference",
+                progress_callback=progress_callback,
+            )
+            sample_candidates = _reconstruct_route_candidates(
+                sample,
+                sample_shortlist,
+                reconstruction_config,
+                side_label="sample",
+                progress_callback=progress_callback,
+            )
+            reference_descriptors = _candidate_descriptors(reference, reference_candidates)
+            sample_descriptors = _candidate_descriptors(sample, sample_candidates)
+        else:
+            reference_sources = tuple(
+                sorted(
+                    reference.route_candidates,
+                    key=lambda candidate: candidate.score.intrinsic_cost,
+                )[:ROUTE_REPORT_LIMIT]
+            )
+            sample_sources = tuple(
+                sorted(
+                    sample.route_candidates,
+                    key=lambda candidate: candidate.score.intrinsic_cost,
+                )[:ROUTE_REPORT_LIMIT]
+            )
+            reference_candidates = fit_writing_route_candidates(reference_sources)
+            sample_candidates = fit_writing_route_candidates(sample_sources)
+            reference_descriptors = _candidate_descriptors(reference, reference_candidates)
+            sample_descriptors = _candidate_descriptors(sample, sample_candidates)
+        reference = replace(
+            reference,
+            route_candidates=reference_candidates,
+            route_descriptors=reference_descriptors,
         )
+        sample = replace(
+            sample,
+            route_candidates=sample_candidates,
+            route_descriptors=sample_descriptors,
+        )
+        if route_selection is None:
+            if progress_callback is not None:
+                progress_callback(
+                    "candidate_ranking",
+                    completed=0,
+                    total=1,
+                    details={"message": "Score reference/sample route pairs"},
+                )
+            route_selection = evaluate_writing_route_pairs(
+                reference_candidates,
+                sample_candidates,
+                steering_distance=steering_profile_distance,
+                direction_policy=writing_direction_policy,
+                reference_descriptors=reference_descriptors,
+                sample_descriptors=sample_descriptors,
+            )
+            if progress_callback is not None:
+                progress_callback(
+                    "candidate_ranking",
+                    completed=1,
+                    total=1,
+                    details={
+                        "message": "Ranked route pairs",
+                        "pair_count": len(route_selection.alternatives),
+                    },
+                )
+    if route_selection is not None and reference.route_candidates and sample.route_candidates:
         reference = _with_selected_route(reference, route_selection.reference)
         sample = _with_selected_route(sample, route_selection.sample)
         warnings.append(
@@ -332,22 +579,74 @@ def compare_letter_images(
     smoothing_window: int = 11,
     smoothing_polynomial_order: int = 2,
     writing_direction_policy: WritingDirectionPolicy | None = None,
+    reconstruction_config: ReconstructionRefinementConfig | None = None,
 ) -> WrittenComparisonReport:
     """Compare two manually cropped images of the same known letter."""
     if len(letter) != 1:
         raise ValueError("letter label must contain exactly one character")
-    reference = extract_letter(reference_path, reference_crop, ink_mode=reference_ink_mode)
-    sample = extract_letter(sample_path, sample_crop, ink_mode=sample_ink_mode)
-    result = compare_extracted_letters(
-        reference,
-        sample,
-        identity=ComparisonIdentity(
-            sample_id=Path(sample_path).stem or "sample",
-            reference_id=Path(reference_path).stem or "reference",
-            label=letter,
-        ),
-        smoothing_window=smoothing_window,
-        smoothing_polynomial_order=smoothing_polynomial_order,
-        writing_direction_policy=writing_direction_policy,
+    if reconstruction_config is None:
+        from .refinement import ReconstructionRefinementConfig
+
+        reconstruction_config = ReconstructionRefinementConfig(
+            scales=(0.5, 1.0),
+            max_route_candidates=2,
+            max_geometry_changes=1,
+            max_width_changes=1,
+            supersampling_coarse=1,
+            supersampling_fine=2,
+            max_iterations_per_level=8,
+        )
+    progress = ProgressReporter(
+        output_dir,
+        enabled=True,
+        verbose=False,
+        expected_samples=1,
     )
-    return write_comparison_report(result, output_dir)
+    try:
+        progress.stage(
+            "route_generation",
+            completed=1,
+            total=2,
+            details={"message": "Generate reference route candidates"},
+        )
+        reference = extract_letter(reference_path, reference_crop, ink_mode=reference_ink_mode)
+        progress.stage(
+            "route_generation",
+            completed=2,
+            total=2,
+            details={"message": "Generate sample route candidates"},
+        )
+        sample = extract_letter(sample_path, sample_crop, ink_mode=sample_ink_mode)
+        result = compare_extracted_letters(
+            reference,
+            sample,
+            identity=ComparisonIdentity(
+                sample_id=Path(sample_path).stem or "sample",
+                reference_id=Path(reference_path).stem or "reference",
+                label=letter,
+            ),
+            smoothing_window=smoothing_window,
+            smoothing_polynomial_order=smoothing_polynomial_order,
+            writing_direction_policy=writing_direction_policy,
+            reconstruction_config=reconstruction_config,
+            progress_callback=progress.stage,
+        )
+        progress.stage(
+            "report_rendering",
+            details={"message": "Render comparison report"},
+        )
+        report = write_comparison_report(result, output_dir)
+        progress.complete(
+            {
+                "output_dir": str(report.output_dir),
+                "report_json": str(report.json_path),
+                "report_markdown": str(report.markdown_path),
+                "report_html": str(report.html_path),
+                "progress_jsonl": str(progress.progress_path),
+                "run_json": str(progress.run_path),
+            }
+        )
+        return report
+    except Exception as error:
+        progress.fail(error)
+        raise
