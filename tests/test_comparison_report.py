@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 
+import pytest
 from PIL import Image, ImageDraw
 from planarcurve.transforms import Similarity2D
 
@@ -215,6 +216,32 @@ def test_report_v3_renders_lowercase_e_routes_and_ink_residuals(tmp_path) -> Non
     selected_score = report.payload["diagnostics"]["selected_route_pair"]["score"]
     assert "writing_prior_cost" in selected_score
     assert "pen_lift_count" in selected_score
+    selected_pair = report.payload["diagnostics"]["selected_route_pair"]
+    assert selected_pair["reference_rank"] == result.route_selection.score.reference_rank
+    assert selected_pair["sample_rank"] == result.route_selection.score.sample_rank
+    route_pairs = report.payload["diagnostics"]["route_pairs"]
+    assert route_pairs["evaluated_pair_count"] == len(result.route_selection.alternatives)
+    assert route_pairs["selected_pair"]["selected"] is True
+    assert route_pairs["selected_pair"]["eligible"] is True
+    assert route_pairs["selected_pair"]["reference_route_rank"] == selected_pair["reference_rank"]
+    assert route_pairs["selected_pair"]["sample_route_rank"] == selected_pair["sample_rank"]
+    assert all(
+        pair["total_cost"] == pytest.approx(sum(pair["cost_breakdown"].values()))
+        for pair in route_pairs["pairs"]
+    )
+    assert json.loads((report.output_dir / "route-pairs.json").read_text()) == route_pairs
+    for artifact in ("route-alternatives.png", "route-cost-breakdown.png"):
+        with Image.open(report.output_dir / artifact) as image:
+            assert image.width >= 1000
+    assert selected_score["cost_breakdown"] == result.route_selection.score.cost_breakdown
+    assert selected_pair["alternatives"][0]["cost_breakdown"] == selected_score["cost_breakdown"]
+    assert all(
+        alternative["total_cost"] == pytest.approx(sum(alternative["cost_breakdown"].values()))
+        for alternative in selected_pair["alternatives"]
+    )
+    assert selected_score["total_cost"] == pytest.approx(
+        sum(selected_score["cost_breakdown"].values())
+    )
     route_svg = (report.output_dir / "writing-path-overlay.svg").read_text()
     assert route_svg.count("<polyline") == (
         report.payload["writing"]["reference"]["stroke_count"]
@@ -251,10 +278,15 @@ def test_report_v3_renders_lowercase_e_routes_and_ink_residuals(tmp_path) -> Non
         assert (report.output_dir / artifact).is_file()
     markdown = report.markdown_path.read_text()
     assert "2. How the selected route differs" in markdown
-    assert "4. Ink reconstruction" in markdown
+    assert "5. Ink reconstruction" in markdown
     html = report.html_path.read_text()
     assert "junction circles mark physical semantic regions" in html.lower()
     assert "under-coverage" in html
+    assert "Routing alternatives" in html
+    assert "Why this pair won" in html
+    assert "route-pairs.json" in html
+    assert "Clean reference mask" in html
+    assert "not source ink" in html
 
 
 def test_raster_only_report_uses_v3_unavailable_sections(tmp_path) -> None:
@@ -270,10 +302,40 @@ def test_raster_only_report_uses_v3_unavailable_sections(tmp_path) -> None:
     assert report.payload["writing"]["available"] is False
     assert report.payload["reconstruction"]["available"] is False
     assert report.payload["diagnostics"]["selected_route_pair"] is None
+    assert report.payload["diagnostics"]["route_pairs"]["evaluated_pair_count"] == 0
+    assert (report.output_dir / "route-pairs.json").is_file()
+    assert (report.output_dir / "route-alternatives.png").is_file()
+    assert (report.output_dir / "route-cost-breakdown.png").is_file()
     assert report.payload["provenance"]["unmeasured_properties"]
     assert (report.output_dir / "overlay-raster.png").is_file()
     assert "Engineering diagnostics" in report.markdown_path.read_text()
     assert "Full report JSON" in report.html_path.read_text()
+    assert "Clean reference mask" in report.html_path.read_text()
+    assert report.payload["writing_feedback"] is not None
+
+
+def test_extraction_overlay_uses_unlabeled_endpoints_and_saves_clean_mask(
+    tmp_path, monkeypatch
+) -> None:
+    import inkgrammar.comparison.report as report_module
+
+    letter = _extracted_letter("sample.png", "black")
+    labels = []
+    draw_point = report_module._draw_point
+
+    def record_label(draw, xy, color, label=None):
+        labels.append(label)
+        draw_point(draw, xy, color, label)
+
+    monkeypatch.setattr(report_module, "_draw_point", record_label)
+    report_module._write_extraction_images(letter, tmp_path, "sample")
+
+    endpoint_count = len(letter.diagnostics.topology.endpoints)
+    labeled_endpoint_count = min(2, endpoint_count)
+    assert labels[:labeled_endpoint_count] == [None] * labeled_endpoint_count
+    assert not {"A", "B"}.intersection(labels)
+    assert (tmp_path / "mask-sample.png").is_file()
+    assert (tmp_path / "extraction-sample.png").is_file()
 
 
 def test_report_records_selected_legacy_fallback(tmp_path) -> None:

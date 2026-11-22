@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw
 from rasterregions import Component, MaskMethod, MaskMode, MaskResult, SpacedSegmentationHypotheses
 from rasterregions.io import spaced_hypotheses_payload, write_spaced_hypotheses
 
-from .models import CropRect
+from .models import CropRect, WritingStructurePolicy
 
 
 @dataclass(frozen=True)
@@ -29,6 +29,10 @@ class SegmentedGlyph:
     mask: np.ndarray
     label: str | None = None
     component_indices: tuple[int, ...] = ()
+    primary_component_indices: tuple[int, ...] = ()
+    secondary_component_indices: tuple[int, ...] = ()
+    ambiguous_component_indices: tuple[int, ...] = ()
+    secondary_mark_centroids: tuple[tuple[float, float], ...] = ()
     warnings: tuple[str, ...] = ()
     mask_method: MaskMethod = "grayscale"
 
@@ -45,6 +49,40 @@ class SegmentedGlyph:
         object.__setattr__(self, "mask", mask)
         object.__setattr__(self, "component_indices", tuple(self.component_indices))
         object.__setattr__(self, "warnings", tuple(self.warnings))
+
+        object.__setattr__(self, "primary_component_indices", tuple(self.primary_component_indices))
+        object.__setattr__(
+            self,
+            "secondary_component_indices",
+            tuple(self.secondary_component_indices),
+        )
+        object.__setattr__(
+            self,
+            "ambiguous_component_indices",
+            tuple(self.ambiguous_component_indices),
+        )
+        object.__setattr__(self, "secondary_mark_centroids", tuple(self.secondary_mark_centroids))
+
+    def expected_stroke_count(self, policy: WritingStructurePolicy | None = None) -> int:
+        policy = policy or WritingStructurePolicy()
+        return policy.preferred_body_strokes + len(self.secondary_component_indices)
+
+    @property
+    def component_role_sequence(self) -> tuple[str, ...]:
+        primary = set(self.primary_component_indices)
+        secondary = set(self.secondary_component_indices)
+        ambiguous = set(self.ambiguous_component_indices)
+        indices = sorted(set(self.component_indices) | primary | secondary | ambiguous)
+        return tuple(
+            "primary"
+            if index in primary
+            else "secondary"
+            if index in secondary
+            else "ambiguous"
+            if index in ambiguous
+            else "unassigned"
+            for index in indices
+        )
 
 
 @dataclass(frozen=True)
@@ -130,7 +168,7 @@ RowBand = rr.RowBand
 detect_ink_rows = rr.detect_rows
 
 
-REFERENCE_SEGMENTATION_VERSION = "4"
+REFERENCE_SEGMENTATION_VERSION = "5"
 
 
 def _coerce_reference_profile(
@@ -303,6 +341,7 @@ def _adapt_candidates(
 ) -> tuple[SegmentedGlyph, ...]:
     selected = result.regions if regions is None else regions
     columns: dict[int, int] = {}
+    components_by_index = {component.index: component for component in result.components}
     candidates = []
     for reading_order, region in enumerate(selected):
         column = columns.get(region.row_index, 0)
@@ -330,6 +369,17 @@ def _adapt_candidates(
                 mask=mask,
                 component_indices=region.component_indices,
                 mask_method=result.mask_result.method,
+                primary_component_indices=region.primary_component_indices,
+                secondary_component_indices=region.secondary_component_indices,
+                ambiguous_component_indices=region.ambiguous_component_indices,
+                secondary_mark_centroids=tuple(
+                    (
+                        (components_by_index[index].center_x - bbox.x) / bbox.width,
+                        (components_by_index[index].center_y - bbox.y) / bbox.height,
+                    )
+                    for index in region.secondary_component_indices
+                    if index in components_by_index
+                ),
                 warnings=(warnings_by_region or {}).get(region.reading_order, ()),
             )
         )
@@ -352,6 +402,10 @@ def _candidate_record(candidate: SegmentedGlyph) -> dict:
         "dimensions": {"width": candidate.bbox.width, "height": candidate.bbox.height},
         "confidence": round(candidate.segmentation_confidence, 4),
         "component_ids": list(candidate.component_indices),
+        "primary_component_ids": list(candidate.primary_component_indices),
+        "secondary_component_ids": list(candidate.secondary_component_indices),
+        "ambiguous_component_ids": list(candidate.ambiguous_component_indices),
+        "secondary_mark_centroids": [list(point) for point in candidate.secondary_mark_centroids],
         "mask_artifact": f"{candidate.glyph_id}-mask.png",
         "crop_artifact": f"{candidate.glyph_id}.png",
         "mask_method": candidate.mask_method,

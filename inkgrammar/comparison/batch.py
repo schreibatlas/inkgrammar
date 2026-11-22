@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from dataclasses import replace
 from importlib.metadata import version as package_version
 from pathlib import Path
 from time import perf_counter
@@ -24,14 +25,14 @@ from .batch_report import (
 )
 from .descriptors import GlyphDescriptor
 from .matching import (
+    DEFAULT_REFINEMENT_LIMIT,
     DEFAULT_TOP_K,
     MINIMUM_ALTERNATIVES,
     MatchScore,
     ReferenceIndex,
     build_reference_index,
-    match_status,
     rank_reference_candidates,
-    refine_top_k_matches,
+    refine_matches_progressively,
 )
 from .models import (
     ComparisonIdentity,
@@ -53,7 +54,8 @@ from .segmentation import (
     segment_reference_gallery,
     segment_sample_glyphs,
 )
-from .skeleton import analyze_skeleton, diagnostics_from_skeleton
+from .skeleton import analyze_skeleton
+from .steering import fit_writing_route_candidates
 
 _REFERENCE_CACHE_VERSION = 5
 _DESCRIPTOR_SIZE = 96
@@ -187,6 +189,12 @@ def _cache_metadata(
                 "reading_order": candidate.reading_order,
                 "confidence": candidate.segmentation_confidence,
                 "component_indices": list(candidate.component_indices),
+                "primary_component_ids": list(candidate.primary_component_indices),
+                "secondary_component_ids": list(candidate.secondary_component_indices),
+                "ambiguous_component_ids": list(candidate.ambiguous_component_indices),
+                "secondary_mark_centroids": [
+                    list(point) for point in candidate.secondary_mark_centroids
+                ],
                 "warnings": list(candidate.warnings),
                 "mask_method": candidate.mask_method,
                 "label": candidate.label,
@@ -297,6 +305,12 @@ def _load_reference_cache(
                 mask_method=item["mask_method"],
                 label=item["label"],
                 component_indices=tuple(item["component_indices"]),
+                primary_component_indices=tuple(item["primary_component_ids"]),
+                secondary_component_indices=tuple(item["secondary_component_ids"]),
+                ambiguous_component_indices=tuple(item["ambiguous_component_ids"]),
+                secondary_mark_centroids=tuple(
+                    tuple(point) for point in item["secondary_mark_centroids"]
+                ),
                 warnings=tuple(item["warnings"]),
             )
         )
@@ -400,6 +414,7 @@ def _load_reference_extraction(
     source_sha256: str,
     candidate: SegmentedGlyph,
     ink_mode: MaskMode,
+    prepared_analysis: SkeletonAnalysis | None = None,
 ) -> ExtractedLetter:
     metadata_path, arrays_path, image_path = _reference_extraction_paths(
         cache_dir, candidate.glyph_id
@@ -414,8 +429,6 @@ def _load_reference_extraction(
         raise ValueError("cached reference extraction does not match the candidate")
     with np.load(arrays_path, allow_pickle=False) as arrays:
         mask = arrays["mask"]
-        skeleton = arrays["skeleton"]
-        radius = arrays["radius"]
         path_xy = arrays["path_xy"]
         resampled_xy = arrays["resampled_xy"]
         continuous_xy = arrays["continuous_xy"]
@@ -424,7 +437,13 @@ def _load_reference_extraction(
         continuous_radius_px = arrays["continuous_radius_px"]
         continuous_confidence = arrays["continuous_confidence"]
         continuous_progress = arrays["continuous_progress"]
-    diagnostics = diagnostics_from_skeleton(skeleton, radius)
+    route_extraction = extract_segmented_glyph(
+        candidate,
+        source_path=source_path,
+        allow_path_failure=True,
+        analysis=prepared_analysis,
+    )
+    diagnostics = route_extraction.diagnostics
     path_info = metadata["ordered_path"]
     ordered_path = (
         OrderedPath(
@@ -472,6 +491,10 @@ def _load_reference_extraction(
         resampled_xy=resampled_xy if ordered_path is not None else None,
         continuous_path=continuous_path,
         geometry_warning=metadata["geometry_warning"],
+        route_candidates=route_extraction.route_candidates,
+        route_descriptors=route_extraction.route_descriptors,
+        component_role_sequence=candidate.component_role_sequence,
+        secondary_mark_centroids=candidate.secondary_mark_centroids,
     )
 
 
@@ -568,6 +591,7 @@ def _get_reference_extraction(
             source_sha256,
             candidate,
             ink_mode,
+            prepared_analysis=prepared_analysis,
         )
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
         cache_status = "miss"
@@ -577,6 +601,12 @@ def _get_reference_extraction(
             allow_path_failure=True,
             analysis=prepared_analysis,
         )
+    if extraction.route_candidates:
+        extraction = replace(
+            extraction,
+            route_candidates=fit_writing_route_candidates(extraction.route_candidates),
+        )
+    if cache_status == "miss":
         _save_reference_extraction(
             cache_dir,
             source_sha256,
@@ -688,8 +718,15 @@ def _assess_segmentation(
     gallery: ReferenceGallery,
     sample: SegmentedGlyph,
     reference: SegmentedGlyph,
+    sample_segmentation: dict[str, Any] | None = None,
 ) -> tuple[str, tuple[str, ...]]:
     warnings: list[str] = []
+    if sample_segmentation is not None and (
+        sample_segmentation["status"] != "ok" or sample_segmentation["warnings"]
+    ):
+        warnings.extend(f"Sample page: {warning}" for warning in sample_segmentation["warnings"])
+        if not sample_segmentation["warnings"]:
+            warnings.append(f"Sample page segmentation status is {sample_segmentation['status']}.")
     if gallery.segmentation.status != "ok" or gallery.segmentation.warnings:
         warnings.extend(f"Reference page: {warning}" for warning in gallery.segmentation.warnings)
         if not gallery.segmentation.warnings:
@@ -704,6 +741,41 @@ def _assess_segmentation(
     return ("ambiguous" if unique_warnings else "ok"), unique_warnings
 
 
+_ESSENTIAL_ROUTE_FEATURES = frozenset(
+    {
+        "route_descriptor",
+        "route_centerline",
+        "route_steering",
+        "route_topology",
+        "route_structure",
+    }
+)
+
+
+def _identity_acceptance_reasons(
+    score: MatchScore,
+    *,
+    progressive_ambiguous: bool,
+    segmentation_status: str,
+    search_metadata: dict[str, Any],
+) -> tuple[str, ...]:
+    reasons = []
+    if search_metadata["search_truncated"]:
+        reasons.append("reference_search_truncated")
+    elif progressive_ambiguous:
+        reasons.append("retrieval_ambiguity")
+    if segmentation_status != "ok":
+        reasons.append("segmentation_uncertainty")
+    if _ESSENTIAL_ROUTE_FEATURES.difference(score.evidence.available_features):
+        reasons.append("missing_essential_route_evidence")
+    selection = score.route_pair_selection
+    if selection is None:
+        reasons.append("route_pair_unavailable")
+    elif selection.ambiguous:
+        reasons.append("route_pair_ambiguous")
+    return tuple(dict.fromkeys(reasons))
+
+
 def _write_match_json(
     output_dir: Path,
     *,
@@ -712,9 +784,12 @@ def _write_match_json(
     ranked: list[MatchScore],
     candidates: dict[str, SegmentedGlyph],
     status: str,
+    accepted_reference_id: str | None,
+    acceptance_reasons: tuple[str, ...],
     segmentation_status: str,
     segmentation_warnings: tuple[str, ...],
     pair_report_dir: Path,
+    search_metadata: dict[str, Any],
 ) -> None:
     alternatives = tuple(ranked[1:])
     reason = match_reason(best, alternatives)
@@ -725,21 +800,32 @@ def _write_match_json(
         segmentation_status,
         segmentation_warnings,
         pair_report_dir / "report.json",
+        search_metadata=search_metadata,
+        acceptance_reasons=acceptance_reasons,
     )
+    leading_match_payload = {
+        **match_score_payload(best),
+        "label": candidates[best.reference_id].label,
+    }
     payload = {
         "sample_id": sample.glyph_id,
         "sample_bbox": sample.bbox.model_dump(mode="json"),
         "segmentation_confidence": sample.segmentation_confidence,
         "status": status,
         "match_status": status,
+        "leading_reference_id": best.reference_id,
+        "accepted_reference_id": accepted_reference_id,
+        "acceptance_reasons": list(acceptance_reasons),
+        "identity_status": (
+            "accepted" if accepted_reference_id is not None else "candidate_diagnostic"
+        ),
         "match_reason": reason,
         "ambiguity_sources": uncertainty,
         "segmentation_status": segmentation_status,
         "segmentation_warnings": list(segmentation_warnings),
-        "best": {
-            **match_score_payload(best),
-            "label": candidates[best.reference_id].label,
-        },
+        "search": search_metadata,
+        "best": leading_match_payload,
+        "leading_match": leading_match_payload,
         "alternatives": [
             {
                 **match_score_payload(score),
@@ -813,6 +899,7 @@ def compare_letter_page(
     reference_ink_mode: MaskMode = "auto",
     sample_ink_mode: MaskMode = "auto",
     top_k: int = DEFAULT_TOP_K,
+    refinement_limit: int = DEFAULT_REFINEMENT_LIMIT,
     reference_profile: str | ReferenceSheetProfile = "alphabet",
     no_progress: bool = False,
     verbose: bool = False,
@@ -834,6 +921,7 @@ def compare_letter_page(
             reference_ink_mode=reference_ink_mode,
             sample_ink_mode=sample_ink_mode,
             top_k=top_k,
+            refinement_limit=refinement_limit,
             reference_profile=reference_profile,
             segment_only=segment_only,
             progress=progress,
@@ -865,6 +953,7 @@ def _compare_letter_page_impl(
     reference_ink_mode: MaskMode,
     sample_ink_mode: MaskMode,
     top_k: int,
+    refinement_limit: int,
     reference_profile: str | ReferenceSheetProfile,
     segment_only: bool,
     progress: ProgressReporter,
@@ -872,6 +961,8 @@ def _compare_letter_page_impl(
     progress.stage("input_validation", details={"message": "Validate inputs"})
     if top_k < 1:
         raise ValueError("top_k must be positive")
+    if refinement_limit < 1:
+        raise ValueError("refinement_limit must be positive")
     if expected_letters < 1:
         raise ValueError("expected_letters must be positive")
     _reference_profile_settings(reference_profile)
@@ -1026,6 +1117,12 @@ def _compare_letter_page_impl(
                         "bbox": candidate.bbox.model_dump(mode="json"),
                         "row": candidate.row_index,
                         "confidence": candidate.segmentation_confidence,
+                        "primary_component_ids": list(candidate.primary_component_indices),
+                        "secondary_component_ids": list(candidate.secondary_component_indices),
+                        "ambiguous_component_ids": list(candidate.ambiguous_component_indices),
+                        "secondary_mark_centroids": [
+                            list(point) for point in candidate.secondary_mark_centroids
+                        ],
                     }
                     for candidate in gallery.candidates
                 ],
@@ -1077,10 +1174,15 @@ def _compare_letter_page_impl(
             source_path=sample_path,
             allow_path_failure=True,
         )
+        if sample_extracted.route_candidates:
+            sample_extracted = replace(
+                sample_extracted,
+                route_candidates=fit_writing_route_candidates(sample_extracted.route_candidates),
+            )
         coarse = rank_reference_candidates(
             sample_candidate,
             index,
-            top_k=min(effective_top_k, len(gallery.candidates)),
+            top_k=len(gallery.candidates),
             sample_analysis=sample_extracted.diagnostics.analysis,
         )
         progress.stage(
@@ -1095,43 +1197,70 @@ def _compare_letter_page_impl(
                 "ranked_count": len(coarse),
             },
         )
-        for coarse_score in coarse:
-            reference_id = coarse_score.reference_id
+
+        def get_reference_extraction(candidate: SegmentedGlyph) -> ExtractedLetter:
+            reference_id = candidate.glyph_id
             if reference_id not in reference_extractions:
                 reference_extractions[reference_id] = _get_reference_extraction(
                     cache_dir,
                     reference,
                     source_sha256,
-                    candidates[reference_id],
+                    candidate,
                     reference_ink_mode,
                     progress,
                     prepared_analysis=reference_descriptors[reference_id].analysis,
                 )
-        ranked = refine_top_k_matches(
+            return reference_extractions[reference_id]
+
+        progressive = refine_matches_progressively(
             sample_candidate,
             gallery,
             coarse,
             sample_extracted=sample_extracted,
             reference_extractions=reference_extractions,
+            reference_extractor=get_reference_extraction,
+            max_refinements=refinement_limit,
         )
+        ranked = list(progressive.scores[:effective_top_k])
+        search_metadata = {
+            "coarse_candidate_count": progressive.coarse_candidate_count,
+            "refined_candidate_count": progressive.refined_candidate_count,
+            "stop_reason": progressive.stop_reason,
+            "search_truncated": progressive.search_truncated,
+            "refinement_limit": refinement_limit,
+        }
         progress.stage(
             "path_refinement",
-            completed=len(ranked),
-            total=len(coarse),
+            completed=progressive.refined_candidate_count,
+            total=progressive.coarse_candidate_count,
             details={
-                "message": (f"Refine top {len(coarse)} candidates for {sample_candidate.glyph_id}")
+                "message": (
+                    f"Refined {progressive.refined_candidate_count} candidates for "
+                    f"{sample_candidate.glyph_id}"
+                ),
+                **search_metadata,
             },
         )
         if not ranked:
             raise SegmentationError("No reference candidates are available for matching.")
         best = ranked[0]
-        status = match_status(ranked)
         sample_dir = root / sample_candidate.glyph_id
         sample_dir.mkdir(parents=True, exist_ok=True)
         matched_reference = candidates[best.reference_id]
         segmentation_status, segmentation_warnings = _assess_segmentation(
-            gallery, sample_candidate, matched_reference
+            gallery,
+            sample_candidate,
+            matched_reference,
+            sample_segmentation=sample_segmentation,
         )
+        acceptance_reasons = _identity_acceptance_reasons(
+            best,
+            progressive_ambiguous=progressive.ambiguous,
+            segmentation_status=segmentation_status,
+            search_metadata=search_metadata,
+        )
+        accepted_reference_id = best.reference_id if not acceptance_reasons else None
+        status = "clear" if accepted_reference_id is not None else "ambiguous"
         matched_reference.image.convert("RGB").save(
             sample_dir / "matched-reference.png", format="PNG"
         )
@@ -1145,6 +1274,10 @@ def _compare_letter_page_impl(
                 sample_id=sample_candidate.glyph_id,
                 reference_id=matched_reference.glyph_id,
                 label=matched_reference.label,
+            ),
+            route_pair_selection=best.route_pair_selection,
+            identity_status=(
+                "accepted" if accepted_reference_id is not None else "candidate_diagnostic"
             ),
         )
         progress.stage(
@@ -1161,9 +1294,12 @@ def _compare_letter_page_impl(
             ranked=ranked,
             candidates=candidates,
             status=status,
+            accepted_reference_id=accepted_reference_id,
+            acceptance_reasons=acceptance_reasons,
             segmentation_status=segmentation_status,
             segmentation_warnings=segmentation_warnings,
             pair_report_dir=pair_report.output_dir,
+            search_metadata=search_metadata,
         )
         results.append(
             BatchSampleResult(
@@ -1173,10 +1309,14 @@ def _compare_letter_page_impl(
                 reference_id=matched_reference.glyph_id,
                 reference_label=matched_reference.label,
                 status=status,
+                leading_reference_id=best.reference_id,
+                accepted_reference_id=accepted_reference_id,
+                acceptance_reasons=acceptance_reasons,
                 segmentation_status=segmentation_status,
                 segmentation_warnings=segmentation_warnings,
                 score=best,
                 alternatives=tuple(ranked[1:]),
+                search_metadata=search_metadata,
                 report_dir=pair_report.output_dir,
                 report_json=pair_report.json_path,
             )
@@ -1190,6 +1330,7 @@ def _compare_letter_page_impl(
         sample_path=sample_path,
         reference_sha256=source_sha256,
         expected_count=expected_letters,
+        refinement_limit=refinement_limit,
         results=tuple(results),
         reference_cache_hit=cache_hit,
         reference_segmentation={

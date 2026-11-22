@@ -7,8 +7,10 @@ import pytest
 import rasterregions as rr
 from PIL import Image, ImageDraw
 
+from inkgrammar.comparison.models import WritingStructurePolicy
 from inkgrammar.comparison.segmentation import (
     SegmentationError,
+    _adapt_candidates,
     detect_ink_rows,
     segment_reference_gallery,
     segment_sample_glyphs,
@@ -431,3 +433,50 @@ def test_reference_dependency_failures_write_diagnostics(
     assert manifest["search_limit"] == search_limit
     hypotheses = json.loads(diagnostic_path.read_text())
     assert hypotheses["error"]["type"] == failure_type.__name__
+
+
+def test_segmented_glyph_preserves_rasterregions_component_roles_and_mark_centroids():
+    image = Image.new("RGB", (16, 16), "white")
+    mask = np.zeros((16, 16), dtype=bool)
+    mask[6:11, 2:7] = True
+    mask[2:4, 9:11] = True
+    mask[13:15, 13:15] = True
+    components = tuple(rr.components(mask))
+    roles = {
+        "primary": components[1].index,
+        "secondary": components[0].index,
+        "ambiguous": components[2].index,
+    }
+    region = rr.Region(
+        region_id="region-0",
+        bbox=rr.BBox(0, 0, 16, 16),
+        row_index=0,
+        column_index=0,
+        reading_order=0,
+        confidence=1.0,
+        component_indices=tuple(component.index for component in components),
+        image=image,
+        mask=mask,
+        primary_component_indices=(roles["primary"],),
+        secondary_component_indices=(roles["secondary"],),
+        ambiguous_component_indices=(roles["ambiguous"],),
+    )
+    result = rr.DetectionResult(
+        source_path=None,
+        image=image,
+        mask_result=rr.MaskResult(mask, 1.0, "grayscale"),
+        clean_mask=mask,
+        components=components,
+        rows=(),
+        regions=(region,),
+    )
+
+    candidate = _adapt_candidates(result, "sample")[0]
+
+    assert candidate.primary_component_indices == (roles["primary"],)
+    assert candidate.secondary_component_indices == (roles["secondary"],)
+    assert candidate.ambiguous_component_indices == (roles["ambiguous"],)
+    assert candidate.expected_stroke_count() == 2
+    assert candidate.expected_stroke_count(WritingStructurePolicy(preferred_body_strokes=2)) == 3
+    assert candidate.component_role_sequence == ("secondary", "primary", "ambiguous")
+    assert len(candidate.secondary_mark_centroids) == 1

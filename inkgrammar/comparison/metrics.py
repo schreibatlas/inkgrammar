@@ -390,6 +390,8 @@ def _writing_metrics(result: ComparisonResult) -> dict[str, object]:
             "topology_event_compatibility_cost": (
                 selection.score.topology_event_compatibility_cost
             ),
+            "descriptor_matching_cost": selection.score.descriptor_matching_cost,
+            "cost_breakdown": selection.score.cost_breakdown,
             "total_cost": selection.score.total_cost,
             "alignment_direction": (
                 result.route_alignment.direction if result.route_alignment is not None else None

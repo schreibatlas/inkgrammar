@@ -4,9 +4,9 @@ from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
-from planarcurve.transforms import fit_similarity_transform
 from rasterregions import MaskMode, MaskResult, foreground_evidence
 from skeletonpaths import (
     SkeletonAnalysis,
@@ -15,6 +15,7 @@ from skeletonpaths import (
 )
 
 from .crop import coerce_crop_rect, load_crop
+from .descriptors import route_descriptor
 from .models import (
     ComparisonIdentity,
     ComparisonResult,
@@ -24,21 +25,23 @@ from .models import (
     OrderedPath,
     SkeletonDiagnostics,
     WritingDirectionPolicy,
-    WritingRouteAlignment,
     WritingRouteCandidate,
+    WritingRoutePairSelection,
+    WritingStructurePolicy,
 )
 from .path import (
     PathExtractionError,
     align_continuous_paths,
     align_ordered_paths,
     recover_ordered_path,
-    resample_continuous_path,
     resample_path,
-    reverse_continuous_path,
-    transform_continuous_path,
 )
 from .report import WrittenComparisonReport, write_comparison_report
-from .routes import generate_writing_route_candidates, select_writing_route_pair
+from .routes import (
+    align_writing_routes,
+    evaluate_writing_route_pairs,
+    generate_writing_route_candidates,
+)
 from .segmentation import SegmentedGlyph
 from .skeleton import analyze_skeleton, diagnostics_from_analysis
 from .steering import fit_writing_route_candidates, steering_profile_distance
@@ -49,6 +52,9 @@ def _route_paths(
     *,
     decision_field: np.ndarray | None = None,
     allow_path_failure: bool,
+    expected_strokes: int | None = None,
+    structure_policy: WritingStructurePolicy | None = None,
+    ambiguous_component_count: int = 0,
 ) -> tuple[
     tuple[WritingRouteCandidate, ...],
     OrderedPath | None,
@@ -59,6 +65,9 @@ def _route_paths(
         candidates = generate_writing_route_candidates(
             diagnostics,
             decision_field=decision_field,
+            expected_strokes=expected_strokes,
+            structure_policy=structure_policy,
+            ambiguous_component_count=ambiguous_component_count,
         )
         candidate = next(
             (item for item in candidates if len(item.continuous_strokes) == 1),
@@ -119,102 +128,13 @@ def _with_selected_route(
     )
 
 
-def _align_writing_routes(
-    reference: WritingRouteCandidate,
-    sample: WritingRouteCandidate,
-) -> WritingRouteAlignment:
-    best_alignment = None
-    for direction in ("forward", "reversed-for-best-match"):
-        sample_strokes = sample.continuous_strokes
-        if direction == "reversed-for-best-match":
-            sample_strokes = tuple(
-                reverse_continuous_path(stroke) for stroke in reversed(sample_strokes)
-            )
-        paired_count = min(len(reference.continuous_strokes), len(sample_strokes))
-        reference_samples = tuple(
-            resample_continuous_path(stroke, 128).xy
-            for stroke in reference.continuous_strokes[:paired_count]
-        )
-        sample_samples = tuple(
-            resample_continuous_path(stroke, 128).xy for stroke in sample_strokes[:paired_count]
-        )
-        try:
-            transform = fit_similarity_transform(
-                np.concatenate(reference_samples, axis=0),
-                np.concatenate(sample_samples, axis=0),
-            )
-            aligned_strokes = tuple(
-                transform_continuous_path(stroke, transform) for stroke in sample_strokes
-            )
-            stroke_errors = tuple(
-                float(np.mean(np.sum((reference_xy - transform.apply(sample_xy)) ** 2, axis=1)))
-                for reference_xy, sample_xy in zip(
-                    reference_samples,
-                    sample_samples,
-                    strict=True,
-                )
-            )
-            stroke_transforms = (transform,) * paired_count
-            strategy = "shared"
-        except ValueError:
-            per_stroke_alignments = tuple(
-                align_continuous_paths(
-                    reference.continuous_strokes[index],
-                    sample_strokes[index],
-                )
-                for index in range(paired_count)
-            )
-            stroke_transforms = tuple(item.transform for item in per_stroke_alignments)
-            transform = stroke_transforms[0]
-            paired_aligned_strokes = []
-            for item in per_stroke_alignments:
-                assert item.aligned_sample_path is not None
-                paired_aligned_strokes.append(item.aligned_sample_path)
-            aligned_strokes = (
-                *paired_aligned_strokes,
-                *(
-                    transform_continuous_path(stroke, transform)
-                    for stroke in sample_strokes[paired_count:]
-                ),
-            )
-            stroke_errors = tuple(item.mean_squared_error for item in per_stroke_alignments)
-            strategy = "per-stroke"
-        weights = tuple(
-            0.5
-            * (
-                reference.continuous_strokes[index].arc_length_px
-                + sample_strokes[index].arc_length_px
-            )
-            for index in range(paired_count)
-        )
-        mean_squared_error = float(
-            sum(error * weight for error, weight in zip(stroke_errors, weights, strict=True))
-            / max(sum(weights), 1e-12)
-        )
-        alignment = WritingRouteAlignment(
-            transform=transform,
-            direction=direction,
-            aligned_sample_strokes=aligned_strokes,
-            stroke_mean_squared_errors=stroke_errors,
-            mean_squared_error=mean_squared_error,
-            stroke_transforms=stroke_transforms,
-            strategy=strategy,
-        )
-        if (
-            best_alignment is None
-            or alignment.mean_squared_error < best_alignment.mean_squared_error
-        ):
-            best_alignment = alignment
-    assert best_alignment is not None
-    return best_alignment
-
-
 def extract_letter(
     image_path: str | Path,
     crop: CropRect | Sequence[int],
     *,
     ink_mode: MaskMode = "auto",
     allow_path_failure: bool = False,
+    writing_structure_policy: WritingStructurePolicy | None = None,
 ) -> ExtractedLetter:
     """Crop an image and recover bounded writing-route hypotheses and geometry."""
     source_path = Path(image_path)
@@ -231,6 +151,10 @@ def extract_letter(
     diagnostics = analyze_skeleton(mask_result.mask)
     route_candidates, ordered_path, continuous_path, geometry_warning = _route_paths(
         diagnostics,
+        expected_strokes=(
+            writing_structure_policy or WritingStructurePolicy()
+        ).preferred_body_strokes,
+        structure_policy=writing_structure_policy,
         decision_field=evidence.decision_field,
         allow_path_failure=allow_path_failure,
     )
@@ -245,6 +169,7 @@ def extract_letter(
         continuous_path=continuous_path,
         geometry_warning=geometry_warning,
         route_candidates=route_candidates,
+        route_descriptors=tuple(route_descriptor(route) for route in route_candidates),
         foreground_evidence=evidence,
     )
 
@@ -255,6 +180,7 @@ def extract_segmented_glyph(
     source_path: str | Path,
     allow_path_failure: bool = True,
     analysis: SkeletonAnalysis | None = None,
+    writing_structure_policy: WritingStructurePolicy | None = None,
 ) -> ExtractedLetter:
     """Analyze a segmented candidate without reloading its source image."""
     diagnostics = (
@@ -264,6 +190,9 @@ def extract_segmented_glyph(
     )
     route_candidates, ordered_path, continuous_path, geometry_warning = _route_paths(
         diagnostics,
+        expected_strokes=candidate.expected_stroke_count(writing_structure_policy),
+        structure_policy=writing_structure_policy,
+        ambiguous_component_count=len(candidate.ambiguous_component_indices),
         allow_path_failure=allow_path_failure,
     )
     return ExtractedLetter(
@@ -282,6 +211,9 @@ def extract_segmented_glyph(
         continuous_path=continuous_path,
         geometry_warning=geometry_warning,
         route_candidates=route_candidates,
+        route_descriptors=tuple(route_descriptor(route, candidate) for route in route_candidates),
+        component_role_sequence=candidate.component_role_sequence,
+        secondary_mark_centroids=candidate.secondary_mark_centroids,
     )
 
 
@@ -293,6 +225,8 @@ def compare_extracted_letters(
     smoothing_window: int = 11,
     smoothing_polynomial_order: int = 2,
     writing_direction_policy: WritingDirectionPolicy | None = None,
+    route_pair_selection: WritingRoutePairSelection | None = None,
+    identity_status: Literal["accepted", "candidate_diagnostic"] = "accepted",
 ) -> ComparisonResult:
     """Compare extracted glyphs, using jointly selected routes when available."""
     warnings = [
@@ -300,17 +234,27 @@ def compare_extracted_letters(
         for side, extracted in (("Reference", reference), ("Sample", sample))
         if extracted.geometry_warning is not None
     ]
-    route_selection = None
+    route_selection = route_pair_selection
     if reference.route_candidates and sample.route_candidates:
         reference_candidates = fit_writing_route_candidates(reference.route_candidates)
         sample_candidates = fit_writing_route_candidates(sample.route_candidates)
         reference = replace(reference, route_candidates=reference_candidates)
         sample = replace(sample, route_candidates=sample_candidates)
-        route_selection = select_writing_route_pair(
+        route_selection = route_selection or evaluate_writing_route_pairs(
             reference_candidates,
             sample_candidates,
             steering_distance=steering_profile_distance,
             direction_policy=writing_direction_policy,
+            reference_descriptors=(
+                reference.route_descriptors
+                or tuple(
+                    route_descriptor(candidate, reference) for candidate in reference_candidates
+                )
+            ),
+            sample_descriptors=(
+                sample.route_descriptors
+                or tuple(route_descriptor(candidate, sample) for candidate in sample_candidates)
+            ),
         )
         reference = _with_selected_route(reference, route_selection.reference)
         sample = _with_selected_route(sample, route_selection.sample)
@@ -332,7 +276,7 @@ def compare_extracted_letters(
         len(route_selection.reference.continuous_strokes) > 1
         or len(route_selection.sample.continuous_strokes) > 1
     ):
-        route_alignment = _align_writing_routes(
+        route_alignment = align_writing_routes(
             route_selection.reference,
             route_selection.sample,
         )
@@ -370,6 +314,7 @@ def compare_extracted_letters(
         warnings=warnings,
         identity=identity,
         route_selection=route_selection,
+        identity_status=identity_status,
         route_alignment=route_alignment,
     )
 

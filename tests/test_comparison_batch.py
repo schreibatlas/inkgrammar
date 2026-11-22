@@ -103,6 +103,10 @@ def test_batch_writes_pair_reports_summaries_and_reuses_hash_keyed_reference_cac
     assert reference_manifest["search_limit"] is None
     assert isinstance(reference_manifest["anchor_region_count"], int)
     candidate = reference_manifest["candidates"][0]
+    assert candidate["primary_component_ids"]
+    assert isinstance(candidate["secondary_component_ids"], list)
+    assert isinstance(candidate["ambiguous_component_ids"], list)
+    assert isinstance(candidate["secondary_mark_centroids"], list)
     assert candidate["dimensions"] == {
         "width": candidate["bbox"]["width"],
         "height": candidate["bbox"]["height"],
@@ -143,7 +147,26 @@ def test_batch_writes_pair_reports_summaries_and_reuses_hash_keyed_reference_cac
         assert (sample_dir / "match.json").is_file()
         assert (sample_dir / "report.json").is_file()
         assert (sample_dir / "report.html").is_file()
-        assert len(match["alternatives"]) == 2
+        assert len(match["alternatives"]) + 1 <= match["search"]["refined_candidate_count"]
+        assert match["search"]["coarse_candidate_count"] == 3
+        assert match["search"]["refinement_limit"] == 32
+        assert match["search"]["stop_reason"] in {
+            "all_candidates_refined",
+            "coarse_lower_bound",
+            "candidate_refinement_limit",
+        }
+        assert isinstance(match["search"]["search_truncated"], bool)
+        leading = match["leading_match"]
+        assert leading["reference_id"] == match["leading_reference_id"]
+        assert "missing_evidence_penalty" in leading
+        assert leading["feature_coverage"]["available_features"]
+        assert all("feature_coverage" in alternative for alternative in match["alternatives"])
+        assert all("route_descriptor_cost" in alternative for alternative in match["alternatives"])
+        assert match["search"]["refined_candidate_count"] >= 1
+        if match["status"] == "clear":
+            assert match["accepted_reference_id"] == match["leading_reference_id"]
+        else:
+            assert match["accepted_reference_id"] is None
 
         pair_overlay = output / match["report_dir"] / "writing-path-overlay.png"
         if pair_overlay.is_file():
@@ -168,7 +191,7 @@ def test_batch_writes_pair_reports_summaries_and_reuses_hash_keyed_reference_cac
     monkeypatch.setattr(comparison_api, "analyze_skeleton", count_sample_analysis)
 
     def fail_repeat_analysis(mask):
-        raise AssertionError("prepared sample paths must be reused for every top-K candidate")
+        raise AssertionError("prepared sample paths must be reused during progressive refinement")
 
     monkeypatch.setattr("inkgrammar.comparison.matching.analyze_skeleton", fail_repeat_analysis)
     second = compare_letter_page(
@@ -182,14 +205,36 @@ def test_batch_writes_pair_reports_summaries_and_reuses_hash_keyed_reference_cac
     public_gallery = json.loads((output / "reference-index" / "gallery.json").read_text())
     assert public_gallery["cache_hit"] is True
     assert analysis_calls == 3
+    cached_match = second.payload["matches"][0]
+    cached_pair = json.loads((output / cached_match["report_json"]).read_text())
+    assert cached_pair["diagnostics"]["selected_route_pair"] is not None
 
 
-def test_reference_cache_rebuilds_for_old_versions_profiles_and_mask_changes(tmp_path):
+def test_reference_cache_rebuilds_for_old_versions_profiles_and_mask_changes(tmp_path, monkeypatch):
+    import inkgrammar.comparison.api as comparison_api
+
+    original_route_generator = comparison_api.generate_writing_route_candidates
+
+    def bounded_route_generator(diagnostics, **kwargs):
+        kwargs["limit"] = 4
+        return original_route_generator(diagnostics, **kwargs)
+
+    monkeypatch.setattr(
+        comparison_api,
+        "generate_writing_route_candidates",
+        bounded_route_generator,
+    )
     reference = _page(tmp_path / "reference.png", ("e", "e", "l"), y=22)
     sample = _page(tmp_path / "sample.png", ("e", "n", "l"), y=30)
     output = tmp_path / "cache-invalidation"
 
-    first = compare_letter_page(reference, sample, expected_letters=3, output_dir=output)
+    first = compare_letter_page(
+        reference,
+        sample,
+        expected_letters=3,
+        output_dir=output,
+        refinement_limit=1,
+    )
     cache_dir = next((output / ".reference-cache").iterdir())
     metadata_path = cache_dir / "gallery.json"
     metadata = json.loads(metadata_path.read_text())
@@ -197,13 +242,25 @@ def test_reference_cache_rebuilds_for_old_versions_profiles_and_mask_changes(tmp
     metadata["segmentation_algorithm_version"] = "3"
     metadata_path.write_text(json.dumps(metadata))
 
-    old_cache = compare_letter_page(reference, sample, expected_letters=3, output_dir=output)
+    old_cache = compare_letter_page(
+        reference,
+        sample,
+        expected_letters=3,
+        output_dir=output,
+        refinement_limit=1,
+    )
     assert old_cache.payload["reference_cache"]["hit"] is False
     rebuilt_metadata = json.loads(metadata_path.read_text())
-    assert rebuilt_metadata["segmentation_algorithm_version"] == "4"
+    assert rebuilt_metadata["segmentation_algorithm_version"] == "5"
     assert [item["id"] for item in rebuilt_metadata["candidates"]] == candidate_ids
 
-    reused_cache = compare_letter_page(reference, sample, expected_letters=3, output_dir=output)
+    reused_cache = compare_letter_page(
+        reference,
+        sample,
+        expected_letters=3,
+        output_dir=output,
+        refinement_limit=1,
+    )
     assert reused_cache.payload["reference_cache"]["hit"] is True
 
     generic = compare_letter_page(
@@ -211,6 +268,7 @@ def test_reference_cache_rebuilds_for_old_versions_profiles_and_mask_changes(tmp
         sample,
         expected_letters=3,
         output_dir=output,
+        refinement_limit=1,
         reference_profile="generic",
     )
     assert generic.payload["reference_cache"]["hit"] is False
@@ -225,6 +283,7 @@ def test_reference_cache_rebuilds_for_old_versions_profiles_and_mask_changes(tmp
         sample,
         expected_letters=3,
         output_dir=output,
+        refinement_limit=1,
         reference_profile="generic",
     )
     assert corrupted_mask.payload["reference_cache"]["hit"] is False
@@ -241,6 +300,7 @@ def test_progress_and_run_files_cover_success_failure_and_quiet_mode(tmp_path, c
         sample,
         expected_letters=3,
         output_dir=output,
+        refinement_limit=1,
         verbose=True,
     )
 
@@ -283,6 +343,7 @@ def test_progress_and_run_files_cover_success_failure_and_quiet_mode(tmp_path, c
         sample,
         expected_letters=3,
         output_dir=quiet_output,
+        refinement_limit=1,
         no_progress=True,
     )
     assert capsys.readouterr().err == ""
@@ -370,7 +431,13 @@ def test_reference_segmentation_ambiguity_is_separate_from_match_ambiguity(tmp_p
     sample = _page(tmp_path / "sample.png", ("e", "n", "l"), y=30)
     output = tmp_path / "ambiguous-reference"
 
-    report = compare_letter_page(reference, sample, expected_letters=3, output_dir=output)
+    report = compare_letter_page(
+        reference,
+        sample,
+        expected_letters=3,
+        output_dir=output,
+        refinement_limit=1,
+    )
 
     assert report is not None
     assert report.payload["status"] == "ambiguous"
@@ -385,6 +452,11 @@ def test_reference_segmentation_ambiguity_is_separate_from_match_ambiguity(tmp_p
         )
         match = json.loads((output / item["match_json"]).read_text())
         assert match["segmentation_status"] == "ambiguous"
+        assert item["accepted_reference_id"] is None
+        assert item["identity_status"] == "candidate_diagnostic"
+        pair_payload = json.loads((output / item["report_json"]).read_text())
+        assert pair_payload["identity"]["final_feedback_available"] is False
+        assert pair_payload["writing_feedback"] is None
         assert match["status"] == match["match_status"]
         assert item["match_reason"]
         assert any(
@@ -506,7 +578,113 @@ def test_batch_runs_one_glyph_end_to_end_and_writes_match_reports(tmp_path):
     assert report.payload["reference"]["segmentation"]["candidate_count"] == 3
     assert len(report.payload["matches"]) == 1
     match = report.payload["matches"][0]
-    assert match["reference_id"] in {"ref-000", "ref-001"}
+    assert match["leading_reference_id"] in {"ref-000", "ref-001", "ref-002"}
+    assert match["accepted_reference_id"] is None or match["accepted_reference_id"] in {
+        "ref-000",
+        "ref-001",
+    }
+    if match["leading_reference_id"] == "ref-002":
+        assert match["status"] == "ambiguous"
+        assert match["accepted_reference_id"] is None
     assert (output / match["match_json"]).is_file()
     assert (output / match["report_json"]).is_file()
     assert (output / match["report_dir"] / "report.html").is_file()
+
+
+def test_identity_acceptance_requires_complete_route_evidence_and_a_certain_pair():
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from inkgrammar.comparison.batch import _identity_acceptance_reasons
+    from inkgrammar.comparison.matching import MatchScore
+
+    score = MatchScore(
+        reference_id="ref-e",
+        rank=1,
+        coarse_cost=0.1,
+        raster_cost=0.1,
+        aspect_cost=0.0,
+        fill_cost=0.0,
+        topology_cost=0.0,
+    )
+    search = {"search_truncated": False}
+    missing = _identity_acceptance_reasons(
+        score,
+        progressive_ambiguous=False,
+        segmentation_status="ok",
+        search_metadata=search,
+    )
+    assert "missing_essential_route_evidence" in missing
+    assert "route_pair_unavailable" in missing
+
+    route_ambiguous_score = replace(
+        score,
+        centerline_cost=0.0,
+        fitted_steering_cost=0.0,
+        route_structure_cost=0.0,
+        route_descriptor_cost=0.0,
+        route_topology_cost=0.0,
+        route_pair_selection=SimpleNamespace(ambiguous=True),
+    )
+    clear_score = replace(
+        route_ambiguous_score,
+        route_pair_selection=SimpleNamespace(ambiguous=False),
+    )
+    assert not _identity_acceptance_reasons(
+        clear_score,
+        progressive_ambiguous=False,
+        segmentation_status="ok",
+        search_metadata=search,
+    )
+    route_ambiguous = _identity_acceptance_reasons(
+        route_ambiguous_score,
+        progressive_ambiguous=False,
+        segmentation_status="ok",
+        search_metadata=search,
+    )
+    assert "route_pair_ambiguous" in route_ambiguous
+    assert "missing_essential_route_evidence" not in route_ambiguous
+    assert "segmentation_uncertainty" in _identity_acceptance_reasons(
+        route_ambiguous_score,
+        progressive_ambiguous=False,
+        segmentation_status="ambiguous",
+        search_metadata=search,
+    )
+
+
+def test_refinement_cap_with_a_viable_candidate_marks_batch_result_ambiguous(tmp_path):
+    reference = _page(tmp_path / "reference.png", ("e", "e", "l"), y=22)
+    sample = tmp_path / "sample.png"
+    image = Image.new("RGB", (250, 88), "white")
+    _draw_glyph(ImageDraw.Draw(image), 95, 30, "e")
+    image.save(sample)
+
+    report = compare_letter_page(
+        reference,
+        sample,
+        expected_letters=1,
+        output_dir=tmp_path / "capped-run",
+        refinement_limit=1,
+        no_progress=True,
+    )
+    match = report.payload["matches"][0]
+    assert match["leading_reference_id"] == match["reference_id"]
+    assert match["accepted_reference_id"] is None
+    assert match["identity_status"] == "candidate_diagnostic"
+    assert "reference_search_truncated" in match["acceptance_reasons"]
+    pair_payload = json.loads((tmp_path / "capped-run" / match["report_json"]).read_text())
+    assert pair_payload["identity"]["status"] == "candidate_diagnostic"
+    assert pair_payload["identity"]["accepted_reference_id"] is None
+    assert pair_payload["identity"]["final_feedback_available"] is False
+    assert pair_payload["writing_feedback"] is None
+    pair_html = (tmp_path / "capped-run" / match["report_dir"] / "report.html").read_text()
+    assert "Candidate diagnostic" in pair_html
+    assert "not final handwriting feedback" in pair_html
+    assert "Leading candidate (not accepted)" in report.markdown_path.read_text()
+
+    assert match["status"] == "ambiguous"
+    assert match["search"]["stop_reason"] == "candidate_refinement_limit"
+    assert match["search"]["search_truncated"] is True
+    assert any(
+        source["source"] == "reference_search_truncated" for source in match["ambiguity_sources"]
+    )

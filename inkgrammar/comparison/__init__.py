@@ -12,7 +12,15 @@ from .api import (
 from .batch import compare_letter_page
 from .batch_report import BatchComparisonReport, BatchSampleResult
 from .crop import coerce_crop_rect, crop_image, load_crop
-from .descriptors import GlyphDescriptor, canonicalize_mask, glyph_descriptor
+from .descriptors import (
+    GlyphDescriptor,
+    RouteDescriptor,
+    canonicalize_mask,
+    glyph_descriptor,
+    reverse_route_descriptor,
+    route_descriptor,
+    route_descriptor_distance,
+)
 from .geometry import (
     DifferentialGeometry,
     continuous_differential_geometry,
@@ -20,13 +28,16 @@ from .geometry import (
     legacy_differential_geometry_from_polyline,
 )
 from .matching import (
+    MatchEvidence,
     MatchScore,
+    ProgressiveRefinementResult,
     ReferenceIndex,
     build_reference_index,
     coarse_match_cost,
     match_status,
     rank_reference_candidates,
     refine_match,
+    refine_matches_progressively,
     refine_top_k_matches,
 )
 from .metrics import ComparisonAnalysis, analyze_comparison
@@ -51,6 +62,7 @@ from .models import (
     WritingRoutePairScore,
     WritingRoutePairSelection,
     WritingRouteScore,
+    WritingStructurePolicy,
 )
 from .path import (
     PathExtractionError,
@@ -62,7 +74,11 @@ from .path import (
     resample_path,
 )
 from .report import WrittenComparisonReport, write_comparison_report
-from .routes import generate_writing_route_candidates, select_writing_route_pair
+from .routes import (
+    evaluate_writing_route_pairs,
+    generate_writing_route_candidates,
+    select_writing_route_pair,
+)
 from .segmentation import (
     PageSegmentation,
     ReferenceGallery,
@@ -107,7 +123,9 @@ __all__ = [
     "WritingRoutePairSelection",
     "WritingDirectionPolicy",
     "WritingPriorScore",
+    "WritingStructurePolicy",
     "WritingRouteScore",
+    "evaluate_writing_route_pairs",
     "generate_writing_route_candidates",
     "select_writing_route_pair",
     "WrittenComparisonReport",
@@ -139,15 +157,22 @@ __all__ = [
     "segment_reference_gallery",
     "segment_sample_glyphs",
     "GlyphDescriptor",
+    "RouteDescriptor",
+    "MatchEvidence",
     "MatchScore",
     "ReferenceIndex",
+    "ProgressiveRefinementResult",
     "build_reference_index",
     "canonicalize_mask",
     "coarse_match_cost",
     "glyph_descriptor",
+    "route_descriptor",
+    "route_descriptor_distance",
+    "reverse_route_descriptor",
     "match_status",
     "rank_reference_candidates",
     "refine_match",
+    "refine_matches_progressively",
     "refine_top_k_matches",
     "BatchComparisonReport",
     "BatchSampleResult",

@@ -14,12 +14,13 @@ from skeletonpaths import SubpixelCenterlineOptions
 from .metrics import ComparisonAnalysis, analyze_comparison
 from .models import ComparisonResult, ExtractedLetter, TopologySummary, WritingRouteCandidate
 from .plots import PlotSeries, write_plot
-from .routes import ROUTE_REPORT_LIMIT, ROUTE_SEARCH_LIMIT
+from .routes import ROUTE_REPORT_LIMIT, ROUTE_SEARCH_LIMIT, align_writing_routes
 
 _REFERENCE = (35, 105, 215)
 _SAMPLE = (225, 75, 55)
 
 _MIN_DIAGNOSTIC_SIDE = 640
+_ROUTE_PAIR_REPORT_LIMIT = 8
 
 _PURPLE = (145, 55, 165)
 
@@ -46,6 +47,9 @@ _ARTIFACTS = {
     "writing_path_overlay": "writing-path-overlay.png",
     "writing_path_overlay_svg": "writing-path-overlay.svg",
     "steering_profile": "steering-profile.png",
+    "route_alternatives": "route-alternatives.png",
+    "route_cost_breakdown": "route-cost-breakdown.png",
+    "route_pairs": "route-pairs.json",
     "ink_reconstruction_reference": "ink-reconstruction-reference.png",
     "ink_reconstruction_sample": "ink-reconstruction-sample.png",
     "ink_residual_reference": "ink-residual-reference.png",
@@ -127,11 +131,12 @@ def _draw_point(
     draw: ImageDraw.ImageDraw,
     xy: tuple[float, float],
     color: tuple[int, int, int],
-    label: str,
+    label: str | None = None,
 ) -> None:
     x, y = xy
     draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=color, outline="white", width=1)
-    draw.text((x + 5, y - 8), label, fill=color, font=ImageFont.load_default())
+    if label is not None:
+        draw.text((x + 5, y - 8), label, fill=color, font=ImageFont.load_default())
 
 
 def _write_extraction_images(letter: ExtractedLetter, output_dir: Path, side: str) -> None:
@@ -150,8 +155,8 @@ def _write_extraction_images(letter: ExtractedLetter, output_dir: Path, side: st
     else:
         draw.text((4, 4), "No ink detected", fill=(220, 30, 30))
     endpoints = letter.diagnostics.topology.endpoints
-    for index, point in enumerate(endpoints[:2]):
-        _draw_point(draw, point, _REFERENCE if index == 0 else _SAMPLE, "AB"[index])
+    for point in endpoints[:2]:
+        _draw_point(draw, point, (20, 110, 230))
     extraction.save(output_dir / _ARTIFACTS[f"extraction_{side}"], format="PNG")
 
     skeleton_image = image.copy()
@@ -956,11 +961,243 @@ def _route_candidate_diagnostics(
     ]
 
 
+def _route_pairs_payload(result: ComparisonResult) -> dict[str, Any]:
+    selection = result.route_selection
+    if selection is None:
+        return {"selected_pair": None, "evaluated_pair_count": 0, "pairs": []}
+
+    selected_key = (selection.score.reference_rank, selection.score.sample_rank)
+    pairs = []
+    for pair_rank, score in enumerate(selection.alternatives, start=1):
+        reference = result.reference.route_candidates[score.reference_rank - 1]
+        sample = result.sample.route_candidates[score.sample_rank - 1]
+        pairs.append(
+            {
+                "pair_rank": pair_rank,
+                "reference_route_rank": score.reference_rank,
+                "sample_route_rank": score.sample_rank,
+                "selected": (score.reference_rank, score.sample_rank) == selected_key,
+                "eligible": score.eligible,
+                "reference": {
+                    "stroke_count": len(reference.continuous_strokes),
+                    "pen_lift_count": reference.hypothesis.pen_lift_count,
+                    "ambiguous": reference.ambiguous,
+                },
+                "sample": {
+                    "stroke_count": len(sample.continuous_strokes),
+                    "pen_lift_count": sample.hypothesis.pen_lift_count,
+                    "ambiguous": sample.ambiguous,
+                },
+                "pen_lift_count": score.pen_lift_count,
+                "geometry_cost": score.geometry_cost,
+                "cost_breakdown": score.cost_breakdown,
+                "total_cost": score.total_cost,
+            }
+        )
+    selected_pair = next(pair for pair in pairs if pair["selected"])
+    return {
+        "selected_pair": selected_pair,
+        "evaluated_pair_count": len(pairs),
+        "pairs": pairs,
+    }
+
+
+def _write_route_alternatives(
+    result: ComparisonResult,
+    route_pairs: dict[str, Any],
+    output: Path,
+) -> None:
+    pairs = route_pairs["pairs"][:_ROUTE_PAIR_REPORT_LIMIT]
+    width, panel_height, columns = 1200, 230, 2
+    rows = max(1, (len(pairs) + columns - 1) // columns)
+    image = Image.new("RGB", (width, 42 + rows * panel_height), "white")
+    draw = ImageDraw.Draw(image)
+    title_font = ImageFont.load_default(size=16)
+    body_font = ImageFont.load_default(size=12)
+    draw.text((12, 10), "Evaluated route-pair alternatives", fill=(20, 20, 20), font=title_font)
+
+    if not pairs:
+        draw.text((12, 55), "No joint route pairs are available.", fill=(75, 75, 75))
+        image.save(output, format="PNG")
+        return
+
+    selection = result.route_selection
+    assert selection is not None
+    for index, pair in enumerate(pairs):
+        column, row = index % columns, index // columns
+        left, top = column * 600 + 8, 42 + row * panel_height + 4
+        right, bottom = left + 584, top + panel_height - 8
+        draw.rectangle((left, top, right, bottom), outline=(190, 190, 190), width=1)
+        reference = result.reference.route_candidates[pair["reference_route_rank"] - 1]
+        sample = result.sample.route_candidates[pair["sample_route_rank"] - 1]
+        alignment = align_writing_routes(reference, sample)
+        reference_strokes = reference.continuous_strokes
+        sample_strokes = alignment.aligned_sample_strokes
+        all_points = np.concatenate(
+            [stroke.xy for stroke in (*reference_strokes, *sample_strokes)], axis=0
+        )
+        minimum = all_points.min(axis=0)
+        maximum = all_points.max(axis=0)
+        span = np.maximum(maximum - minimum, 1.0)
+        plot_left, plot_top = left + 14, top + 66
+        plot_width, plot_height = right - left - 28, bottom - top - 96
+        scale = min(plot_width / span[0], plot_height / span[1])
+
+        def project(
+            points: np.ndarray,
+            *,
+            origin: np.ndarray,
+            plot_origin: tuple[int, int],
+            scale: float,
+        ) -> list[tuple[int, int]]:
+            return [
+                (
+                    round(plot_origin[0] + (point[0] - origin[0]) * scale),
+                    round(plot_origin[1] + (point[1] - origin[1]) * scale),
+                )
+                for point in points
+            ]
+
+        for stroke in reference_strokes:
+            points = project(
+                stroke.xy,
+                origin=minimum,
+                plot_origin=(plot_left, plot_top),
+                scale=scale,
+            )
+            draw.line(points, fill=_REFERENCE, width=3)
+        for stroke in sample_strokes:
+            points = project(
+                stroke.xy,
+                origin=minimum,
+                plot_origin=(plot_left, plot_top),
+                scale=scale,
+            )
+            draw.line(points, fill=_SAMPLE, width=3)
+
+        state = "selected" if pair["selected"] else "alternative"
+        eligibility = "eligible" if pair["eligible"] else "not eligible"
+        draw.text(
+            (left + 12, top + 8),
+            f"Pair #{pair['pair_rank']}: R{pair['reference_route_rank']} / "
+            f"S{pair['sample_route_rank']} ({state}, {eligibility})",
+            fill=(20, 20, 20),
+            font=body_font,
+        )
+        draw.text(
+            (left + 12, top + 26),
+            f"R: {len(reference_strokes)} strokes, {reference.hypothesis.pen_lift_count} lifts; "
+            f"S: {len(sample_strokes)} strokes, {sample.hypothesis.pen_lift_count} lifts; "
+            f"total cost {pair['total_cost']:.4f}",
+            fill=(55, 55, 55),
+            font=body_font,
+        )
+        draw.text((left + 14, bottom - 22), "Reference", fill=_REFERENCE, font=body_font)
+        draw.text((left + 92, bottom - 22), "Aligned sample", fill=_SAMPLE, font=body_font)
+    image.save(output, format="PNG")
+
+
+def _write_route_cost_breakdown(route_pairs: dict[str, Any], output: Path) -> None:
+    pairs = route_pairs["pairs"][:_ROUTE_PAIR_REPORT_LIMIT]
+    width, row_height = 1200, 34
+    height = 62 + max(len(pairs), 1) * row_height + 40
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+    title_font = ImageFont.load_default(size=16)
+    body_font = ImageFont.load_default(size=12)
+    draw.text((12, 10), "Additive route-pair cost breakdown", fill=(20, 20, 20), font=title_font)
+    if not pairs:
+        draw.text((12, 46), "No route-pair costs are available.", fill=(75, 75, 75))
+        image.save(output, format="PNG")
+        return
+
+    terms = (
+        ("intrinsic_route_cost", "route plausibility", (95, 95, 95)),
+        ("descriptor_matching_cost", "trajectory descriptor", (145, 55, 165)),
+        ("aligned_centerline_cost", "centerline", (35, 105, 215)),
+        ("steering_profile_cost", "steering", (225, 75, 55)),
+        ("topology_event_compatibility_cost", "topology", (20, 145, 95)),
+        ("writing_prior_cost", "writing prior", (230, 160, 35)),
+    )
+    maximum = max(max(pair["total_cost"] for pair in pairs), 1e-12)
+    bar_left, bar_width = 240, 780
+    for index, pair in enumerate(pairs):
+        y = 48 + index * row_height
+        state = "selected" if pair["selected"] else "alternative"
+        eligibility = "eligible" if pair["eligible"] else "not eligible"
+        draw.text(
+            (12, y + 6),
+            f"#{pair['pair_rank']} R{pair['reference_route_rank']}/S{pair['sample_route_rank']} "
+            f"{state}, {eligibility}",
+            fill=(35, 35, 35),
+            font=body_font,
+        )
+        x = bar_left
+        for key, _label, color in terms:
+            segment_width = round(pair["cost_breakdown"][key] / maximum * bar_width)
+            if segment_width:
+                draw.rectangle((x, y + 4, x + segment_width, y + 24), fill=color)
+            x += segment_width
+        draw.text(
+            (bar_left + bar_width + 10, y + 6),
+            f"{pair['total_cost']:.4f}",
+            fill=(20, 20, 20),
+        )
+
+    legend_y = 52 + len(pairs) * row_height
+    x = 12
+    for _key, label, color in terms:
+        draw.rectangle((x, legend_y, x + 12, legend_y + 12), fill=color)
+        draw.text((x + 17, legend_y - 1), label, fill=(40, 40, 40), font=body_font)
+        x += 190
+    image.save(output, format="PNG")
+
+
+def _write_route_pair_artifacts(result: ComparisonResult, output_dir: Path) -> dict[str, Any]:
+    route_pairs = _route_pairs_payload(result)
+    (output_dir / _ARTIFACTS["route_pairs"]).write_text(
+        json.dumps(route_pairs, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _write_route_alternatives(
+        result,
+        route_pairs,
+        output_dir / _ARTIFACTS["route_alternatives"],
+    )
+    _write_route_cost_breakdown(
+        route_pairs,
+        output_dir / _ARTIFACTS["route_cost_breakdown"],
+    )
+    return route_pairs
+
+
+def _route_pair_rationale(route_pairs: dict[str, Any]) -> str:
+    selected = route_pairs["selected_pair"]
+    if selected is None:
+        return "No jointly evaluated route pair is available."
+    rationale = (
+        f"Route pair R{selected['reference_route_rank']}/S{selected['sample_route_rank']} "
+        f"was selected as the lowest-cost eligible pair with additive total cost "
+        f"{selected['total_cost']:.4f}."
+    )
+    closest = next((pair for pair in route_pairs["pairs"] if not pair["selected"]), None)
+    if closest is not None:
+        rationale += (
+            f" The closest listed alternative is pair #{closest['pair_rank']} "
+            f"(R{closest['reference_route_rank']}/S{closest['sample_route_rank']}) at "
+            f"{closest['total_cost']:.4f}."
+        )
+    return rationale
+
+
 def _writing_payload(result: ComparisonResult, writing_metrics: dict[str, Any]) -> dict[str, Any]:
     selection = result.route_selection
     payload: dict[str, Any] = {
         "available": bool(writing_metrics.get("available")),
         "direction_source": "static_image_geometry_not_observed",
+        "feedback_status": (
+            "final" if result.identity_status == "accepted" else "candidate_diagnostic"
+        ),
         "direction_status": "unavailable",
         "direction_interpretation": _route_direction_interpretation(result),
         "route_ambiguous": selection.ambiguous if selection is not None else None,
@@ -1067,6 +1304,8 @@ def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> d
     )
     selection = result.route_selection
 
+    route_pairs = _route_pairs_payload(result)
+
     def input_payload(letter: ExtractedLetter, side: str) -> dict[str, Any]:
         path = letter.continuous_path
         return {
@@ -1159,6 +1398,7 @@ def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> d
             "reference_rank": selection.score.reference_rank,
             "sample_rank": selection.score.sample_rank,
             "ambiguous": selection.ambiguous,
+            "eligible": selection.score.eligible,
             "score": {
                 "intrinsic_route_cost": selection.score.intrinsic_route_cost,
                 "aligned_centerline_cost": selection.score.aligned_centerline_cost,
@@ -1169,6 +1409,8 @@ def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> d
                 "geometry_cost": selection.score.geometry_cost,
                 "writing_prior_cost": selection.score.writing_prior_cost,
                 "pen_lift_count": selection.score.pen_lift_count,
+                "descriptor_matching_cost": selection.score.descriptor_matching_cost,
+                "cost_breakdown": selection.score.cost_breakdown,
                 "total_cost": selection.score.total_cost,
             },
             "alternatives": [
@@ -1176,6 +1418,9 @@ def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> d
                     "reference_rank": score.reference_rank,
                     "sample_rank": score.sample_rank,
                     "total_cost": score.total_cost,
+                    "eligible": score.eligible,
+                    "descriptor_matching_cost": score.descriptor_matching_cost,
+                    "cost_breakdown": score.cost_breakdown,
                 }
                 for score in selection.alternatives
             ],
@@ -1201,6 +1446,9 @@ def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> d
             "plot_curvature_error",
             "plot_cumulative_turn",
             "plot_width",
+            "route_alternatives",
+            "route_cost_breakdown",
+            "route_pairs",
         )
     ]
     primary_artifacts = [_ARTIFACTS["input_reference"], _ARTIFACTS["input_sample"]]
@@ -1210,6 +1458,9 @@ def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> d
                 _ARTIFACTS["writing_path_overlay"],
                 _ARTIFACTS["writing_path_overlay_svg"],
                 _ARTIFACTS["steering_profile"],
+                _ARTIFACTS["route_alternatives"],
+                _ARTIFACTS["route_cost_breakdown"],
+                _ARTIFACTS["route_pairs"],
             )
         )
     if analysis.metrics["reconstruction"]["available"]:
@@ -1231,6 +1482,11 @@ def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> d
             "sample_id": result.identity.sample_id,
             "reference_id": result.identity.reference_id,
             "label": result.identity.label,
+            "status": result.identity_status,
+            "accepted_reference_id": (
+                result.identity.reference_id if result.identity_status == "accepted" else None
+            ),
+            "final_feedback_available": result.identity_status == "accepted",
         },
         "interpretation": {
             "direction_source": "static_image_geometry_not_observed",
@@ -1288,6 +1544,7 @@ def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> d
             "interpretation": "Nuisance normalization, not a handwriting-quality score.",
         },
         "writing": writing_payload,
+        "writing_feedback": (writing_payload if result.identity_status == "accepted" else None),
         "reconstruction": analysis.metrics["reconstruction"],
         "diagnostics": {
             "geometry": {
@@ -1326,6 +1583,7 @@ def _report_payload(result: ComparisonResult, analysis: ComparisonAnalysis) -> d
             "candidate_routes": candidate_routes,
             "route_search": route_search,
             "selected_route_pair": selected_route_pair,
+            "route_pairs": route_pairs,
         },
         "artifacts": {
             **_ARTIFACTS,
@@ -1430,13 +1688,19 @@ def _writing_summary_rows(writing: dict[str, Any]) -> list[tuple[str, str, str, 
 
 def _markdown(result: ComparisonResult, payload: dict[str, Any]) -> str:
     writing = payload["writing"]
+    route_pairs = payload["diagnostics"]["route_pairs"]
+    writing_heading = (
+        "Candidate diagnostic, not final handwriting feedback"
+        if result.identity_status == "candidate_diagnostic"
+        else "Writing summary"
+    )
     rows = [
         f"# {_comparison_title(result)}",
         "",
         "![Reference crop](input-reference.png)",
         "![My writing crop](input-sample.png)",
         "",
-        "## 1. Writing summary",
+        f"## 1. {writing_heading}",
         "",
         writing["direction_interpretation"],
         "",
@@ -1465,12 +1729,24 @@ def _markdown(result: ComparisonResult, payload: dict[str, Any]) -> str:
         )
     else:
         rows.append(f"Route overlay unavailable: {writing['unavailable_reason']}")
-    rows.extend(("", "## 3. Fitted steering profile", ""))
+    rows.extend(
+        (
+            "",
+            "## 3. Routing alternatives",
+            "",
+            f"Why this pair won: {_route_pair_rationale(route_pairs)}",
+            "",
+            "![Ranked route-pair alternatives](route-alternatives.png)",
+            "![Additive route-pair costs](route-cost-breakdown.png)",
+            "All evaluated pairs and cost terms are in [route-pairs.json](route-pairs.json).",
+        )
+    )
+    rows.extend(("", "## 4. Fitted steering profile", ""))
     if writing["available"]:
         rows.append("![Fitted heading-rate profiles](steering-profile.png)")
     else:
         rows.append("A fitted steering profile is unavailable without a jointly selected route.")
-    rows.extend(("", "## 4. Ink reconstruction", ""))
+    rows.extend(("", "## 5. Ink reconstruction", ""))
     reconstruction = payload["reconstruction"]
     if reconstruction["available"]:
         rows.extend(
@@ -1487,10 +1763,15 @@ def _markdown(result: ComparisonResult, payload: dict[str, Any]) -> str:
     rows.extend(
         (
             "",
-            "<details><summary>5. Engineering diagnostics</summary>",
+            "<details><summary>6. Engineering diagnostics</summary>",
             "",
             "Raw geometry, skeleton pixels, candidate routes, and numeric series are retained "
             "in [report.json](report.json).",
+            "Diagnostic overlays are annotations, not source ink; "
+            "clean masks are shown separately.",
+            "",
+            "![Clean reference mask](mask-reference.png)",
+            "![Clean sample mask](mask-sample.png)",
             "",
             "![Position error diagnostic](plot-position-error.png)",
             "![Raw X/Y diagnostic](plot-x-y.png)",
@@ -1508,14 +1789,24 @@ def _markdown(result: ComparisonResult, payload: dict[str, Any]) -> str:
 
 def _comparison_title(result: ComparisonResult) -> str:
     if result.letter is not None:
-        return f"Letter comparison: {result.letter}"
-    identity = result.identity
-    assert identity is not None
-    return f"Glyph comparison: {identity.sample_id} to {identity.reference_id}"
+        title = f"Letter comparison: {result.letter}"
+    else:
+        identity = result.identity
+        assert identity is not None
+        title = f"Glyph comparison: {identity.sample_id} to {identity.reference_id}"
+    if result.identity_status == "candidate_diagnostic":
+        return f"Candidate diagnostic (identity not accepted): {title}"
+    return title
 
 
 def _html(result: ComparisonResult, payload: dict[str, Any]) -> str:
     writing = payload["writing"]
+    route_pairs = payload["diagnostics"]["route_pairs"]
+    writing_heading = (
+        "Candidate diagnostic, not final handwriting feedback"
+        if result.identity_status == "candidate_diagnostic"
+        else "Writing summary"
+    )
     reconstruction = payload["reconstruction"]
 
     def image(name: str, alt: str) -> str:
@@ -1547,7 +1838,7 @@ def _html(result: ComparisonResult, payload: dict[str, Any]) -> str:
         image(_ARTIFACTS["input_reference"], "Reference crop"),
         image(_ARTIFACTS["input_sample"], "My writing crop"),
         "</div>",
-        "<h2>1. Writing summary</h2>",
+        f"<h2>1. {html.escape(writing_heading)}</h2>",
         f"<p>{html.escape(writing['direction_interpretation'])} "
         "Differences are descriptive, not correctness scores.</p>",
         "<table><thead><tr><th>Feature</th><th>Reference</th><th>My writing</th>"
@@ -1577,7 +1868,18 @@ def _html(result: ComparisonResult, payload: dict[str, Any]) -> str:
             "unavailable_reason", "A jointly selected route is unavailable."
         )
         rows.append(f"<p>{html.escape(unavailable_reason)}</p>")
-    rows.extend(("<h2>3. Fitted steering profile</h2>",))
+    rows.extend(
+        (
+            "<h2>3. Routing alternatives</h2>",
+            f"<p>Why this pair won: {html.escape(_route_pair_rationale(route_pairs))}</p>",
+            '<div class="grid">',
+            image(_ARTIFACTS["route_alternatives"], "Ranked aligned route-pair alternatives"),
+            image(_ARTIFACTS["route_cost_breakdown"], "Additive route-pair cost breakdown"),
+            "</div>",
+            '<p><a href="route-pairs.json">Complete evaluated route pairs and cost terms</a></p>',
+        )
+    )
+    rows.extend(("<h2>4. Fitted steering profile</h2>",))
     if writing["available"]:
         rows.extend(
             (
@@ -1592,7 +1894,7 @@ def _html(result: ComparisonResult, payload: dict[str, Any]) -> str:
         rows.append(
             "<p>A fitted steering profile is unavailable without a jointly selected route.</p>"
         )
-    rows.append("<h2>4. Ink reconstruction</h2>")
+    rows.append("<h2>5. Ink reconstruction</h2>")
     if reconstruction["available"]:
         rows.extend(
             (
@@ -1625,12 +1927,16 @@ def _html(result: ComparisonResult, payload: dict[str, Any]) -> str:
         rows.append(f"<p>{html.escape(unavailable_reason)}</p>")
     rows.extend(
         (
-            "<details><summary>5. Engineering diagnostics</summary>",
-            "<p>Raw geometry, skeleton pixels, candidate routes, and numeric series "
-            "are secondary diagnostics.</p>",
+            "<details><summary>6. Engineering diagnostics</summary>",
+            "<p>Raw geometry, skeleton pixels, candidate routes, and "
+            "numeric series are secondary diagnostics.</p>",
+            "<p>Diagnostic overlays are annotations, not source ink; "
+            "clean masks are shown separately.</p>",
             '<div class="grid">',
             image(_ARTIFACTS["extraction_reference"], "Reference extraction diagnostics"),
             image(_ARTIFACTS["extraction_sample"], "Sample extraction diagnostics"),
+            image(_ARTIFACTS["mask_reference"], "Clean reference mask"),
+            image(_ARTIFACTS["mask_sample"], "Clean sample mask"),
             image(_ARTIFACTS["skeleton_reference"], "Reference skeleton diagnostics"),
             image(_ARTIFACTS["skeleton_sample"], "Sample skeleton diagnostics"),
             image(_ARTIFACTS["plot_position_error"], "Position error diagnostic"),
@@ -1748,6 +2054,9 @@ def _write_raster_only_report(
             "skeleton_reference",
             "skeleton_sample",
             "overlay_raster",
+            "route_alternatives",
+            "route_cost_breakdown",
+            "route_pairs",
             "report_json",
             "report_markdown",
             "report_html",
@@ -1761,6 +2070,11 @@ def _write_raster_only_report(
             "sample_id": identity.sample_id,
             "reference_id": identity.reference_id,
             "label": identity.label,
+            "status": result.identity_status,
+            "accepted_reference_id": (
+                identity.reference_id if result.identity_status == "accepted" else None
+            ),
+            "final_feedback_available": result.identity_status == "accepted",
         },
         "interpretation": {
             "direction_source": "unavailable_without_jointly_selected_route",
@@ -1797,6 +2111,7 @@ def _write_raster_only_report(
         "inputs": inputs,
         "alignment": None,
         "writing": writing,
+        "writing_feedback": (writing if result.identity_status == "accepted" else None),
         "reconstruction": reconstruction,
         "diagnostics": {
             "geometry": {
@@ -1850,6 +2165,7 @@ def _write_raster_only_report(
                 "sample": _route_candidate_diagnostics(sample, None),
             },
             "selected_route_pair": None,
+            "route_pairs": _route_pairs_payload(result),
         },
         "artifacts": {
             **artifacts,
@@ -1869,6 +2185,11 @@ def _write_raster_only_report(
         ),
     }
     report_title = _comparison_title(result)
+    writing_heading = (
+        "Candidate diagnostic, not final handwriting feedback"
+        if result.identity_status == "candidate_diagnostic"
+        else "Writing summary"
+    )
     (output_dir / _ARTIFACTS["report_json"]).write_text(
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -1879,7 +2200,7 @@ def _write_raster_only_report(
         "![Reference crop](input-reference.png)",
         "![My writing crop](input-sample.png)",
         "",
-        "## 1. Writing summary",
+        f"## 1. {writing_heading}",
         "",
         writing["direction_interpretation"],
         "",
@@ -1927,7 +2248,7 @@ def _write_raster_only_report(
         "figure{display:inline-block;vertical-align:top}"
         "details{margin-top:2rem}</style></head><body>"
         f"<h1>{html.escape(report_title)}</h1><div>{image_html}</div>"
-        "<h2>1. Writing summary</h2>"
+        f"<h2>1. {html.escape(writing_heading)}</h2>"
         f"<p>{html.escape(writing['direction_interpretation'])}</p>"
         f"<p>Route-based writing measurements are unavailable: {html.escape(unavailable)}</p>"
         "<h2>2. Route geometry comparison</h2>"
@@ -1938,6 +2259,10 @@ def _write_raster_only_report(
         "<p>Unavailable without a comparable route and width model.</p>"
         "<details><summary>5. Engineering diagnostics</summary>"
         f'<p><img src="{artifacts["overlay_raster"]}" alt="Unaligned observed masks"></p>'
+        f'<p><img src="{artifacts["mask_reference"]}" alt="Clean reference mask"></p>'
+        f'<p><img src="{artifacts["mask_sample"]}" alt="Clean sample mask"></p>'
+        "<p>Diagnostic overlays are annotations, not source ink; "
+        "clean masks are shown separately.</p>"
         f"<pre>{html.escape(json.dumps(payload['diagnostics']['metrics'], indent=2))}</pre>"
         '<p><a href="report.json">Full report JSON</a></p></details></body></html>'
     )
@@ -1951,6 +2276,7 @@ def write_comparison_report(
 ) -> WrittenComparisonReport:
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
+    _write_route_pair_artifacts(result, destination)
     if result.alignment is None and result.route_alignment is None:
         return _write_raster_only_report(result, destination)
 

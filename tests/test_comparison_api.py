@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from PIL import Image, ImageChops, ImageDraw
 from typer.testing import CliRunner
 
@@ -232,6 +233,9 @@ def test_label_free_comparison_writes_raster_report_when_route_search_fails(tmp_
         "sample_id": "sample-000",
         "reference_id": "ref-004",
         "label": None,
+        "status": "accepted",
+        "accepted_reference_id": "ref-004",
+        "final_feedback_available": True,
     }
     capabilities = report.payload["capabilities"]
     assert capabilities["raster"] is True
@@ -292,3 +296,98 @@ def test_changed_smoothing_options_warn_and_do_not_change_continuous_geometry(tm
         default_analysis.reference_geometry.turn_rate_rad_per_progress,
         changed_analysis.reference_geometry.turn_rate_rad_per_progress,
     )
+
+
+def test_segmented_extraction_passes_assigned_mark_stroke_prior(monkeypatch):
+    import inkgrammar.comparison.api as comparison_api
+    from inkgrammar.comparison.models import WritingStructurePolicy
+    from inkgrammar.comparison.segmentation import SegmentedGlyph
+
+    mask = np.zeros((16, 16), dtype=bool)
+    mask[4, 2:9] = True
+    mask[1, 11] = True
+    mask[12, 12] = True
+    candidate = SegmentedGlyph(
+        glyph_id="sample",
+        bbox=CropRect(x=0, y=0, width=16, height=16),
+        row_index=0,
+        column_index=0,
+        reading_order=0,
+        segmentation_confidence=1.0,
+        image=Image.new("RGB", (16, 16), "white"),
+        mask=mask,
+        component_indices=(0, 1, 2),
+        primary_component_indices=(0,),
+        secondary_component_indices=(1,),
+        ambiguous_component_indices=(2,),
+        secondary_mark_centroids=((0.8, 0.1),),
+    )
+    policy = WritingStructurePolicy(preferred_body_strokes=2)
+    captured = {}
+
+    def capture_search(_diagnostics, **kwargs):
+        captured.update(kwargs)
+        return ()
+
+    monkeypatch.setattr(comparison_api, "generate_writing_route_candidates", capture_search)
+    extracted = comparison_api.extract_segmented_glyph(
+        candidate,
+        source_path="sample.png",
+        writing_structure_policy=policy,
+    )
+    assert extracted.component_role_sequence == ("primary", "secondary", "ambiguous")
+    assert extracted.secondary_mark_centroids == ((0.8, 0.1),)
+
+    assert captured["expected_strokes"] == 3
+    assert captured["structure_policy"] is policy
+    assert captured["ambiguous_component_count"] == 1
+
+
+def test_comparison_reuses_the_route_pair_selection_from_retrieval(monkeypatch) -> None:
+    import inkgrammar.comparison.api as comparison_api
+    from inkgrammar.comparison.models import ComparisonIdentity
+    from inkgrammar.comparison.routes import evaluate_writing_route_pairs
+    from inkgrammar.comparison.segmentation import SegmentedGlyph
+    from inkgrammar.comparison.steering import fit_writing_route_candidates
+
+    mask = np.zeros((32, 32), dtype=bool)
+    mask[15, 5:28] = True
+    candidate = SegmentedGlyph(
+        glyph_id="glyph",
+        bbox=CropRect(x=0, y=0, width=32, height=32),
+        row_index=0,
+        column_index=0,
+        reading_order=0,
+        segmentation_confidence=1.0,
+        image=Image.new("RGB", (32, 32), "white"),
+        mask=mask,
+        component_indices=(0,),
+        primary_component_indices=(0,),
+    )
+    extracted = comparison_api.extract_segmented_glyph(candidate, source_path="glyph.png")
+    fitted = fit_writing_route_candidates(extracted.route_candidates)
+    selection = evaluate_writing_route_pairs(
+        fitted,
+        fitted,
+        reference_descriptors=extracted.route_descriptors,
+        sample_descriptors=extracted.route_descriptors,
+    )
+
+    def unexpected_pair_evaluation(*_args, **_kwargs):
+        pytest.fail("retrieval's selected route pair must be reused")
+
+    monkeypatch.setattr(
+        comparison_api,
+        "evaluate_writing_route_pairs",
+        unexpected_pair_evaluation,
+    )
+    result = comparison_api.compare_extracted_letters(
+        extracted,
+        extracted,
+        identity=ComparisonIdentity("sample", "reference", "x"),
+        route_pair_selection=selection,
+    )
+
+    assert result.route_selection is selection
+    assert result.reference.selected_route is selection.reference
+    assert result.sample.selected_route is selection.sample

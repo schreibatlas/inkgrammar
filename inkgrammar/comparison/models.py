@@ -16,6 +16,7 @@ from ..models import StrictModel
 if TYPE_CHECKING:
     from planarcurve.fitting import TrajectoryModelSelectionResult
 
+    from .descriptors import RouteDescriptor
 InkMode = MaskMode
 InkMaskResult = MaskResult
 
@@ -161,6 +162,7 @@ class WritingRouteScore:
     steering_complexity_cost: float
     junction_pairing_cost: float = 0.0
     counterpart_similarity_cost: float | None = None
+    structure_prior_cost: float = 0.0
 
     @property
     def intrinsic_cost(self) -> float:
@@ -171,6 +173,7 @@ class WritingRouteScore:
             + 10.0 * self.continuity_cost
             + self.steering_complexity_cost
             + self.junction_pairing_cost
+            + self.structure_prior_cost
         )
 
 
@@ -197,6 +200,29 @@ class WritingDirectionPolicy:
         )
         if any(not np.isfinite(value) or value < 0.0 for value in weights):
             raise ValueError("writing direction policy values must be finite and nonnegative")
+
+
+@dataclass(frozen=True)
+class WritingStructurePolicy:
+    preferred_body_strokes: int = 1
+    detached_mark_stroke_weight: float = 0.25
+    unexpected_body_lift_weight: float = 0.25
+    side_component_penalty: float = 0.25
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.preferred_body_strokes, bool)
+            or not isinstance(self.preferred_body_strokes, int)
+            or self.preferred_body_strokes < 1
+        ):
+            raise ValueError("preferred_body_strokes must be a positive integer")
+        weights = (
+            self.detached_mark_stroke_weight,
+            self.unexpected_body_lift_weight,
+            self.side_component_penalty,
+        )
+        if any(not np.isfinite(value) or value < 0.0 for value in weights):
+            raise ValueError("writing structure policy weights must be finite and nonnegative")
 
 
 @dataclass(frozen=True)
@@ -242,6 +268,27 @@ class WritingRoutePairScore:
     geometry_cost: float = 0.0
     writing_prior_cost: float = 0.0
     pen_lift_count: int = 0
+    descriptor_matching_cost: float = 0.0
+
+    eligible: bool = False
+
+    @property
+    def cost_breakdown(self) -> dict[str, float]:
+        return {
+            "intrinsic_route_cost": self.intrinsic_route_cost,
+            "aligned_centerline_cost": self.aligned_centerline_cost,
+            "steering_profile_cost": self.steering_profile_cost,
+            "topology_event_compatibility_cost": self.topology_event_compatibility_cost,
+            "writing_prior_cost": self.writing_prior_cost,
+            "descriptor_matching_cost": self.descriptor_matching_cost,
+        }
+
+    def __post_init__(self) -> None:
+        costs = (*self.cost_breakdown.values(), self.geometry_cost, self.total_cost)
+        if any(not np.isfinite(cost) or cost < 0.0 for cost in costs):
+            raise ValueError("route-pair costs must be finite and nonnegative")
+        if not np.isclose(self.total_cost, sum(self.cost_breakdown.values())):
+            raise ValueError("total_cost must equal the sum of named route-pair costs")
 
 
 @dataclass(frozen=True)
@@ -352,12 +399,25 @@ class ExtractedLetter:
     continuous_path: ContinuousPath | None = None
     geometry_warning: str | None = None
     route_candidates: tuple[WritingRouteCandidate, ...] = ()
+    route_descriptors: tuple[RouteDescriptor, ...] = ()
     foreground_evidence: ForegroundEvidence | None = None
+    component_role_sequence: tuple[str, ...] = ()
+    secondary_mark_centroids: tuple[tuple[float, float], ...] = ()
     selected_route: WritingRouteCandidate | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_path", Path(self.source_path))
+        object.__setattr__(self, "component_role_sequence", tuple(self.component_role_sequence))
+        object.__setattr__(self, "secondary_mark_centroids", tuple(self.secondary_mark_centroids))
+        if any(
+            len(centroid) != 2 or not np.isfinite(centroid).all()
+            for centroid in self.secondary_mark_centroids
+        ):
+            raise ValueError("secondary mark centroids must be finite coordinate pairs")
         object.__setattr__(self, "route_candidates", tuple(self.route_candidates))
+        object.__setattr__(self, "route_descriptors", tuple(self.route_descriptors))
+        if self.route_descriptors and len(self.route_descriptors) != len(self.route_candidates):
+            raise ValueError("route descriptors must align with route candidates")
         expected_shape = (self.crop.height, self.crop.width)
         if self.image.size != (self.crop.width, self.crop.height):
             raise ValueError("extracted image dimensions must match its crop rectangle")
@@ -405,6 +465,7 @@ class ComparisonResult:
     smoothing_polynomial_order: int = 2
     warnings: list[str] = field(default_factory=list)
     identity: ComparisonIdentity | None = None
+    identity_status: Literal["accepted", "candidate_diagnostic"] = "accepted"
     route_selection: WritingRoutePairSelection | None = None
     route_alignment: WritingRouteAlignment | None = None
 

@@ -67,7 +67,13 @@ def compare_letter_command(
         None,
         "--top-k",
         min=1,
-        help="Number of ranked reference candidates to refine (automatic mode; default: 5).",
+        help="Number of ranked reference alternatives to report (automatic mode; default: 5).",
+    ),  # noqa: B008
+    refinement_limit: int | None = typer.Option(
+        None,
+        "--refinement-limit",
+        min=1,
+        help="Maximum candidates progressively refined per sample (automatic mode; default: 32).",
     ),  # noqa: B008
     reference_profile: str | None = typer.Option(
         None,
@@ -102,6 +108,7 @@ def compare_letter_command(
         if (
             top_k is not None
             or reference_profile is not None
+            or refinement_limit is not None
             or no_progress
             or verbose
             or segment_only
@@ -121,6 +128,7 @@ def compare_letter_command(
                 expected_letters=letters,
                 output_dir=output,
                 top_k=5 if top_k is None else top_k,
+                refinement_limit=32 if refinement_limit is None else refinement_limit,
                 reference_profile="alphabet" if reference_profile is None else reference_profile,
                 no_progress=no_progress,
                 verbose=verbose,

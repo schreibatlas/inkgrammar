@@ -3,13 +3,27 @@ from __future__ import annotations
 from dataclasses import replace
 
 import numpy as np
+import pytest
+from PIL import Image
 
-from inkgrammar.comparison.models import ContinuousPath, WritingRouteScore
+from inkgrammar.comparison.descriptors import (
+    reverse_route_descriptor,
+    route_descriptor,
+    route_descriptor_distance,
+)
+from inkgrammar.comparison.models import (
+    ContinuousPath,
+    CropRect,
+    WritingRouteScore,
+    WritingStructurePolicy,
+)
 from inkgrammar.comparison.routes import (
     ROUTE_REPORT_LIMIT,
+    evaluate_writing_route_pairs,
     generate_writing_route_candidates,
     select_writing_route_pair,
 )
+from inkgrammar.comparison.segmentation import SegmentedGlyph
 from inkgrammar.comparison.skeleton import analyze_skeleton
 
 
@@ -108,11 +122,12 @@ def test_route_search_uses_stroke_diversity_and_global_reversal(monkeypatch) -> 
         return original_search(analysis, **kwargs)
 
     monkeypatch.setattr(routes, "stroke_hypotheses_from_analysis", capture_search)
-    candidates = routes.generate_writing_route_candidates(diagnostics)
+    candidates = routes.generate_writing_route_candidates(diagnostics, expected_strokes=2)
 
     assert routes.ROUTE_SEARCH_LIMIT > ROUTE_REPORT_LIMIT
     assert search_options["limit"] == routes.ROUTE_SEARCH_LIMIT
     assert search_options["diversity"] == "stroke-count"
+    assert search_options["expected_strokes"] == 2
     native = next(
         candidate for candidate in candidates if candidate.orientation_variant == "native"
     )
@@ -138,6 +153,7 @@ def test_joint_route_selection_is_deterministic_and_marks_near_ties() -> None:
     assert (selected.score.reference_rank, selected.score.sample_rank) == (1, 1)
     assert not selected.ambiguous
     assert selected.score.total_cost < selected.alternatives[1].total_cost
+    assert selected.score.total_cost == pytest.approx(sum(selected.score.cost_breakdown.values()))
 
     tied = select_writing_route_pair(
         (_route(candidate, straight), _route(candidate, straight)),
@@ -145,6 +161,33 @@ def test_joint_route_selection_is_deterministic_and_marks_near_ties() -> None:
     )
     assert (tied.score.reference_rank, tied.score.sample_rank) == (1, 1)
     assert tied.ambiguous
+
+
+def test_route_pair_evaluation_includes_descriptor_cost_in_additive_breakdown() -> None:
+    candidate = _candidate()
+    straight = _route(
+        candidate,
+        _continuous_path(((0, 0), (1, 0), (2, 0), (3, 0))),
+    )
+    curved = _route(
+        candidate,
+        _continuous_path(((0, 0), (1, 1), (2, -1), (3, 0))),
+    )
+    reference_descriptors = (route_descriptor(straight), route_descriptor(curved))
+    sample_descriptors = (route_descriptor(curved),)
+
+    result = evaluate_writing_route_pairs(
+        (straight, curved),
+        (curved,),
+        reference_descriptors=reference_descriptors,
+        sample_descriptors=sample_descriptors,
+    )
+
+    assert result.score.reference_rank == 2
+    assert len(result.alternatives) == 2
+    assert result.score.descriptor_matching_cost == pytest.approx(0.0)
+    assert result.alternatives[1].descriptor_matching_cost > 0.0
+    assert result.score.total_cost == pytest.approx(sum(result.score.cost_breakdown.values()))
 
 
 def test_planarcurve_fit_summary_and_width_normalization() -> None:
@@ -222,3 +265,43 @@ def test_internal_graph_edge_boundary_is_not_a_writing_event() -> None:
     )
 
     assert transitions == ()
+
+
+def test_writing_structure_prior_is_soft_and_uses_assigned_mark_count() -> None:
+    from inkgrammar.comparison.routes import _writing_structure_prior_cost
+
+    policy = WritingStructurePolicy()
+    assert _writing_structure_prior_cost(1, 1, policy, 0) == 0.0
+    assert _writing_structure_prior_cost(2, 1, policy, 0) > 0.0
+    assert _writing_structure_prior_cost(2, 2, policy, 0) == 0.0
+    assert _writing_structure_prior_cost(1, 2, policy, 0) == policy.detached_mark_stroke_weight
+    assert _writing_structure_prior_cost(1, 1, policy, 1) == policy.side_component_penalty
+
+
+def test_route_descriptor_uses_planarcurve_and_carries_component_roles() -> None:
+    candidate = _candidate()
+    glyph = SegmentedGlyph(
+        glyph_id="glyph",
+        bbox=CropRect(x=0, y=0, width=32, height=32),
+        row_index=0,
+        column_index=0,
+        reading_order=0,
+        segmentation_confidence=1.0,
+        image=Image.new("RGB", (32, 32), "white"),
+        mask=np.ones((32, 32), dtype=bool),
+        component_indices=(0, 1, 2),
+        primary_component_indices=(0,),
+        secondary_component_indices=(1,),
+        ambiguous_component_indices=(2,),
+        secondary_mark_centroids=((0.8, 0.2),),
+    )
+    descriptor = route_descriptor(candidate, glyph)
+    reversed_descriptor = reverse_route_descriptor(descriptor)
+
+    assert descriptor.stroke_count == 1
+    assert descriptor.pen_lift_count == 0
+    assert descriptor.secondary_mark_count == 1
+    assert descriptor.component_role_sequence == ("primary", "secondary", "ambiguous")
+    assert descriptor.relative_mark_centroids == ((0.8, 0.2),)
+    assert route_descriptor_distance(descriptor, descriptor) == pytest.approx(0.0)
+    assert route_descriptor_distance(descriptor, reversed_descriptor) == pytest.approx(0.0)

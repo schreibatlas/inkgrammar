@@ -10,8 +10,14 @@ from .matching import (
     AMBIGUITY_ABSOLUTE_MARGIN,
     AMBIGUITY_RELATIVE_MARGIN,
     ASPECT_WEIGHT,
+    CENTERLINE_WEIGHT,
     FILL_WEIGHT,
+    FITTED_STEERING_WEIGHT,
+    HEADING_WEIGHT,
     RASTER_WEIGHT,
+    ROUTE_DESCRIPTOR_WEIGHT,
+    ROUTE_STRUCTURE_WEIGHT,
+    ROUTE_TOPOLOGY_WEIGHT,
     TOPOLOGY_WEIGHT,
     MatchScore,
 )
@@ -24,12 +30,16 @@ class BatchSampleResult:
     sample_bbox: CropRect
     sample_confidence: float
     reference_id: str
+    leading_reference_id: str
+    accepted_reference_id: str | None
+    acceptance_reasons: tuple[str, ...]
     reference_label: str | None
     status: str
     segmentation_status: str
     segmentation_warnings: tuple[str, ...]
     score: MatchScore
     alternatives: tuple[MatchScore, ...]
+    search_metadata: dict[str, Any]
     report_dir: Path
     report_json: Path
 
@@ -53,6 +63,19 @@ class BatchComparisonReport:
 
 
 def match_score_payload(score: MatchScore) -> dict[str, Any]:
+    selection = score.route_pair_selection
+    route_pair = (
+        None
+        if selection is None
+        else {
+            "reference_route_rank": selection.score.reference_rank,
+            "sample_route_rank": selection.score.sample_rank,
+            "ambiguous": selection.ambiguous,
+            "eligible": selection.score.eligible,
+            "total_cost": selection.score.total_cost,
+            "cost_breakdown": selection.score.cost_breakdown,
+        }
+    )
     return {
         "reference_id": score.reference_id,
         "rank": score.rank,
@@ -67,6 +90,14 @@ def match_score_payload(score: MatchScore) -> dict[str, Any]:
         "heading_cost": score.heading_cost,
         "fitted_steering_cost": score.fitted_steering_cost,
         "route_structure_cost": score.route_structure_cost,
+        "route_descriptor_cost": score.route_descriptor_cost,
+        "route_topology_cost": score.route_topology_cost,
+        "missing_evidence_penalty": score.missing_evidence_penalty,
+        "feature_coverage": {
+            "available_features": list(score.evidence.available_features),
+            "unavailable_features": list(score.evidence.unavailable_features),
+        },
+        "route_pair_selection": route_pair,
     }
 
 
@@ -79,10 +110,12 @@ def match_reason(score: MatchScore, alternatives: tuple[MatchScore, ...]) -> str
         "aspect": ("aspect_cost", ASPECT_WEIGHT),
         "fill": ("fill_cost", FILL_WEIGHT),
         "topology": ("topology_cost", TOPOLOGY_WEIGHT),
-        "centerline": ("centerline_cost", 0.45),
-        "heading": ("heading_cost", 0.15),
-        "fitted steering": ("fitted_steering_cost", 0.15),
-        "route structure": ("route_structure_cost", 0.10),
+        "centerline": ("centerline_cost", CENTERLINE_WEIGHT),
+        "heading": ("heading_cost", HEADING_WEIGHT),
+        "fitted steering": ("fitted_steering_cost", FITTED_STEERING_WEIGHT),
+        "route structure": ("route_structure_cost", ROUTE_STRUCTURE_WEIGHT),
+        "route descriptor": ("route_descriptor_cost", ROUTE_DESCRIPTOR_WEIGHT),
+        "route topology": ("route_topology_cost", ROUTE_TOPOLOGY_WEIGHT),
     }
     advantages = []
     for label, (attribute, weight) in weights.items():
@@ -107,8 +140,24 @@ def ambiguity_sources(
     segmentation_status: str,
     segmentation_warnings: tuple[str, ...],
     pair_report_json: Path | None = None,
+    search_metadata: dict[str, Any] | None = None,
+    acceptance_reasons: tuple[str, ...] = (),
 ) -> list[dict[str, str]]:
     sources = []
+    if search_metadata is not None and search_metadata["search_truncated"]:
+        unrefined_count = (
+            search_metadata["coarse_candidate_count"] - search_metadata["refined_candidate_count"]
+        )
+        sources.append(
+            {
+                "source": "reference_search_truncated",
+                "reason": (
+                    f"Reference refinement reached its limit of "
+                    f"{search_metadata['refinement_limit']} candidates with "
+                    f"{unrefined_count} unrefined candidates still able to affect the decision."
+                ),
+            }
+        )
     if match_status == "ambiguous" and alternatives:
         next_cost = alternatives[0].cost
         margin = next_cost - score.cost
@@ -174,6 +223,36 @@ def ambiguity_sources(
                     ),
                 }
             )
+    acceptance_source_aliases = {
+        "reference_search_truncated": {"reference_search_truncated"},
+        "retrieval_ambiguity": {"match_cost_tie"},
+        "segmentation_uncertainty": {"segmentation_uncertainty"},
+        "route_pair_ambiguous": {"writing_route_hypothesis", "writing_route_pair_tie"},
+    }
+    acceptance_reasons_text = {
+        "reference_search_truncated": (
+            "Reference refinement stopped before all competitive candidates were evaluated."
+        ),
+        "retrieval_ambiguity": (
+            "Several reference candidates remain within the retrieval ambiguity margin."
+        ),
+        "segmentation_uncertainty": "Sample or reference segmentation is materially uncertain.",
+        "missing_essential_route_evidence": (
+            "Essential route evidence is unavailable for this match."
+        ),
+        "route_pair_unavailable": "No joint route-pair selection was available.",
+        "route_pair_ambiguous": "The selected route pair remains materially ambiguous.",
+    }
+    existing_sources = {source["source"] for source in sources}
+    for reason in acceptance_reasons:
+        aliases = acceptance_source_aliases.get(reason, set())
+        if reason not in existing_sources and not aliases.intersection(existing_sources):
+            sources.append(
+                {
+                    "source": reason,
+                    "reason": acceptance_reasons_text[reason],
+                }
+            )
     return sources
 
 
@@ -190,12 +269,25 @@ def _sample_payload(result: BatchSampleResult, output_dir: Path) -> dict[str, An
         result.segmentation_status,
         result.segmentation_warnings,
         result.report_json,
+        search_metadata=result.search_metadata,
+        acceptance_reasons=result.acceptance_reasons,
     )
     return {
         "sample_id": result.sample_id,
         "sample_bbox": result.sample_bbox.model_dump(mode="json"),
         "segmentation_confidence": result.sample_confidence,
         "reference_id": result.reference_id,
+        "leading_reference_id": result.leading_reference_id,
+        "accepted_reference_id": result.accepted_reference_id,
+        "identity_status": (
+            "accepted" if result.accepted_reference_id is not None else "candidate_diagnostic"
+        ),
+        "identity_label": (
+            f"Accepted reference: {result.accepted_reference_id}"
+            if result.accepted_reference_id is not None
+            else f"Leading candidate (not accepted): {result.leading_reference_id}"
+        ),
+        "acceptance_reasons": list(result.acceptance_reasons),
         "reference_label": result.reference_label,
         "status": result.status,
         "match_status": result.status,
@@ -204,7 +296,9 @@ def _sample_payload(result: BatchSampleResult, output_dir: Path) -> dict[str, An
         "ambiguity_sources": ambiguity,
         "segmentation_warnings": list(result.segmentation_warnings),
         "cost": result.score.cost,
+        "leading_match": match_score_payload(result.score),
         "alternatives": [match_score_payload(score) for score in result.alternatives],
+        "search": result.search_metadata,
         "report_dir": result.report_dir.relative_to(output_dir).as_posix(),
         "report_json": result.report_json.relative_to(output_dir).as_posix(),
         "match_json": f"{result.sample_id}/match.json",
@@ -222,6 +316,7 @@ def write_batch_report(
     reference_sha256: str,
     expected_count: int,
     reference_cache_hit: bool,
+    refinement_limit: int,
     results: tuple[BatchSampleResult, ...],
     reference_segmentation: dict[str, Any],
 ) -> BatchComparisonReport:
@@ -264,11 +359,18 @@ def write_batch_report(
         "reference_cache": {"hit": reference_cache_hit, "key": reference_sha256},
         "matching": {
             "cost_interpretation": "lower retrieval cost ranks ahead; it is not a probability",
+            "refinement_limit": refinement_limit,
             "weights": {
                 "raster": RASTER_WEIGHT,
                 "aspect": ASPECT_WEIGHT,
                 "fill": FILL_WEIGHT,
                 "topology": TOPOLOGY_WEIGHT,
+                "centerline": CENTERLINE_WEIGHT,
+                "heading": HEADING_WEIGHT,
+                "fitted_steering": FITTED_STEERING_WEIGHT,
+                "route_structure": ROUTE_STRUCTURE_WEIGHT,
+                "route_descriptor": ROUTE_DESCRIPTOR_WEIGHT,
+                "route_topology": ROUTE_TOPOLOGY_WEIGHT,
             },
             "ambiguity_margin": {
                 "absolute": AMBIGUITY_ABSOLUTE_MARGIN,
@@ -299,13 +401,13 @@ def write_batch_report(
         f"writing directions unresolved: {writing_direction_ambiguous_count}.",
         "Retrieval costs rank candidates and are not correctness probabilities.",
         "",
-        "| Sample | Best reference | Match status | Segmentation status | Cost | "
+        "| Sample | Reference decision | Match status | Segmentation status | Cost | "
         "Match reason | Ambiguity sources | Pair report |",
         "|---|---|---:|---:|---:|---|---|---|",
     ]
     for item in samples:
         markdown.append(
-            f"| {item['sample_id']} | {item['reference_id']} | {item['status']} "
+            f"| {item['sample_id']} | {item['identity_label']} | {item['status']} "
             f"| {item['segmentation_status']} | {item['cost']:.4f} "
             f"| {item['match_reason']} | {_ambiguity_text(item['ambiguity_sources'])} "
             f"| [{item['report_dir']}/report.html]({item['report_dir']}/report.html) |"
@@ -338,7 +440,7 @@ def write_batch_report(
             f'alt="{sample_id}"></a></td>'
             f'<td><a href="{matched_link}"><img src="{matched_link}" width="100" '
             f'alt="{html.escape(item["reference_id"])}"></a><br>'
-            f"{html.escape(item['reference_id'])}</td>"
+            f"{html.escape(item['identity_label'])}</td>"
             f"<td>{html.escape(item['status'])}</td>"
             f"<td>{html.escape(item['segmentation_status'])}</td>"
             f"<td>{item['cost']:.4f}</td>"
@@ -369,7 +471,7 @@ def write_batch_report(
             f"{reference_segmentation['candidate_count']} candidates; "
             f"search truncated {reference_segmentation['search_truncated']} "
             f"(limit {reference_segmentation['search_limit']}).</p>",
-            "<table><thead><tr><th>Sample</th><th>Best reference</th>"
+            "<table><thead><tr><th>Sample</th><th>Reference decision</th>"
             "<th>Match status</th><th>Segmentation status</th><th>Cost</th>"
             "<th>Match reason</th><th>Ambiguity sources</th>"
             "<th>Report</th><th>Alternatives</th></tr></thead>",
