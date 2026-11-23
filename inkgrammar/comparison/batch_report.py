@@ -396,7 +396,7 @@ def write_batch_report(
             f"search truncated: {reference_segmentation['search_truncated']}, "
             f"limit: {reference_segmentation['search_limit']})."
         ),
-            f"Acceptance decision: {reference_segmentation['decision']['status']}.",
+        f"Acceptance decision: {reference_segmentation['decision']['status']}.",
         (
             f"Cleanup: {reference_segmentation['raw_component_count']} raw components; "
             f"{reference_segmentation['removed_page_artifact_count']} page artifacts and "

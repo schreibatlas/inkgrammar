@@ -250,7 +250,24 @@ def test_reference_cache_rebuilds_for_old_versions_profiles_and_mask_changes(tmp
     assert metadata["semantic_config_fingerprint"]
     assert metadata["cleanup_config_fingerprint"]
     assert metadata["reference_profile_fingerprint"]
-    metadata["segmentation_policy_version"] = "0"
+    assert metadata["cache_version"] == 7
+    assert metadata["reference_profile_version"] == "2"
+    semantic = metadata["semantic_configuration"]
+    assert semantic["rasterregions_version"] == metadata["rasterregions_version"]
+    assert "cleanup" in semantic["rasterregions_config"]
+    assert "spacing" in semantic["rasterregions_config"]
+    assert semantic["reference_profile_settings"]["name"] == "auto"
+    assert semantic["reference_segmentation_version"] == "7"
+    assert semantic["segmentation_policy_version"] == "3"
+    assert semantic["reference_profile_version"] == "2"
+    metadata["cache_version"] = 6
+    metadata["segmentation_algorithm_version"] = "6"
+    metadata["segmentation_policy_version"] = "2"
+    metadata["cleanup_policy_version"] = "2"
+    metadata["reference_profile_version"] = "1"
+    metadata["semantic_configuration"]["reference_segmentation_version"] = "6"
+    metadata["semantic_configuration"]["segmentation_policy_version"] = "2"
+    metadata["semantic_configuration"]["reference_profile_version"] = "1"
     metadata_path.write_text(json.dumps(metadata))
 
     old_cache = compare_letter_page(
@@ -262,8 +279,8 @@ def test_reference_cache_rebuilds_for_old_versions_profiles_and_mask_changes(tmp
     )
     assert old_cache.payload["reference_cache"]["hit"] is False
     rebuilt_metadata = json.loads(metadata_path.read_text())
-    assert rebuilt_metadata["segmentation_algorithm_version"] == "6"
-    assert rebuilt_metadata["segmentation_policy_version"] == "2"
+    assert rebuilt_metadata["segmentation_algorithm_version"] == "7"
+    assert rebuilt_metadata["segmentation_policy_version"] == "3"
     assert [item["id"] for item in rebuilt_metadata["candidates"]] == candidate_ids
 
     reused_cache = compare_letter_page(
@@ -335,6 +352,18 @@ def test_progress_and_run_files_cover_success_failure_and_quiet_mode(tmp_path, c
     assert segmentation_events[0]["details"]["reference_profile"] == "generic"
     assert segmentation_events[0]["details"]["candidate_count"] == 3
     assert isinstance(segmentation_events[0]["details"]["search_truncated"], bool)
+    details = segmentation_events[0]["details"]
+    assert details["message"].startswith("Reference segmentation accepted")
+    assert "profile: generic" in details["message"]
+    assert "foreground ownership: valid" in details["message"]
+    assert "search truncated: no" in details["message"]
+    assert details["foreground_ownership_valid"] is True
+    assert isinstance(details["removed_page_artifact_count"], int)
+    assert isinstance(details["uncertain_secondary_count"], int)
+    assert isinstance(details["ambiguous_component_ids"], list)
+    assert isinstance(details["uncertain_secondary_component_ids"], list)
+    assert isinstance(details["unassigned_secondary_component_ids"], list)
+    assert isinstance(details["uncertain_secondary_components"], list)
     assert {
         "input_validation",
         "reference_hash",
@@ -708,7 +737,6 @@ def test_refinement_cap_with_a_viable_candidate_marks_batch_result_ambiguous(tmp
     )
 
 
-
 def test_rejected_reference_segmentation_stops_before_downstream_work(tmp_path, monkeypatch):
     import inkgrammar.comparison.batch as comparison_batch
     from inkgrammar.comparison.segmentation import SegmentationError
@@ -747,14 +775,14 @@ def test_rejected_reference_segmentation_stops_before_downstream_work(tmp_path, 
     assert (segmentation_dir / "reference-segmentation-decision.json").is_file()
     assert not (segmentation_dir / "sample-segmentation.json").exists()
     assert not (output / "reference-index" / "gallery.json").exists()
-    events = [
-        json.loads(line) for line in (output / "progress.jsonl").read_text().splitlines()
-    ]
+    events = [json.loads(line) for line in (output / "progress.jsonl").read_text().splitlines()]
     validation = next(event for event in events if event["stage"] == "reference_segmentation")
     assert validation["details"]["status"] == "rejected"
     assert validation["details"]["accepted"] is False
     assert "recognized alphabet layout" in " ".join(validation["details"]["reasons"])
-
+    assert validation["details"]["message"].startswith("Reference segmentation rejected")
+    assert isinstance(validation["details"]["ambiguous_component_ids"], list)
+    assert isinstance(validation["details"]["uncertain_secondary_components"], list)
 
 
 def test_reference_cache_round_trips_cleanup_evidence_and_rejects_old_policy(tmp_path):

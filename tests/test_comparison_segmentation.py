@@ -207,6 +207,40 @@ def _anchor_first_reference_page(path):
     return path
 
 
+def _reference_page_with_two_detached_dots(path):
+    image = Image.new("RGB", (260, 140), "white")
+    draw = ImageDraw.Draw(image)
+    for y in (30, 90):
+        for column, x in enumerate((20, 90, 160)):
+            draw.rectangle((x, y, x + 6, y + 30), fill="black")
+            if column == 1:
+                draw.ellipse((x, y - 12, x + 6, y - 6), fill="black")
+    image.save(path)
+    return path
+
+
+def test_reference_gallery_assigns_meaningful_detached_dots(tmp_path):
+    path = _reference_page_with_two_detached_dots(tmp_path / "detached-dots.png")
+
+    gallery = segment_reference_gallery(path, ink_mode="dark", reference_profile="generic")
+
+    assert gallery.decision is not None and gallery.decision.accepted
+    assert gallery.decision.retained_secondary_count == 2
+    assert gallery.decision.uncertain_secondary_count == 0
+    assert gallery.decision.unassigned_secondary_count == 0
+    assert [
+        candidate.glyph_id
+        for candidate in gallery.candidates
+        if candidate.secondary_component_indices
+    ] == [
+        "ref-001",
+        "ref-004",
+    ]
+    assignments = gallery.cleanup_diagnostics["secondary_mark_assignments"]
+    assert len(assignments) == 2
+    assert all(item["status"] == "assigned" and item["mark_kind"] == "dot" for item in assignments)
+
+
 def test_generated_anchor_first_reference_has_63_disjoint_candidates(tmp_path):
     row_counts = [12, 8, 6, 11, 11, 5, 10]
     path = _anchor_first_reference_page(tmp_path / "anchor-reference.png")
@@ -216,20 +250,21 @@ def test_generated_anchor_first_reference_has_63_disjoint_candidates(tmp_path):
         path,
         ink_mode="dark",
         output_dir=output,
-        reference_profile="alphabet",
+        reference_profile="auto",
     )
 
     assert len(gallery.candidates) == 63
     assert [row.candidate_count for row in gallery.segmentation.rows] == row_counts
     assert gallery.decision is not None
+    assert gallery.segmentation.reference_profile == "alphabet"
     assert gallery.decision.accepted
     assert gallery.decision.accepted_count == 63
     assert gallery.decision.anchor_row_counts == tuple(row_counts)
     assert gallery.decision.selected_row_counts == tuple(row_counts)
-    assert gallery.decision.search_truncated
-    assert gallery.decision.retained_secondary_count > 0
+    assert not gallery.decision.search_truncated
+    assert gallery.decision.retained_secondary_count == 0
     assert all(row.included for row in gallery.segmentation.rows)
-    assert gallery.segmentation.search_truncated is True
+    assert gallery.segmentation.search_truncated is False
     assert gallery.segmentation.search_limit is None
     assert gallery.segmentation.unassigned_ink_fraction == 0.0
     assert any(
@@ -251,15 +286,19 @@ def test_generated_anchor_first_reference_has_63_disjoint_candidates(tmp_path):
 
     manifest = json.loads((output / "reference-candidates.json").read_text())
     assert manifest["candidate_count"] == 63
+    assert manifest["reference_profile"] == "alphabet"
     assert manifest["per_row_candidate_count"] == {
         str(index): count for index, count in enumerate(row_counts)
     }
 
-    decision_payload = json.loads(
-        (output / "reference-segmentation-decision.json").read_text()
-    )
+    decision_payload = json.loads((output / "reference-segmentation-decision.json").read_text())
     assert decision_payload["accepted"] is True
     assert decision_payload["accepted_count"] == 63
+    assert isinstance(decision_payload["ambiguous_component_ids"], list)
+    assert isinstance(decision_payload["uncertain_secondary_component_ids"], list)
+    assert isinstance(decision_payload["unassigned_secondary_component_ids"], list)
+    assert isinstance(decision_payload["uncertain_secondary_components"], list)
+
 
 def test_reference_hypothesis_invariant_falls_back_to_detected_anchor_counts(tmp_path, monkeypatch):
     row_counts = [12, 8, 6, 11, 11, 5, 10]
@@ -404,6 +443,45 @@ def test_alphabet_profile_excludes_title_and_year_and_isolates_all_glyph_rows(tm
         assert (output / filename).is_file()
 
 
+def test_auto_reference_profile_selects_stable_alphabet_layout(tmp_path):
+    path = _alphabet_like_page(tmp_path / "synthetic-alphabet.png")
+
+    gallery = segment_reference_gallery(path, ink_mode="dark", reference_profile="auto")
+
+    assert gallery.segmentation.reference_profile == "alphabet"
+    assert tuple(row.candidate_count for row in gallery.segmentation.rows if row.included) == (
+        12,
+        8,
+        6,
+        11,
+        10,
+        5,
+        10,
+    )
+    assert gallery.decision is not None
+    assert gallery.decision.profile_name == "alphabet"
+
+
+def test_auto_reference_profile_keeps_unrelated_layout_generic(tmp_path):
+    path = _reference_page(tmp_path / "unrelated-reference.png")
+
+    gallery = segment_reference_gallery(path, ink_mode="dark", reference_profile="auto")
+
+    assert gallery.segmentation.reference_profile == "generic"
+    assert gallery.decision is not None
+    assert gallery.decision.profile_name == "generic"
+
+
+def test_explicit_alphabet_profile_rejects_unrecognized_layout(tmp_path):
+    path = _reference_page(tmp_path / "unrelated-reference.png")
+
+    gallery = segment_reference_gallery(path, ink_mode="dark", reference_profile="alphabet")
+
+    assert gallery.decision is not None
+    assert not gallery.decision.accepted
+    assert "recognized alphabet layout has no compatible hypothesis" in gallery.decision.reasons
+
+
 def test_isolated_candidate_image_whitens_other_ink_in_overlapping_boxes():
     from inkgrammar.comparison.segmentation import _isolated_candidate_image
 
@@ -530,7 +608,6 @@ def test_segmented_glyph_preserves_rasterregions_component_roles_and_mark_centro
     assert len(candidate.secondary_mark_centroids) == 1
 
 
-
 def _reference_decision_fixture(
     monkeypatch,
     *,
@@ -632,8 +709,15 @@ def test_reference_decision_accepts_generic_counts_and_nonblocking_removed_noise
     assert decision.removed_micro_noise_count == 1
     assert decision.retained_secondary_count == 1
 
+    assert "profile: generic" in decision.summary
+    assert "rows: [3, 4]" in decision.summary
+    assert "removed micro-noise: 1" in decision.summary
+    assert "detached marks retained: 1" in decision.summary
+    assert "foreground ownership: valid" in decision.summary
+    assert "search truncated: no" in decision.summary
 
-def test_reference_decision_rejects_uncertain_bbox_changing_secondary_mark(monkeypatch):
+
+def test_reference_decision_rejects_uncertain_bbox_changing_secondary_mark(tmp_path, monkeypatch):
     decision = _reference_decision_fixture(
         monkeypatch,
         anchor_counts=(12, 8, 6, 11, 11, 5, 10),
@@ -643,6 +727,19 @@ def test_reference_decision_rejects_uncertain_bbox_changing_secondary_mark(monke
                 status="ambiguous",
                 component_index=99,
                 bbox_expansion_ratio=1.2,
+                candidate_region_indices=(35, 36),
+                best_score=0.31,
+                second_best_score=0.33,
+                margin=0.02,
+                reason="best-target score margin is below the configured threshold",
+            ),
+        ),
+        component_decisions=(
+            SimpleNamespace(
+                component_index=99,
+                bbox=SimpleNamespace(x0=10, y0=20, x1=12, y1=22),
+                action="kept",
+                role="secondary",
             ),
         ),
     )
@@ -650,3 +747,31 @@ def test_reference_decision_rejects_uncertain_bbox_changing_secondary_mark(monke
     assert decision.accepted is False
     assert decision.uncertain_secondary_count == 1
     assert "uncertain secondary ownership can change candidate bounds" in decision.reasons
+    assert decision.ambiguous_component_ids == (99,)
+    assert decision.uncertain_secondary_component_ids == (99,)
+    assert decision.unassigned_secondary_component_ids == ()
+    component = decision.uncertain_secondary_components[0]
+    assert component["bbox"] == (10, 20, 12, 22)
+    assert component["candidate_region_ids"] == ("region-035", "region-036")
+    assert component["best_score"] == 0.31
+    assert component["second_best_score"] == 0.33
+    assert component["margin"] == 0.02
+    assert component["bbox_expansion_ratio"] == 1.2
+    assert "secondary component 99 is ambiguous between region-035 and region-036" in (
+        decision.summary
+    )
+    assert "uncertain secondary component IDs: [99]" in decision.summary
+
+    from inkgrammar.comparison.segmentation import _write_reference_report
+
+    report_path = tmp_path / "reference-segmentation.md"
+    _write_reference_report(
+        SimpleNamespace(diagnostics=None),
+        SimpleNamespace(warnings=()),
+        decision,
+        report_path,
+    )
+    report = report_path.read_text()
+    assert "## Uncertain secondary components" in report
+    assert "best score=0.31" in report
+    assert "bbox expansion=1.2" in report

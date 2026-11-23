@@ -89,13 +89,13 @@ ALPHABET_ROW_COUNT_PATTERNS = (
     (12, 8, 6, 11, 10, 5, 10),
     (12, 8, 6, 11, 11, 5, 10),
 )
-REFERENCE_SEGMENTATION_POLICY_VERSION = "2"
-REFERENCE_PROFILE_VERSION = "1"
+REFERENCE_SEGMENTATION_POLICY_VERSION = "3"
+REFERENCE_PROFILE_VERSION = "2"
 
 
 @dataclass(frozen=True)
 class ReferenceSheetProfile:
-    name: Literal["alphabet", "generic"] = "generic"
+    name: Literal["alphabet", "generic", "auto"] = "generic"
     include_rows: tuple[int, ...] | None = None
     exclude_rows: tuple[int, ...] = ()
     allowed_row_count_patterns: tuple[tuple[int, ...], ...] | None = None
@@ -106,8 +106,8 @@ class ReferenceSheetProfile:
         rows = self.include_rows if self.include_rows is not None else self.exclude_rows
         if rows is not None and any(index < 0 for index in rows):
             raise ValueError("row indexes must be nonnegative")
-        if self.name not in {"alphabet", "generic"}:
-            raise ValueError("reference profile must be 'alphabet' or 'generic'")
+        if self.name not in {"alphabet", "generic", "auto"}:
+            raise ValueError("reference profile must be 'alphabet', 'generic', or 'auto'")
         object.__setattr__(
             self,
             "include_rows",
@@ -171,6 +171,10 @@ class ReferenceSegmentationDecision:
     foreground_ownership_valid: bool
     reasons: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    ambiguous_component_ids: tuple[int, ...] = ()
+    uncertain_secondary_component_ids: tuple[int, ...] = ()
+    unassigned_secondary_component_ids: tuple[int, ...] = ()
+    uncertain_secondary_components: tuple[dict[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "anchor_row_counts", tuple(self.anchor_row_counts))
@@ -186,6 +190,28 @@ class ReferenceSegmentationDecision:
         object.__setattr__(self, "count_changing_repairs", repairs)
         object.__setattr__(self, "reasons", tuple(self.reasons))
         object.__setattr__(self, "warnings", tuple(self.warnings))
+        object.__setattr__(self, "ambiguous_component_ids", tuple(self.ambiguous_component_ids))
+        object.__setattr__(
+            self, "uncertain_secondary_component_ids", tuple(self.uncertain_secondary_component_ids)
+        )
+        object.__setattr__(
+            self,
+            "unassigned_secondary_component_ids",
+            tuple(self.unassigned_secondary_component_ids),
+        )
+        object.__setattr__(
+            self,
+            "uncertain_secondary_components",
+            tuple(
+                {
+                    **detail,
+                    "bbox": tuple(detail["bbox"]) if detail["bbox"] is not None else None,
+                    "candidate_region_indices": tuple(detail["candidate_region_indices"]),
+                    "candidate_region_ids": tuple(detail["candidate_region_ids"]),
+                }
+                for detail in self.uncertain_secondary_components
+            ),
+        )
         if self.accepted != (self.accepted_count is not None):
             raise ValueError("accepted_count must be set exactly for accepted decisions")
         if self.status != ("accepted" if self.accepted else "rejected"):
@@ -193,15 +219,44 @@ class ReferenceSegmentationDecision:
 
     @property
     def summary(self) -> str:
-        if self.accepted:
-            return f"Reference segmentation accepted: {self.accepted_count} candidates."
+        label = "accepted" if self.accepted else "rejected"
         lines = [
-            "Reference segmentation rejected:",
-            f"  anchor layout:   {list(self.anchor_row_counts)}",
-            f"  selected layout: {list(self.selected_row_counts)}",
+            f"Reference segmentation {label}",
+            f"  profile: {self.profile_name}",
+            f"  rows: {list(self.selected_row_counts)}",
+            f"  candidates: {self.accepted_count if self.accepted else self.detected_count}",
+            f"  removed micro-noise: {self.removed_micro_noise_count}",
+            f"  detached marks retained: {self.retained_secondary_count}",
+            f"  uncertain detached marks: {self.uncertain_secondary_count}",
+            f"  unassigned detached marks: {self.unassigned_secondary_count}",
+            f"  foreground ownership: {'valid' if self.foreground_ownership_valid else 'invalid'}",
+            f"  search truncated: {'yes' if self.search_truncated else 'no'}",
         ]
-        lines.extend(f"  reason: {reason}" for reason in self.reasons)
+        if not self.accepted:
+            if self.ambiguous_component_ids:
+                lines.append(f"  ambiguous component IDs: {list(self.ambiguous_component_ids)}")
+            if self.uncertain_secondary_component_ids:
+                lines.append(
+                    "  uncertain secondary component IDs: "
+                    f"{list(self.uncertain_secondary_component_ids)}"
+                )
+            if self.unassigned_secondary_component_ids:
+                lines.append(
+                    "  unassigned secondary component IDs: "
+                    f"{list(self.unassigned_secondary_component_ids)}"
+                )
+            lines.extend(f"  reason: {reason}" for reason in self.reasons)
+            for component in self.uncertain_secondary_components:
+                regions = component["candidate_region_ids"] or tuple(
+                    f"region-{index:03d}" for index in component["candidate_region_indices"]
+                )
+                target_text = " and ".join(regions) if regions else "no candidate region"
+                lines.append(
+                    f"  reason: secondary component {component['component_id']} "
+                    f"is ambiguous between {target_text}"
+                )
         return "\n".join(lines)
+
 
 @dataclass(frozen=True)
 class ReferenceRowDiagnostic:
@@ -248,6 +303,7 @@ class ReferenceGallery:
 
     cleanup_diagnostics: dict[str, Any] | None = None
 
+
 class SegmentationError(ValueError):
     def __init__(
         self,
@@ -266,7 +322,7 @@ RowBand = rr.RowBand
 detect_ink_rows = rr.detect_rows
 
 
-REFERENCE_SEGMENTATION_VERSION = "6"
+REFERENCE_SEGMENTATION_VERSION = "7"
 
 
 def _coerce_reference_profile(
@@ -274,9 +330,47 @@ def _coerce_reference_profile(
 ) -> ReferenceSheetProfile:
     if isinstance(profile, ReferenceSheetProfile):
         return profile
-    if profile not in {"alphabet", "generic"}:
-        raise ValueError("reference profile must be 'alphabet' or 'generic'")
+    if profile not in {"alphabet", "generic", "auto"}:
+        raise ValueError("reference profile must be 'alphabet', 'generic', or 'auto'")
     return ReferenceSheetProfile(name=profile)
+
+
+def _select_auto_reference_profile(
+    result: rr.DetectionResult,
+    hypotheses: rr.SpacedSegmentationHypotheses,
+    fallback_warning: str | None,
+) -> ReferenceSheetProfile:
+    generic = ReferenceSheetProfile(name="generic")
+    diagnostics = result.diagnostics
+    if (
+        result.status != "ok"
+        or hypotheses.truncated
+        or fallback_warning is not None
+        or diagnostics is None
+        or diagnostics.search_truncated
+    ):
+        return generic
+
+    alphabet = ReferenceSheetProfile(name="alphabet")
+    rows, _, _, ambiguous = _classify_reference_rows(result, alphabet)
+    included_rows = tuple(row for row in rows if row.included)
+    counts = tuple(row.candidate_count for row in included_rows)
+    if ambiguous or counts not in ALPHABET_ROW_COUNT_PATTERNS:
+        return generic
+
+    anchor_rows = {row.row_index: row for row in diagnostics.row_segmentation}
+    for row in included_rows:
+        anchor = anchor_rows.get(row.row_index)
+        if (
+            anchor is None
+            or anchor.anchor_count is None
+            or anchor.anchor_count != row.candidate_count
+            or anchor.repair_count
+            or anchor.split_anchor_indices
+            or anchor.merged_anchor_groups
+        ):
+            return generic
+    return alphabet
 
 
 def _classify_reference_rows(
@@ -532,6 +626,7 @@ def _write_page_mask(mask: np.ndarray, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(np.asarray(mask, dtype=np.uint8) * 255).save(output, format="PNG")
 
+
 def _diagnostics_payload(diagnostics: rr.DetectionDiagnostics | None) -> dict[str, Any]:
     return asdict(diagnostics) if diagnostics is not None else {}
 
@@ -632,11 +727,23 @@ def _write_reference_report(
     if decision.reasons:
         lines.extend(("", "## Blocking reasons", ""))
         lines.extend(f"- {reason}" for reason in decision.reasons)
+    if decision.uncertain_secondary_components:
+        lines.extend(("", "## Uncertain secondary components", ""))
+        for component in decision.uncertain_secondary_components:
+            candidate_regions = (
+                component["candidate_region_ids"] or component["candidate_region_indices"]
+            )
+            lines.append(
+                f"- Component {component['component_id']}: bbox={component['bbox']}, "
+                f"candidate regions={candidate_regions}, best score={component['best_score']}, "
+                f"second score={component['second_best_score']}, margin={component['margin']}, "
+                f"bbox expansion={component['bbox_expansion_ratio']}, "
+                f"reason={component['reason']}"
+            )
     if decision.warnings or segmentation.warnings:
         lines.extend(("", "## Warnings", ""))
         lines.extend(f"- {warning}" for warning in (*decision.warnings, *segmentation.warnings))
     output.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
 
 
 def _write_reference_diagnostics(
@@ -916,9 +1023,11 @@ def evaluate_reference_segmentation(
     included_rows = tuple(row for row in segmentation.rows if row.included)
     selected_counts = tuple(row.candidate_count for row in included_rows)
     selected_by_row = {row.row_index: row.candidate_count for row in included_rows}
-    package_rows = {
-        row.row_index: row for row in diagnostics.row_segmentation
-    } if diagnostics is not None else {}
+    package_rows = (
+        {row.row_index: row for row in diagnostics.row_segmentation}
+        if diagnostics is not None
+        else {}
+    )
     anchor_counts = tuple(
         package_rows[row.row_index].anchor_count
         if row.row_index in package_rows and package_rows[row.row_index].anchor_count is not None
@@ -966,12 +1075,77 @@ def evaluate_reference_segmentation(
         index for region in result.regions for index in region.secondary_component_indices
     }
     retained_secondary.update(
-        assignment.component_index
-        for assignment in assignments
-        if assignment.status == "assigned"
+        assignment.component_index for assignment in assignments if assignment.status == "assigned"
     )
     unassigned_secondary_count = sum(
         assignment.status == "unassigned" for assignment in assignments
+    )
+    ambiguous_assignments = tuple(
+        assignment for assignment in assignments if assignment.status == "ambiguous"
+    )
+    component_decisions = {
+        decision.component_index: decision
+        for decision in result.component_decisions
+        if hasattr(decision, "component_index")
+    }
+    regions_by_row: dict[int, list[Any]] = {}
+    for region in result.regions:
+        regions_by_row.setdefault(region.row_index, []).append(region)
+    candidate_region_ids = {}
+    for candidate in segmentation.candidates:
+        row_index = getattr(candidate, "row_index", None)
+        column_index = getattr(candidate, "column_index", None)
+        row_regions = sorted(
+            regions_by_row.get(row_index, ()), key=lambda region: region.reading_order
+        )
+        if column_index is not None and column_index < len(row_regions):
+            candidate_region_ids[row_regions[column_index].reading_order] = candidate.glyph_id
+
+    uncertain_component_details = []
+    for assignment in ambiguous_assignments:
+        component = component_decisions.get(assignment.component_index)
+        box = getattr(component, "bbox", None)
+        bbox = (
+            [box.x0, box.y0, box.x1, box.y1]
+            if box is not None and all(hasattr(box, field) for field in ("x0", "y0", "x1", "y1"))
+            else None
+        )
+        region_indices = tuple(getattr(assignment, "candidate_region_indices", ()))
+        region_ids = tuple(
+            candidate_region_ids.get(index, f"region-{index:03d}") for index in region_indices
+        )
+        uncertain_component_details.append(
+            {
+                "component_id": assignment.component_index,
+                "bbox": bbox,
+                "candidate_region_indices": region_indices,
+                "candidate_region_ids": region_ids,
+                "best_score": getattr(assignment, "best_score", None),
+                "second_best_score": getattr(assignment, "second_best_score", None),
+                "margin": getattr(assignment, "margin", None),
+                "bbox_expansion_ratio": getattr(assignment, "bbox_expansion_ratio", None),
+                "reason": getattr(assignment, "reason", None),
+            }
+        )
+    ambiguous_component_ids = tuple(
+        sorted(
+            {
+                index
+                for candidate in segmentation.candidates
+                for index in getattr(candidate, "ambiguous_component_indices", ())
+            }
+            | {assignment.component_index for assignment in ambiguous_assignments}
+        )
+    )
+    uncertain_component_ids = tuple(
+        sorted({assignment.component_index for assignment in ambiguous_assignments})
+    )
+    unassigned_component_ids = tuple(
+        sorted(
+            assignment.component_index
+            for assignment in assignments
+            if assignment.status == "unassigned"
+        )
     )
     ownership_error = ownership_error or _reference_ownership_error(result)
 
@@ -1009,18 +1183,20 @@ def evaluate_reference_segmentation(
     if competing_identity:
         reasons.append("segmentation hypotheses disagree on candidate identity")
     identity_unstable = (
-        selected_counts != anchor_counts
-        and any(not repair.strongly_supported for repair in repairs)
-    ) or bool(uncertain_assignments) or competing_identity
+        (
+            selected_counts != anchor_counts
+            and any(not repair.strongly_supported for repair in repairs)
+        )
+        or bool(uncertain_assignments)
+        or competing_identity
+    )
     search_truncated = hypotheses.truncated or bool(diagnostics and diagnostics.search_truncated)
     if search_truncated and identity_unstable:
         reasons.append("segmentation search was truncated while candidate identity was unstable")
 
     component_decisions = result.component_decisions
     raw_component_count = (
-        diagnostics.raw_component_count
-        if diagnostics is not None
-        else len(component_decisions)
+        diagnostics.raw_component_count if diagnostics is not None else len(component_decisions)
     )
     removed_page_artifact_count = sum(
         decision.action == "removed" and decision.role == "artifact"
@@ -1063,6 +1239,10 @@ def evaluate_reference_segmentation(
         search_truncated=search_truncated,
         foreground_ownership_valid=ownership_error is None,
         reasons=tuple(dict.fromkeys(reasons)),
+        ambiguous_component_ids=ambiguous_component_ids,
+        uncertain_secondary_component_ids=uncertain_component_ids,
+        unassigned_secondary_component_ids=unassigned_component_ids,
+        uncertain_secondary_components=tuple(uncertain_component_details),
         warnings=tuple(dict.fromkeys(warnings)),
     )
 
@@ -1277,6 +1457,8 @@ def segment_reference_gallery(
         raise SegmentationError(message, diagnostic_path, details=details) from error
 
     result = hypotheses.selected
+    if profile.name == "auto":
+        profile = _select_auto_reference_profile(result, hypotheses, fallback_warning)
     override_rows = (
         profile.include_rows if profile.include_rows is not None else profile.exclude_rows
     )

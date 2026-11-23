@@ -77,8 +77,6 @@ def test_compare_letter_cli_automatic_mode_writes_batch_summary(tmp_path):
             "3",
             "--top-k",
             "4",
-            "--reference-profile",
-            "generic",
             "--verbose",
             "--output",
             str(output),
@@ -160,7 +158,7 @@ def test_compare_letter_help_describes_automatic_controls():
     result = CliRunner().invoke(app, ["compare-letter", "--help"])
 
     assert result.exit_code == 0
-    assert "generic (default)" in result.output
+    assert "auto (default)" in result.output
     assert "exactly N visibly" in result.output
     assert "standalone" in result.output
     for option in (

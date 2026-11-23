@@ -60,7 +60,7 @@ from .segmentation import (
 from .skeleton import analyze_skeleton
 from .steering import fit_writing_route_candidates
 
-_REFERENCE_CACHE_VERSION = 6
+_REFERENCE_CACHE_VERSION = 7
 _DESCRIPTOR_SIZE = 96
 
 _REFERENCE_DIAGNOSTICS = (
@@ -131,6 +131,7 @@ def _reference_profile_settings(
         "unassigned_ink_fraction_limit": 0.02,
     }
 
+
 def _payload_fingerprint(payload: dict[str, Any]) -> str:
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
@@ -168,7 +169,6 @@ def _reference_cache_semantics(
     }
 
 
-
 def _cache_metadata(
     gallery: ReferenceGallery,
     index: ReferenceIndex,
@@ -201,7 +201,7 @@ def _cache_metadata(
         "descriptor_size": _DESCRIPTOR_SIZE,
         "ink_mode": ink_mode,
         "source_sha256": gallery.source_sha256,
-        "reference_profile": profile_settings["name"],
+        "reference_profile": gallery.segmentation.reference_profile,
         "reference_profile_settings": profile_settings,
         "row_classification_settings": profile_settings,
         "reference_profile_version": REFERENCE_PROFILE_VERSION,
@@ -1000,7 +1000,7 @@ def compare_letter_page(
     sample_ink_mode: MaskMode = "auto",
     top_k: int = DEFAULT_TOP_K,
     refinement_limit: int = DEFAULT_REFINEMENT_LIMIT,
-    reference_profile: str | ReferenceSheetProfile = "generic",
+    reference_profile: str | ReferenceSheetProfile = "auto",
     no_progress: bool = False,
     verbose: bool = False,
     segment_only: bool = False,
@@ -1177,9 +1177,7 @@ def _compare_letter_page_impl(
             "anchor_row_counts": list(decision.anchor_row_counts),
             "selected_row_counts": list(decision.selected_row_counts),
             "recognized_layout": (
-                list(decision.recognized_layout)
-                if decision.recognized_layout is not None
-                else None
+                list(decision.recognized_layout) if decision.recognized_layout is not None else None
             ),
             "reasons": list(decision.reasons),
             "warnings": list(decision.warnings),
@@ -1187,6 +1185,13 @@ def _compare_letter_page_impl(
             "removed_micro_noise_count": decision.removed_micro_noise_count,
             "retained_secondary_count": decision.retained_secondary_count,
             "unassigned_secondary_count": decision.unassigned_secondary_count,
+            "removed_page_artifact_count": decision.removed_page_artifact_count,
+            "uncertain_secondary_count": decision.uncertain_secondary_count,
+            "foreground_ownership_valid": decision.foreground_ownership_valid,
+            "ambiguous_component_ids": list(decision.ambiguous_component_ids),
+            "uncertain_secondary_component_ids": list(decision.uncertain_secondary_component_ids),
+            "unassigned_secondary_component_ids": list(decision.unassigned_secondary_component_ids),
+            "uncertain_secondary_components": list(decision.uncertain_secondary_components),
             "excluded_row_count": sum(not row.included for row in gallery.segmentation.rows),
             "per_row_candidate_counts": {
                 str(row.row_index): sum(
@@ -1489,5 +1494,5 @@ def _compare_letter_page_impl(
             "foreground_ownership_valid": decision.foreground_ownership_valid,
             "unassigned_ink_fraction": gallery.segmentation.unassigned_ink_fraction,
             "decision": asdict(decision),
-        }
+        },
     )

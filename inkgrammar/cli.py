@@ -78,7 +78,7 @@ def compare_letter_command(
     reference_profile: str | None = typer.Option(
         None,
         "--reference-profile",
-        help="Reference row profile: generic (default) or alphabet (automatic mode).",
+        help="Reference row profile: auto (default), alphabet, or generic (automatic mode).",
     ),  # noqa: B008
     no_progress: bool = typer.Option(
         False, "--no-progress", help="Suppress progress output on stderr."
@@ -129,7 +129,7 @@ def compare_letter_command(
                 output_dir=output,
                 top_k=5 if top_k is None else top_k,
                 refinement_limit=32 if refinement_limit is None else refinement_limit,
-                reference_profile="generic" if reference_profile is None else reference_profile,
+                reference_profile="auto" if reference_profile is None else reference_profile,
                 no_progress=no_progress,
                 verbose=verbose,
                 segment_only=segment_only,
