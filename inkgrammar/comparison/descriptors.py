@@ -179,8 +179,13 @@ def reverse_route_descriptor(descriptor: RouteDescriptor) -> RouteDescriptor:
     )
 
 
-def route_descriptor_distance(reference: RouteDescriptor, sample: RouteDescriptor) -> float:
-    """Compare route shape and structural evidence in either traversal direction."""
+def route_descriptor_distance(
+    reference: RouteDescriptor,
+    sample: RouteDescriptor,
+    *,
+    allow_reverse: bool = False,
+) -> float:
+    """Compare route shape and structure, directed unless reversal is explicitly allowed."""
 
     def trajectory_cost(sample_strokes: tuple[TrajectoryDescriptor | None, ...]) -> float:
         reference_strokes = reference.stroke_descriptors
@@ -240,7 +245,7 @@ def route_descriptor_distance(reference: RouteDescriptor, sample: RouteDescripto
         reverse_descriptor(stroke) if stroke is not None else None
         for stroke in reversed(sample.stroke_descriptors)
     )
-    shape_cost = min(direct, trajectory_cost(reversed_strokes))
+    shape_cost = min(direct, trajectory_cost(reversed_strokes)) if allow_reverse else direct
     structural_costs = (
         count_cost(reference.pen_lift_count, sample.pen_lift_count),
         count_cost(reference.cycle_count, sample.cycle_count),

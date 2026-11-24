@@ -687,6 +687,7 @@ def test_identity_acceptance_requires_complete_route_evidence_and_a_certain_pair
         route_structure_cost=0.0,
         route_descriptor_cost=0.0,
         route_topology_cost=0.0,
+        stroke_pattern_cost=0.0,
         route_pair_selection=SimpleNamespace(ambiguous=True),
     )
     clear_score = replace(

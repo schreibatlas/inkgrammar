@@ -496,7 +496,7 @@ def test_controlled_e_vs_6_never_accepts_the_6_route_as_a_clear_identity(
     )
     accepted_reference_id = leader.reference_id if not reasons else None
     assert accepted_reference_id != "controlled-6"
-    assert six_score.cost > e_score.cost or progressive.ambiguous
+    assert leader.reference_id == "controlled-e"
     assert leader.route_pair_selection is not None
 
     result = compare_extracted_letters(

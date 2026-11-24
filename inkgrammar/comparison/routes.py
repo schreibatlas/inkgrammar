@@ -4,13 +4,14 @@ from collections.abc import Callable
 from dataclasses import replace
 
 import numpy as np
-from planarcurve.transforms import fit_similarity_transform
+from planarcurve.transforms import Similarity2D, fit_similarity_transform
 from skeletonpaths import (
     RefinedSkeletonGeometry,
     StrokeHypothesis,
     StrokeSearchLimits,
     SubpixelReconstructionError,
     SubpixelReconstructionLimitError,
+    orientation_variants,
     refine_graph_geometry,
     stroke_hypotheses_from_analysis,
 )
@@ -18,6 +19,7 @@ from skeletonpaths import (
 from .descriptors import RouteDescriptor, route_descriptor, route_descriptor_distance
 from .models import (
     ContinuousPath,
+    IdentityAlignmentPolicy,
     SkeletonDiagnostics,
     WritingDirectionPolicy,
     WritingEvent,
@@ -32,11 +34,15 @@ from .models import (
 from .path import (
     PathExtractionError,
     _semantic_junction_transition_indices,
-    align_continuous_paths,
+    align_bounded_continuous_paths,
     refine_continuous_walk,
     resample_continuous_path,
-    reverse_continuous_path,
     transform_continuous_path,
+)
+from .patterns import (
+    StrokeVariationPolicy,
+    directed_stroke_pattern_distance,
+    stroke_pattern_descriptor,
 )
 
 ROUTE_SEARCH_LIMIT = 32
@@ -55,21 +61,6 @@ ROUTE_REPORT_LIMIT = 5
 DEFAULT_ROUTE_CANDIDATE_LIMIT = ROUTE_SEARCH_LIMIT
 ROUTE_AMBIGUITY_ABSOLUTE_MARGIN = 0.04
 ROUTE_AMBIGUITY_RELATIVE_MARGIN = 0.15
-
-
-def _orientation_variants(
-    hypothesis: StrokeHypothesis,
-) -> tuple[tuple[StrokeHypothesis, str], ...]:
-    variants = [(hypothesis, "native")]
-    ambiguous = hypothesis.orientation_ambiguous or any(hypothesis.orientation_ambiguous_strokes)
-    if ambiguous:
-        reversed_hypothesis = replace(
-            hypothesis,
-            walks=tuple(walk.reversed() for walk in reversed(hypothesis.walks)),
-            orientation_relation="global-reversal",
-        )
-        variants.append((reversed_hypothesis, "global-reverse"))
-    return tuple(variants)
 
 
 def _route_events(
@@ -231,9 +222,17 @@ def generate_writing_route_candidates(
     candidates = []
     reconstruction_failures = []
     expanded_hypotheses = tuple(
-        (variant, orientation_variant, orientation_group)
+        (
+            variant,
+            "global-reverse" if variant.orientation_relation == "global-reversal" else "native",
+            orientation_group,
+        )
         for orientation_group, hypothesis in enumerate(hypotheses, start=1)
-        for variant, orientation_variant in _orientation_variants(hypothesis)
+        for variant in (
+            orientation_variants(hypothesis)
+            if hypothesis.orientation_ambiguous or any(hypothesis.orientation_ambiguous_strokes)
+            else (hypothesis,)
+        )
     )
     for hypothesis, orientation_variant, orientation_group in expanded_hypotheses:
         if hypothesis.uncovered_edge_ids:
@@ -374,7 +373,7 @@ def _centerline_cost(
         sample_strokes[:paired_count],
         strict=True,
     ):
-        alignment = align_continuous_paths(reference_stroke, sample_stroke)
+        alignment = align_bounded_continuous_paths(reference_stroke, sample_stroke)
         weight = 0.5 * (reference_stroke.arc_length_px + sample_stroke.arc_length_px)
         scale = max(reference_stroke.arc_length_px, sample_stroke.arc_length_px, 1e-12)
         weighted_error += np.sqrt(max(alignment.mean_squared_error, 0.0)) / scale * weight
@@ -424,10 +423,14 @@ def evaluate_writing_route_pairs(
     direction_policy: WritingDirectionPolicy | None = None,
     reference_descriptors: tuple[RouteDescriptor, ...] | None = None,
     sample_descriptors: tuple[RouteDescriptor, ...] | None = None,
+    identity_policy: IdentityAlignmentPolicy | None = None,
+    variation_policy: StrokeVariationPolicy | None = None,
 ) -> WritingRoutePairSelection:
     if not reference_candidates or not sample_candidates:
         raise ValueError("joint route selection requires candidates for both glyphs")
     policy = direction_policy or WritingDirectionPolicy()
+    identity_policy = identity_policy or IdentityAlignmentPolicy()
+    variation_policy = variation_policy or StrokeVariationPolicy()
     reference_descriptors = (
         tuple(route_descriptor(candidate) for candidate in reference_candidates)
         if reference_descriptors is None
@@ -454,6 +457,31 @@ def evaluate_writing_route_pairs(
     for reference_rank, reference in enumerate(reference_candidates, start=1):
         for sample_rank, sample in enumerate(sample_candidates, start=1):
             intrinsic = reference.score.intrinsic_cost + sample.score.intrinsic_cost
+            alignments = tuple(
+                align_bounded_continuous_paths(
+                    reference_stroke,
+                    sample_stroke,
+                    identity_policy,
+                )
+                for reference_stroke, sample_stroke in zip(
+                    reference.continuous_strokes,
+                    sample.continuous_strokes,
+                    strict=False,
+                )
+            )
+            required_rotation = max(
+                (abs(alignment.required_rotation_deg or 0.0) for alignment in alignments),
+                default=0.0,
+            )
+            rejection_reason = next(
+                (
+                    alignment.rejection_reason
+                    for alignment in alignments
+                    if not alignment.orientation_eligible
+                ),
+                None,
+            )
+            orientation_eligible = rejection_reason is None
             centerline = _centerline_cost(reference, sample)
             steering = (
                 float(steering_distance(reference, sample))
@@ -475,6 +503,11 @@ def evaluate_writing_route_pairs(
                 reference_descriptors[reference_rank - 1],
                 sample_descriptors[sample_rank - 1],
             )
+            pattern_cost = directed_stroke_pattern_distance(
+                stroke_pattern_descriptor(reference),
+                stroke_pattern_descriptor(sample),
+                variation_policy,
+            )
             reconstruction_fit_cost = sum(
                 value
                 for candidate in (reference, sample)
@@ -495,6 +528,7 @@ def evaluate_writing_route_pairs(
                     topology,
                     writing_prior_cost,
                     descriptor_cost,
+                    pattern_cost,
                     reconstruction_fit_cost,
                     model_complexity_cost,
                 )
@@ -512,6 +546,10 @@ def evaluate_writing_route_pairs(
                     writing_prior_cost=writing_prior_cost,
                     descriptor_matching_cost=descriptor_cost,
                     reconstruction_fit_cost=reconstruction_fit_cost,
+                    stroke_pattern_cost=pattern_cost,
+                    required_rotation_deg=required_rotation,
+                    orientation_eligible=orientation_eligible,
+                    orientation_rejection_reason=rejection_reason,
                     model_complexity_cost=model_complexity_cost,
                     pen_lift_count=(
                         reference.hypothesis.pen_lift_count + sample.hypothesis.pen_lift_count
@@ -519,10 +557,12 @@ def evaluate_writing_route_pairs(
                 )
             )
 
-    best_geometry = min(score.geometry_cost for score in pair_scores)
+    orientation_candidates = [score for score in pair_scores if score.orientation_eligible]
+    gate_pool = orientation_candidates or pair_scores
+    best_geometry = min(score.geometry_cost for score in gate_pool)
     geometry_tolerance = policy.pen_lift_geometry_tolerance
     geometry_plausible = [
-        score for score in pair_scores if score.geometry_cost <= best_geometry + geometry_tolerance
+        score for score in gate_pool if score.geometry_cost <= best_geometry + geometry_tolerance
     ]
     minimum_lifts = min(score.pen_lift_count for score in geometry_plausible)
     eligible_ids = {
@@ -533,7 +573,10 @@ def evaluate_writing_route_pairs(
     pair_scores = [
         replace(
             score,
-            eligible=(score.reference_rank, score.sample_rank) in eligible_ids,
+            eligible=(
+                (score.reference_rank, score.sample_rank) in eligible_ids
+                and score.orientation_eligible
+            ),
         )
         for score in pair_scores
     ]
@@ -546,7 +589,14 @@ def evaluate_writing_route_pairs(
         key=lambda score: (score.total_cost, score.reference_rank, score.sample_rank),
     )
     pair_scores = [*eligible, *remaining]
-    best = eligible[0]
+    best = (
+        eligible[0]
+        if eligible
+        else min(
+            pair_scores,
+            key=lambda score: (score.total_cost, score.reference_rank, score.sample_rank),
+        )
+    )
     reference = reference_candidates[best.reference_rank - 1]
     sample = sample_candidates[best.sample_rank - 1]
     near_tie = len(eligible) > 1 and _near_tie(best.total_cost, eligible[1].total_cost)
@@ -562,7 +612,9 @@ def evaluate_writing_route_pairs(
         ):
             return "resolved", "resolved", None
         alternatives = []
-        for score in eligible:
+        for score in pair_scores:
+            if not score.eligible and score.orientation_rejection_reason is None:
+                continue
             if is_reference:
                 if score.sample_rank != best.sample_rank:
                     continue
@@ -582,6 +634,13 @@ def evaluate_writing_route_pairs(
         margin = max(0.0, alternative_score.total_cost - best.total_cost)
         selected_prior = selected.writing_prior
         alternative_prior = alternative.writing_prior
+        prior_resolves = (
+            selected_prior is not None
+            and alternative_prior is not None
+            and selected_prior.direction_cost < alternative_prior.direction_cost
+        )
+        if not alternative_score.eligible and not prior_resolves:
+            return "ambiguous", "graph-order-only", margin
         if (
             selected_prior is not None
             and alternative_prior is not None
@@ -651,90 +710,92 @@ def align_writing_routes(
     reference: WritingRouteCandidate,
     sample: WritingRouteCandidate,
 ) -> WritingRouteAlignment:
-    best_alignment = None
-    for direction in ("forward", "reversed-for-best-match"):
-        sample_strokes = sample.continuous_strokes
-        if direction == "reversed-for-best-match":
-            sample_strokes = tuple(
-                reverse_continuous_path(stroke) for stroke in reversed(sample_strokes)
+    policy = IdentityAlignmentPolicy()
+    reference_strokes = reference.continuous_strokes
+    sample_strokes = sample.continuous_strokes
+    paired_count = min(len(reference_strokes), len(sample_strokes))
+    reference_samples = tuple(
+        resample_continuous_path(stroke, 128).xy for stroke in reference_strokes[:paired_count]
+    )
+    sample_samples = tuple(
+        resample_continuous_path(stroke, 128).xy for stroke in sample_strokes[:paired_count]
+    )
+    try:
+        reference_xy = np.concatenate(reference_samples, axis=0)
+        sample_xy = np.concatenate(sample_samples, axis=0)
+        unconstrained = fit_similarity_transform(reference_xy, sample_xy)
+        rotation = float(
+            np.clip(
+                (unconstrained.rotation_deg + 180.0) % 360.0 - 180.0,
+                -policy.max_rotation_deg,
+                policy.max_rotation_deg,
             )
-        paired_count = min(len(reference.continuous_strokes), len(sample_strokes))
-        reference_samples = tuple(
-            resample_continuous_path(stroke, 128).xy
-            for stroke in reference.continuous_strokes[:paired_count]
         )
-        sample_samples = tuple(
-            resample_continuous_path(stroke, 128).xy for stroke in sample_strokes[:paired_count]
+        scale = unconstrained.scale
+        if policy.min_scale_ratio is not None:
+            scale = max(scale, policy.min_scale_ratio)
+        if policy.max_scale_ratio is not None:
+            scale = min(scale, policy.max_scale_ratio)
+        angle = np.deg2rad(rotation)
+        matrix = scale * np.array(((np.cos(angle), -np.sin(angle)), (np.sin(angle), np.cos(angle))))
+        translation = reference_xy.mean(axis=0) - sample_xy.mean(axis=0) @ matrix.T
+        transform = Similarity2D(
+            scale=float(scale),
+            rotation_deg=rotation,
+            dx=float(translation[0]),
+            dy=float(translation[1]),
         )
-        try:
-            transform = fit_similarity_transform(
-                np.concatenate(reference_samples, axis=0),
-                np.concatenate(sample_samples, axis=0),
+        aligned_strokes = tuple(
+            transform_continuous_path(stroke, transform) for stroke in sample_strokes
+        )
+        stroke_errors = tuple(
+            float(np.mean(np.sum((reference_xy_i - transform.apply(sample_xy_i)) ** 2, axis=1)))
+            for reference_xy_i, sample_xy_i in zip(
+                reference_samples,
+                sample_samples,
+                strict=True,
             )
-            aligned_strokes = tuple(
-                transform_continuous_path(stroke, transform) for stroke in sample_strokes
-            )
-            stroke_errors = tuple(
-                float(np.mean(np.sum((reference_xy - transform.apply(sample_xy)) ** 2, axis=1)))
-                for reference_xy, sample_xy in zip(
-                    reference_samples,
-                    sample_samples,
-                    strict=True,
-                )
-            )
-            stroke_transforms = (transform,) * paired_count
-            strategy = "shared"
-        except ValueError:
-            per_stroke_alignments = tuple(
-                align_continuous_paths(
-                    reference.continuous_strokes[index],
-                    sample_strokes[index],
-                )
-                for index in range(paired_count)
-            )
-            stroke_transforms = tuple(item.transform for item in per_stroke_alignments)
-            transform = stroke_transforms[0]
-            paired_aligned_strokes = []
-            for item in per_stroke_alignments:
-                assert item.aligned_sample_path is not None
-                paired_aligned_strokes.append(item.aligned_sample_path)
-            aligned_strokes = (
-                *paired_aligned_strokes,
-                *(
-                    transform_continuous_path(stroke, transform)
-                    for stroke in sample_strokes[paired_count:]
-                ),
-            )
-            stroke_errors = tuple(item.mean_squared_error for item in per_stroke_alignments)
-            strategy = "per-stroke"
-        weights = tuple(
-            0.5
-            * (
-                reference.continuous_strokes[index].arc_length_px
-                + sample_strokes[index].arc_length_px
-            )
+        )
+        stroke_transforms = (transform,) * paired_count
+        strategy = "shared"
+    except ValueError:
+        per_stroke_alignments = tuple(
+            align_bounded_continuous_paths(reference_strokes[index], sample_strokes[index], policy)
             for index in range(paired_count)
         )
-        mean_squared_error = float(
-            sum(error * weight for error, weight in zip(stroke_errors, weights, strict=True))
-            / max(sum(weights), 1e-12)
+        stroke_transforms = tuple(item.transform for item in per_stroke_alignments)
+        transform = stroke_transforms[0]
+        paired_aligned_strokes = tuple(
+            item.aligned_sample_path
+            for item in per_stroke_alignments
+            if item.aligned_sample_path is not None
         )
-        alignment = WritingRouteAlignment(
-            transform=transform,
-            direction=direction,
-            aligned_sample_strokes=aligned_strokes,
-            stroke_mean_squared_errors=stroke_errors,
-            mean_squared_error=mean_squared_error,
-            stroke_transforms=stroke_transforms,
-            strategy=strategy,
+        aligned_strokes = (
+            *paired_aligned_strokes,
+            *(
+                transform_continuous_path(stroke, transform)
+                for stroke in sample_strokes[paired_count:]
+            ),
         )
-        if (
-            best_alignment is None
-            or alignment.mean_squared_error < best_alignment.mean_squared_error
-        ):
-            best_alignment = alignment
-    assert best_alignment is not None
-    return best_alignment
+        stroke_errors = tuple(item.mean_squared_error for item in per_stroke_alignments)
+        strategy = "per-stroke"
+    weights = tuple(
+        0.5 * (reference_strokes[index].arc_length_px + sample_strokes[index].arc_length_px)
+        for index in range(paired_count)
+    )
+    mean_squared_error = float(
+        sum(error * weight for error, weight in zip(stroke_errors, weights, strict=True))
+        / max(sum(weights), 1e-12)
+    )
+    return WritingRouteAlignment(
+        transform=transform,
+        direction="forward",
+        aligned_sample_strokes=aligned_strokes,
+        stroke_mean_squared_errors=stroke_errors,
+        mean_squared_error=mean_squared_error,
+        stroke_transforms=stroke_transforms,
+        strategy=strategy,
+    )
 
 
 def select_writing_route_pair(

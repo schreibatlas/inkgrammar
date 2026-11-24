@@ -1037,6 +1037,7 @@ def _assess_segmentation(
 _ESSENTIAL_ROUTE_FEATURES = frozenset(
     {
         "route_descriptor",
+        "stroke_pattern",
         "route_centerline",
         "route_steering",
         "route_topology",
@@ -1053,6 +1054,8 @@ def _identity_acceptance_reasons(
     search_metadata: dict[str, Any],
 ) -> tuple[str, ...]:
     reasons = []
+    if score.identity_eligible is False:
+        reasons.append(score.orientation_rejection_reason or "identity_orientation_ineligible")
     if search_metadata["search_truncated"]:
         reasons.append("reference_search_truncated")
     elif progressive_ambiguous:

@@ -92,6 +92,12 @@ def match_score_payload(score: MatchScore) -> dict[str, Any]:
         "route_structure_cost": score.route_structure_cost,
         "route_descriptor_cost": score.route_descriptor_cost,
         "route_topology_cost": score.route_topology_cost,
+        "identity_status": score.identity_status,
+        "identity_eligible": score.identity_eligible,
+        "identity_cost": score.identity_cost,
+        "required_rotation_deg": score.required_rotation_deg,
+        "orientation_rejection_reason": score.orientation_rejection_reason,
+        "stroke_pattern_cost": score.stroke_pattern_cost,
         "missing_evidence_penalty": score.missing_evidence_penalty,
         "route_evidence_status": score.route_evidence_status,
         "route_search_truncated": score.route_search_truncated,
@@ -106,6 +112,11 @@ def match_score_payload(score: MatchScore) -> dict[str, Any]:
 
 
 def match_reason(score: MatchScore, alternatives: tuple[MatchScore, ...]) -> str:
+    if score.identity_eligible is False:
+        rotation = score.required_rotation_deg
+        detail = f"Required rotation: {rotation:+.1f} degrees. " if rotation is not None else ""
+        reason = score.orientation_rejection_reason or "orientation_ineligible"
+        return f"Candidate rejected by orientation gate ({reason}). {detail}"
     if not alternatives:
         return "Only available reference candidate."
     runner_up = alternatives[0]
@@ -120,6 +131,7 @@ def match_reason(score: MatchScore, alternatives: tuple[MatchScore, ...]) -> str
         "route structure": ("route_structure_cost", ROUTE_STRUCTURE_WEIGHT),
         "route descriptor": ("route_descriptor_cost", ROUTE_DESCRIPTOR_WEIGHT),
         "route topology": ("route_topology_cost", ROUTE_TOPOLOGY_WEIGHT),
+        "stroke pattern": ("stroke_pattern_cost", 1.0),
     }
     advantages = []
     for label, (attribute, weight) in weights.items():
@@ -148,6 +160,21 @@ def ambiguity_sources(
     acceptance_reasons: tuple[str, ...] = (),
 ) -> list[dict[str, str]]:
     sources = []
+    if score.identity_eligible is False:
+        rotation = score.required_rotation_deg
+        rotation_detail = (
+            f" Required rotation: {rotation:+.1f} degrees." if rotation is not None else ""
+        )
+        sources.append(
+            {
+                "source": "orientation_ineligible",
+                "reason": (
+                    f"Candidate rejected by orientation gate: "
+                    f"{score.orientation_rejection_reason or 'identity ineligible'}."
+                    f"{rotation_detail}"
+                ),
+            }
+        )
     if search_metadata is not None and search_metadata["search_truncated"]:
         unrefined_count = (
             search_metadata["coarse_candidate_count"] - search_metadata["refined_candidate_count"]
@@ -232,6 +259,7 @@ def ambiguity_sources(
         "retrieval_ambiguity": {"match_cost_tie"},
         "segmentation_uncertainty": {"segmentation_uncertainty"},
         "route_pair_ambiguous": {"writing_route_hypothesis", "writing_route_pair_tie"},
+        "required_rotation_exceeds_identity_limit": {"orientation_ineligible"},
     }
     acceptance_reasons_text = {
         "reference_search_truncated": (

@@ -48,6 +48,7 @@ from .models import (
     ContinuousPath,
     CropRect,
     ExtractedLetter,
+    IdentityAlignmentPolicy,
     InkMaskResult,
     InkMode,
     LetterImageInput,
@@ -66,12 +67,20 @@ from .models import (
 )
 from .path import (
     PathExtractionError,
+    align_bounded_continuous_paths,
     align_continuous_paths,
     align_ordered_paths,
     fit_similarity_transform,
     recover_ordered_path,
     resample_continuous_path,
     resample_path,
+)
+from .patterns import (
+    DirectedStrokePattern,
+    StrokePatternDescriptor,
+    StrokeVariationPolicy,
+    directed_stroke_pattern_distance,
+    stroke_pattern_descriptor,
 )
 from .report import WrittenComparisonReport, write_comparison_report
 from .routes import (
@@ -96,6 +105,12 @@ from .skeleton import analyze_skeleton
 
 __all__ = [
     "AlignmentResult",
+    "IdentityAlignmentPolicy",
+    "DirectedStrokePattern",
+    "StrokePatternDescriptor",
+    "StrokeVariationPolicy",
+    "directed_stroke_pattern_distance",
+    "stroke_pattern_descriptor",
     "ComparisonAnalysis",
     "ComparisonResult",
     "ContinuousPath",
@@ -129,6 +144,7 @@ __all__ = [
     "generate_writing_route_candidates",
     "select_writing_route_pair",
     "WrittenComparisonReport",
+    "align_bounded_continuous_paths",
     "align_continuous_paths",
     "align_ordered_paths",
     "analyze_comparison",

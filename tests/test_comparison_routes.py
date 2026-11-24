@@ -347,4 +347,7 @@ def test_route_descriptor_uses_planarcurve_and_carries_component_roles() -> None
     assert descriptor.component_role_sequence == ("primary", "secondary", "ambiguous")
     assert descriptor.relative_mark_centroids == ((0.8, 0.2),)
     assert route_descriptor_distance(descriptor, descriptor) == pytest.approx(0.0)
-    assert route_descriptor_distance(descriptor, reversed_descriptor) == pytest.approx(0.0)
+    assert route_descriptor_distance(descriptor, reversed_descriptor) > 0.0
+    assert route_descriptor_distance(
+        descriptor, reversed_descriptor, allow_reverse=True
+    ) == pytest.approx(0.0)

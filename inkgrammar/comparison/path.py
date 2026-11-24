@@ -12,7 +12,13 @@ from skeletonpaths import (
     refined_walk,
 )
 
-from .models import AlignmentResult, ContinuousPath, OrderedPath, SkeletonDiagnostics
+from .models import (
+    AlignmentResult,
+    ContinuousPath,
+    IdentityAlignmentPolicy,
+    OrderedPath,
+    SkeletonDiagnostics,
+)
 
 
 class PathExtractionError(ValueError):
@@ -282,6 +288,56 @@ def transform_continuous_path(
         route_event_progress=path.route_event_progress,
         edge_ids=path.edge_ids,
         edge_directions=path.edge_directions,
+    )
+
+
+def align_bounded_continuous_paths(
+    reference: ContinuousPath,
+    sample: ContinuousPath,
+    policy: IdentityAlignmentPolicy | None = None,
+    sample_count: int = 256,
+) -> AlignmentResult:
+    """Align a directed path with bounded positive scale and page rotation."""
+    policy = policy or IdentityAlignmentPolicy()
+    reference_samples = resample_continuous_path(reference, sample_count)
+    sample_samples = resample_continuous_path(sample, sample_count)
+    unconstrained = fit_similarity_transform(reference_samples.xy, sample_samples.xy)
+    required_rotation = float((unconstrained.rotation_deg + 180.0) % 360.0 - 180.0)
+    rotation = float(np.clip(required_rotation, -policy.max_rotation_deg, policy.max_rotation_deg))
+    scale = unconstrained.scale
+    if policy.min_scale_ratio is not None:
+        scale = max(scale, policy.min_scale_ratio)
+    if policy.max_scale_ratio is not None:
+        scale = min(scale, policy.max_scale_ratio)
+    angle = np.deg2rad(rotation)
+    matrix = scale * np.array(((np.cos(angle), -np.sin(angle)), (np.sin(angle), np.cos(angle))))
+    translation = reference_samples.xy.mean(axis=0) - sample_samples.xy.mean(axis=0) @ matrix.T
+    transform = Similarity2D(
+        scale=float(scale),
+        rotation_deg=rotation,
+        dx=float(translation[0]),
+        dy=float(translation[1]),
+    )
+    aligned_path = transform_continuous_path(sample_samples, transform)
+    error = float(np.mean(np.sum((reference_samples.xy - aligned_path.xy) ** 2, axis=1)))
+    scale_eligible = (
+        policy.min_scale_ratio is None or unconstrained.scale >= policy.min_scale_ratio
+    ) and (policy.max_scale_ratio is None or unconstrained.scale <= policy.max_scale_ratio)
+    eligible = abs(required_rotation) <= policy.max_rotation_deg and scale_eligible
+    reason = None
+    if abs(required_rotation) > policy.max_rotation_deg:
+        reason = "required_rotation_exceeds_identity_limit"
+    elif not scale_eligible:
+        reason = "required_scale_exceeds_identity_limit"
+    return AlignmentResult(
+        transform=transform,
+        direction="forward",
+        aligned_sample_xy=aligned_path.xy,
+        mean_squared_error=error,
+        aligned_sample_path=aligned_path,
+        required_rotation_deg=required_rotation,
+        orientation_eligible=eligible,
+        rejection_reason=reason,
     )
 
 

@@ -276,6 +276,10 @@ class WritingRoutePairScore:
     pen_lift_count: int = 0
     descriptor_matching_cost: float = 0.0
 
+    stroke_pattern_cost: float = 0.0
+    required_rotation_deg: float | None = None
+    orientation_eligible: bool = True
+    orientation_rejection_reason: str | None = None
     eligible: bool = False
 
     @property
@@ -287,6 +291,7 @@ class WritingRoutePairScore:
             "topology_event_compatibility_cost": self.topology_event_compatibility_cost,
             "writing_prior_cost": self.writing_prior_cost,
             "descriptor_matching_cost": self.descriptor_matching_cost,
+            "stroke_pattern_cost": self.stroke_pattern_cost,
             "reconstruction_fit_cost": self.reconstruction_fit_cost,
             "model_complexity_cost": self.model_complexity_cost,
         }
@@ -309,12 +314,40 @@ class WritingRoutePairSelection:
 
 
 @dataclass(frozen=True)
+class IdentityAlignmentPolicy:
+    max_rotation_deg: float = 15.0
+    rotation_soft_sigma_deg: float = 6.0
+    min_scale_ratio: float | None = 0.5
+    max_scale_ratio: float | None = 2.0
+    allow_hidden_reversal: bool = False
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.max_rotation_deg) or not 0.0 <= self.max_rotation_deg <= 180.0:
+            raise ValueError("max_rotation_deg must be between 0 and 180")
+        if not np.isfinite(self.rotation_soft_sigma_deg) or self.rotation_soft_sigma_deg <= 0.0:
+            raise ValueError("rotation_soft_sigma_deg must be finite and positive")
+        if self.min_scale_ratio is not None and self.min_scale_ratio <= 0.0:
+            raise ValueError("min_scale_ratio must be positive")
+        if self.max_scale_ratio is not None and self.max_scale_ratio <= 0.0:
+            raise ValueError("max_scale_ratio must be positive")
+        if (
+            self.min_scale_ratio is not None
+            and self.max_scale_ratio is not None
+            and self.min_scale_ratio > self.max_scale_ratio
+        ):
+            raise ValueError("min_scale_ratio cannot exceed max_scale_ratio")
+
+
+@dataclass(frozen=True)
 class AlignmentResult:
     transform: Similarity2D
     direction: Literal["forward", "reversed-for-best-match"]
     aligned_sample_xy: np.ndarray
     mean_squared_error: float
     aligned_sample_path: ContinuousPath | None = None
+    required_rotation_deg: float | None = None
+    orientation_eligible: bool = True
+    rejection_reason: str | None = None
 
     def __post_init__(self) -> None:
         points = np.asarray(self.aligned_sample_xy, dtype=float)

@@ -12,17 +12,28 @@ from skeletonpaths import (
     SubpixelReconstructionLimitError,
 )
 
-from .descriptors import GlyphDescriptor, glyph_descriptor, route_descriptor
+from .descriptors import (
+    GlyphDescriptor,
+    RouteDescriptor,
+    glyph_descriptor,
+    route_descriptor,
+)
 from .geometry import continuous_differential_geometry
-from .models import ContinuousPath, ExtractedLetter, WritingRoutePairSelection
+from .models import (
+    ContinuousPath,
+    ExtractedLetter,
+    IdentityAlignmentPolicy,
+    WritingRouteCandidate,
+    WritingRoutePairSelection,
+)
 from .path import (
     PathExtractionError,
-    align_continuous_paths,
+    align_bounded_continuous_paths,
     recover_ordered_path,
     refine_continuous_path,
     resample_continuous_path,
 )
-from .routes import evaluate_writing_route_pairs
+from .routes import evaluate_writing_route_pairs, shortlist_writing_route_candidates
 from .segmentation import ReferenceGallery, SegmentedGlyph
 from .skeleton import analyze_skeleton
 from .steering import (
@@ -46,6 +57,7 @@ ROUTE_STRUCTURE_WEIGHT = 0.10
 AMBIGUITY_ABSOLUTE_MARGIN = 0.04
 ROUTE_DESCRIPTOR_WEIGHT = 0.25
 ROUTE_TOPOLOGY_WEIGHT = 0.10
+STROKE_PATTERN_WEIGHT = 0.30
 AMBIGUITY_RELATIVE_MARGIN = 0.15
 
 
@@ -72,6 +84,11 @@ class MatchEvidence:
     route_topology_cost: float | None = None
     route_structure_cost: float | None = None
     missing_evidence_penalty: float = 0.0
+    identity_eligible: bool | None = None
+    identity_status: Literal["eligible", "ineligible", "ambiguous", "accepted"] = "ambiguous"
+    required_rotation_deg: float | None = None
+    orientation_rejection_reason: str | None = None
+    stroke_pattern_cost: float | None = None
 
     def __post_init__(self) -> None:
         costs = (
@@ -85,6 +102,7 @@ class MatchEvidence:
             self.route_steering_cost,
             self.route_topology_cost,
             self.route_structure_cost,
+            self.stroke_pattern_cost,
             self.missing_evidence_penalty,
         )
         if any(value is not None and (not np.isfinite(value) or value < 0.0) for value in costs):
@@ -99,6 +117,7 @@ class MatchEvidence:
             ("route_heading", self.route_heading_cost),
             ("route_steering", self.route_steering_cost),
             ("route_topology", self.route_topology_cost),
+            ("stroke_pattern", self.stroke_pattern_cost),
             ("route_structure", self.route_structure_cost),
         )
         features.extend(name for name, value in route_features if value is not None)
@@ -112,6 +131,7 @@ class MatchEvidence:
             ("route_heading", self.route_heading_cost),
             ("route_steering", self.route_steering_cost),
             ("route_topology", self.route_topology_cost),
+            ("stroke_pattern", self.stroke_pattern_cost),
             ("route_structure", self.route_structure_cost),
         )
         return tuple(name for name, value in route_features if value is None)
@@ -139,10 +159,21 @@ class MatchScore:
     route_warning: str | None = None
     route_search_failure: dict[str, str | int] | None = None
     route_pair_selection: WritingRoutePairSelection | None = None
+    identity_eligible: bool | None = None
+    identity_cost: float | None = None
+    required_rotation_deg: float | None = None
+    orientation_rejection_reason: str | None = None
+    stroke_pattern_cost: float | None = None
 
     @property
     def cost(self) -> float:
         return self.refined_cost if self.refined_cost is not None else self.coarse_cost
+
+    @property
+    def identity_status(self) -> Literal["eligible", "ineligible", "ambiguous"]:
+        if self.identity_eligible is None:
+            return "ambiguous"
+        return "eligible" if self.identity_eligible else "ineligible"
 
     @property
     def evidence(self) -> MatchEvidence:
@@ -157,8 +188,23 @@ class MatchScore:
             route_steering_cost=self.fitted_steering_cost,
             route_topology_cost=self.route_topology_cost,
             route_structure_cost=self.route_structure_cost,
+            identity_eligible=self.identity_eligible,
+            identity_status=self.identity_status,
+            required_rotation_deg=self.required_rotation_deg,
+            orientation_rejection_reason=self.orientation_rejection_reason,
+            stroke_pattern_cost=self.stroke_pattern_cost,
             missing_evidence_penalty=self.missing_evidence_penalty,
         )
+
+
+def _identity_sort_key(score: MatchScore) -> tuple[bool, float, float, str]:
+    pattern_cost = score.stroke_pattern_cost
+    return (
+        score.identity_eligible is False,
+        score.cost if pattern_cost is None else pattern_cost,
+        score.cost,
+        score.reference_id,
+    )
 
 
 @dataclass(frozen=True)
@@ -337,6 +383,23 @@ def _missing_evidence_penalty(
     return sum(weight for value, weight in missing_features if value is None)
 
 
+def _descriptors_for_routes(
+    extracted: ExtractedLetter,
+    routes: tuple[WritingRouteCandidate, ...],
+) -> tuple[RouteDescriptor, ...]:
+    if len(extracted.route_descriptors) == len(extracted.route_candidates):
+        descriptor_by_route = {
+            id(route): descriptor
+            for route, descriptor in zip(
+                extracted.route_candidates,
+                extracted.route_descriptors,
+                strict=True,
+            )
+        }
+        return tuple(descriptor_by_route[id(route)] for route in routes)
+    return tuple(route_descriptor(route, extracted) for route in routes)
+
+
 def _route_pair_selection(
     sample_extracted: ExtractedLetter | None,
     reference_extracted: ExtractedLetter | None,
@@ -348,14 +411,15 @@ def _route_pair_selection(
         or not reference_extracted.route_candidates
     ):
         return None
-    sample_candidates = fit_writing_route_candidates(sample_extracted.route_candidates)
-    reference_candidates = fit_writing_route_candidates(reference_extracted.route_candidates)
-    sample_descriptors = sample_extracted.route_descriptors or tuple(
-        route_descriptor(candidate, sample_extracted) for candidate in sample_candidates
+    sample_routes = shortlist_writing_route_candidates(sample_extracted.route_candidates, limit=3)
+    reference_routes = shortlist_writing_route_candidates(
+        reference_extracted.route_candidates,
+        limit=3,
     )
-    reference_descriptors = reference_extracted.route_descriptors or tuple(
-        route_descriptor(candidate, reference_extracted) for candidate in reference_candidates
-    )
+    sample_descriptors = _descriptors_for_routes(sample_extracted, sample_routes)
+    reference_descriptors = _descriptors_for_routes(reference_extracted, reference_routes)
+    sample_candidates = fit_writing_route_candidates(sample_routes)
+    reference_candidates = fit_writing_route_candidates(reference_routes)
     return evaluate_writing_route_pairs(
         reference_candidates,
         sample_candidates,
@@ -397,6 +461,7 @@ def refine_match(
         steering = pair_selection.score.steering_profile_cost
         descriptor_cost = pair_selection.score.descriptor_matching_cost
         topology_cost = pair_selection.score.topology_event_compatibility_cost
+        pattern_cost = pair_selection.score.stroke_pattern_cost
         missing_evidence_penalty = _missing_evidence_penalty(
             centerline_cost=centerline,
             heading_cost=None,
@@ -412,6 +477,7 @@ def refine_match(
             + ROUTE_STRUCTURE_WEIGHT * (route_structure or 0.0)
             + ROUTE_DESCRIPTOR_WEIGHT * descriptor_cost
             + ROUTE_TOPOLOGY_WEIGHT * topology_cost
+            + STROKE_PATTERN_WEIGHT * pattern_cost
             + missing_evidence_penalty
         )
         return replace(
@@ -422,16 +488,26 @@ def refine_match(
             route_structure_cost=route_structure,
             route_descriptor_cost=descriptor_cost,
             route_topology_cost=topology_cost,
+            stroke_pattern_cost=pattern_cost,
+            identity_eligible=pair_selection.score.eligible,
+            identity_cost=pair_selection.score.total_cost,
+            required_rotation_deg=pair_selection.score.required_rotation_deg,
+            orientation_rejection_reason=pair_selection.score.orientation_rejection_reason,
             missing_evidence_penalty=missing_evidence_penalty,
             route_pair_selection=pair_selection,
         )
     route_structure = _route_structure_cost(sample_extracted, reference_extracted)
+    alignment = None
     try:
         reference_path = _continuous_path_for_match(reference, reference_extracted)
         sample_path = _continuous_path_for_match(sample, sample_extracted)
         if reference_path is None or sample_path is None:
             raise PathExtractionError("continuous matching paths are unavailable")
-        alignment = align_continuous_paths(reference_path, sample_path)
+        alignment = align_bounded_continuous_paths(
+            reference_path,
+            sample_path,
+            IdentityAlignmentPolicy(),
+        )
         aligned_sample_path = alignment.aligned_sample_path
         if aligned_sample_path is None:
             raise PathExtractionError("aligned continuous sample path is unavailable")
@@ -458,6 +534,13 @@ def refine_match(
             coarse_score,
             refined_cost=(coarse_score.coarse_cost + route_increment + missing_evidence_penalty),
             route_structure_cost=route_structure,
+            identity_eligible=(alignment.orientation_eligible if alignment is not None else None),
+            required_rotation_deg=(
+                alignment.required_rotation_deg if alignment is not None else None
+            ),
+            orientation_rejection_reason=(
+                alignment.rejection_reason if alignment is not None else None
+            ),
             missing_evidence_penalty=missing_evidence_penalty,
         )
 
@@ -494,6 +577,9 @@ def refine_match(
         heading_cost=heading,
         fitted_steering_cost=fitted_steering,
         route_structure_cost=route_structure,
+        identity_eligible=alignment.orientation_eligible,
+        required_rotation_deg=alignment.required_rotation_deg,
+        orientation_rejection_reason=alignment.rejection_reason,
         missing_evidence_penalty=missing_evidence_penalty,
     )
 
@@ -527,7 +613,7 @@ def refine_top_k_matches(
                 reference_extracted=extracted,
             )
         )
-    refined.sort(key=lambda score: (score.cost, score.reference_id))
+    refined.sort(key=_identity_sort_key)
     return [replace(score, rank=rank) for rank, score in enumerate(refined, start=1)]
 
 
@@ -589,7 +675,7 @@ def refine_matches_progressively(
             )
         )
 
-    refined.sort(key=lambda candidate: (candidate.cost, candidate.reference_id))
+    refined.sort(key=_identity_sort_key)
     ranked = tuple(replace(score, rank=rank) for rank, score in enumerate(refined, start=1))
     return ProgressiveRefinementResult(
         scores=ranked,
@@ -604,7 +690,7 @@ def match_status(scores: list[MatchScore]) -> Literal["clear", "ambiguous"]:
     """Classify best-match ambiguity from the gap to the second-ranked candidate."""
     if len(scores) < 2:
         return "clear"
-    ranked = sorted(scores, key=lambda score: (score.cost, score.reference_id))
+    ranked = sorted(scores, key=_identity_sort_key)
     best, second = ranked[:2]
     margin = second.cost - best.cost
     relative_margin = margin / max(abs(best.cost), 1e-9)

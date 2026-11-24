@@ -77,12 +77,16 @@ def _model_profile(
 def _profile_pair_distance(
     reference_model: TrajectoryModelSelectionResult,
     sample_model: TrajectoryModelSelectionResult,
+    *,
+    allow_reverse: bool = False,
 ) -> float:
     reference_rates, reference_turn = _model_profile(reference_model)
     sample_rates, sample_turn = _model_profile(sample_model)
-    reversed_rates = -sample_rates[::-1]
+    profiles = [(sample_rates, sample_turn)]
+    if allow_reverse:
+        profiles.append((-sample_rates[::-1], -sample_turn))
     distances = []
-    for rates, turn in ((sample_rates, sample_turn), (reversed_rates, -sample_turn)):
+    for rates, turn in profiles:
         scale = max(
             360.0,
             float(np.sqrt(np.mean(reference_rates**2))),
@@ -97,6 +101,8 @@ def _profile_pair_distance(
 def steering_profile_distance(
     reference: WritingRouteCandidate,
     sample: WritingRouteCandidate,
+    *,
+    allow_reverse: bool = False,
 ) -> float:
     paired_count = min(len(reference.steering_models), len(sample.steering_models))
     if not paired_count:
@@ -112,6 +118,7 @@ def steering_profile_distance(
             _profile_pair_distance(
                 reference.steering_models[index],
                 sample.steering_models[index],
+                allow_reverse=allow_reverse,
             )
             * weight
         )
