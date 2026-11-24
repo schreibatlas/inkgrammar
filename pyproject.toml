@@ -26,7 +26,7 @@ dependencies = [
   "rasterregions>=0.2.7,<0.3",
   "packaging>=24",
   "planarcurve>=0.1.5,<0.2",
-  "skeletonpaths>=0.1.6,<0.2",
+  "skeletonpaths>=0.1.7,<0.2",
   "strokeoutline[svg]>=0.1.2,<0.2",
   "Pillow>=10.1",
   "pydantic>=2.8",
@@ -57,7 +57,7 @@ Changelog = "https://github.com/buchwandler/inkgrammar/releases"
 
 [project.optional-dependencies]
 comparison = [
-  "skeletonpaths[image]>=0.1.6,<0.2",
+  "skeletonpaths[image]>=0.1.7,<0.2",
   "planarcurve[fit]>=0.1.5,<0.2",
 ]
 dev = [

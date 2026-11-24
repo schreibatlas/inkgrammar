@@ -217,6 +217,8 @@ def test_route_reconstruction_failure_preserves_topology_comparison(tmp_path, mo
     assert extracted.diagnostics.topology.component_count == 1
     assert comparison.alignment is None
     assert any("forced reconstruction failure" in warning for warning in comparison.warnings)
+    assert any("incomplete writing-route evidence" in warning for warning in comparison.warnings)
+    assert comparison.route_selection is None
 
 
 def test_crop_to_ink_uses_rasterregions_bbox_and_preserves_empty_policy():
@@ -306,3 +308,63 @@ def test_extract_segmented_glyph_reuses_prepared_analysis(tmp_path, monkeypatch)
 
     assert extracted.diagnostics.analysis is analysis
     assert extracted.diagnostics.topology.endpoint_count == 2
+
+
+def test_comparison_extraction_uses_explicit_bounded_search_policy(tmp_path, monkeypatch):
+    from inkgrammar.comparison import api
+
+    image = Image.new("RGB", (32, 32), "white")
+    ImageDraw.Draw(image).line((16, 4, 16, 27), fill="black", width=5)
+    image_path = tmp_path / "bounded-line.png"
+    image.save(image_path)
+    original = api.generate_writing_route_candidates
+    received = {}
+
+    def record_search(*args, **kwargs):
+        received.update(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(api, "generate_writing_route_candidates", record_search)
+
+    extracted = api.extract_letter(image_path, (0, 0, 32, 32))
+
+    assert extracted.route_candidates
+    assert received["limit"] == api.COMPARISON_ROUTE_SEARCH_LIMIT
+    assert received["limits"] == api.COMPARISON_STROKE_SEARCH_LIMITS
+    assert received["on_limit"] == "truncate"
+    assert extracted.route_candidates[0].hypothesis.search_diagnostics is not None
+
+
+def test_junction_pairing_limit_degrades_only_tolerant_route_extraction(tmp_path, monkeypatch):
+    from skeletonpaths import JunctionPairingLimitError
+
+    from inkgrammar.comparison import api
+
+    image = Image.new("RGB", (32, 32), "white")
+    ImageDraw.Draw(image).line((16, 4, 16, 27), fill="black", width=5)
+    image_path = tmp_path / "line.png"
+    image.save(image_path)
+    error = JunctionPairingLimitError(
+        "max_junction_pairings",
+        1000,
+        1001,
+        "junction-pairing-generation",
+    )
+
+    def fail_route_search(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(api, "generate_writing_route_candidates", fail_route_search)
+
+    extracted = api.extract_letter(image_path, (0, 0, 32, 32), allow_path_failure=True)
+
+    assert extracted.diagnostics.topology.component_count == 1
+    assert extracted.route_candidates == ()
+    assert extracted.ordered_path is not None
+    assert extracted.continuous_path is None
+    assert "max_junction_pairings" in extracted.geometry_warning
+    assert "junction-pairing-generation" in extracted.geometry_warning
+
+    with pytest.raises(api.PathExtractionError) as raised:
+        api.extract_letter(image_path, (0, 0, 32, 32), allow_path_failure=False)
+    assert raised.value.__cause__ is error

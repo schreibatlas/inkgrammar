@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, is_dataclass, replace
+from enum import Enum
+from importlib import import_module
 from importlib.metadata import version as package_version
 from pathlib import Path
 from time import perf_counter
@@ -23,7 +25,7 @@ from .batch_report import (
     match_score_payload,
     write_batch_report,
 )
-from .descriptors import GlyphDescriptor
+from .descriptors import GlyphDescriptor, route_descriptor
 from .matching import (
     DEFAULT_REFINEMENT_LIMIT,
     DEFAULT_TOP_K,
@@ -40,9 +42,15 @@ from .models import (
     CropRect,
     ExtractedLetter,
     OrderedPath,
+    WritingStructurePolicy,
 )
 from .progress import ProgressReporter
 from .report import write_comparison_report
+from .routes import (
+    COMPARISON_ROUTE_SEARCH_LIMIT,
+    COMPARISON_STROKE_SEARCH_LIMITS,
+    shortlist_writing_route_candidates,
+)
 from .segmentation import (
     REFERENCE_PROFILE_VERSION,
     REFERENCE_SEGMENTATION_POLICY_VERSION,
@@ -57,11 +65,13 @@ from .segmentation import (
     segment_reference_gallery,
     segment_sample_glyphs,
 )
-from .skeleton import analyze_skeleton
+from .skeleton import analyze_skeleton, diagnostics_from_analysis
 from .steering import fit_writing_route_candidates
 
 _REFERENCE_CACHE_VERSION = 7
 _DESCRIPTOR_SIZE = 96
+_REFERENCE_EXTRACTION_CACHE_VERSION = 2
+_ROUTE_EXTRACTION_ALGORITHM_VERSION = 2
 
 _REFERENCE_DIAGNOSTICS = (
     "reference-mask.png",
@@ -500,6 +510,121 @@ def _reference_extraction_paths(cache_dir: Path, glyph_id: str) -> tuple[Path, P
     )
 
 
+def _encode_route_cache_value(value: Any, arrays: dict[str, np.ndarray]) -> Any:
+    if isinstance(value, np.ndarray):
+        name = f"route_array_{len(arrays):05d}"
+        arrays[name] = value
+        return {"__array__": name}
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Enum):
+        return {
+            "__enum__": f"{type(value).__module__}:{type(value).__qualname__}",
+            "value": value.value,
+        }
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            "__dataclass__": f"{type(value).__module__}:{type(value).__qualname__}",
+            "fields": {
+                item.name: _encode_route_cache_value(getattr(value, item.name), arrays)
+                for item in fields(value)
+            },
+        }
+    if isinstance(value, (set, frozenset)):
+        return {
+            "__frozenset__": [
+                _encode_route_cache_value(item, arrays) for item in sorted(value, key=repr)
+            ]
+        }
+    if isinstance(value, tuple):
+        return {"__tuple__": [_encode_route_cache_value(item, arrays) for item in value]}
+    if isinstance(value, list):
+        return [_encode_route_cache_value(item, arrays) for item in value]
+    if isinstance(value, dict):
+        return {
+            "__dict__": [
+                [
+                    _encode_route_cache_value(key, arrays),
+                    _encode_route_cache_value(item, arrays),
+                ]
+                for key, item in value.items()
+            ]
+        }
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(f"unsupported route-cache value: {type(value)!r}")
+
+
+def _cache_class(type_name: str) -> type:
+    module_name, qualified_name = type_name.split(":", 1)
+    if not (
+        module_name.startswith("inkgrammar.")
+        or module_name.startswith("skeletonpaths.")
+        or module_name.startswith("planarcurve.")
+    ):
+        raise ValueError("route cache contains an unsupported type")
+    value: Any = import_module(module_name)
+    for part in qualified_name.split("."):
+        value = getattr(value, part)
+    return value
+
+
+def _decode_route_cache_value(value: Any, arrays: Any) -> Any:
+    if isinstance(value, list):
+        return [_decode_route_cache_value(item, arrays) for item in value]
+    if not isinstance(value, dict):
+        return value
+    if "__frozenset__" in value:
+        return frozenset(_decode_route_cache_value(item, arrays) for item in value["__frozenset__"])
+    if "__array__" in value:
+        return np.array(arrays[value["__array__"]], copy=True)
+    if "__tuple__" in value:
+        return tuple(_decode_route_cache_value(item, arrays) for item in value["__tuple__"])
+    if "__dict__" in value:
+        return {
+            _decode_route_cache_value(key, arrays): _decode_route_cache_value(item, arrays)
+            for key, item in value["__dict__"]
+        }
+    if "__enum__" in value:
+        return _cache_class(value["__enum__"])(value["value"])
+    if "__dataclass__" in value:
+        cls = _cache_class(value["__dataclass__"])
+        if not is_dataclass(cls):
+            raise ValueError("route cache type is not a dataclass")
+        return cls(
+            **{
+                key: _decode_route_cache_value(item, arrays)
+                for key, item in value["fields"].items()
+            }
+        )
+    return {key: _decode_route_cache_value(item, arrays) for key, item in value.items()}
+
+
+def _route_extraction_cache_fingerprint(
+    source_sha256: str,
+    candidate: SegmentedGlyph,
+    ink_mode: MaskMode,
+) -> str:
+    mask_digest = hashlib.sha256(np.ascontiguousarray(candidate.mask).tobytes()).hexdigest()
+    return _payload_fingerprint(
+        {
+            "cache_version": _REFERENCE_EXTRACTION_CACHE_VERSION,
+            "source_sha256": source_sha256,
+            "candidate_mask_sha256": mask_digest,
+            "bbox": candidate.bbox.model_dump(mode="json"),
+            "ink_mode": ink_mode,
+            "route_algorithm_version": _ROUTE_EXTRACTION_ALGORITHM_VERSION,
+            "packages": {
+                name: package_version(name)
+                for name in ("inkgrammar", "skeletonpaths", "planarcurve")
+            },
+            "route_search_limit": COMPARISON_ROUTE_SEARCH_LIMIT,
+            "search_limits": asdict(COMPARISON_STROKE_SEARCH_LIMITS),
+            "writing_structure_policy": asdict(WritingStructurePolicy()),
+        }
+    )
+
+
 def _load_reference_extraction(
     cache_dir: Path,
     source_path: Path,
@@ -513,12 +638,15 @@ def _load_reference_extraction(
     )
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     if (
-        metadata["source_sha256"] != source_sha256
-        or metadata["reference_id"] != candidate.glyph_id
-        or metadata["ink_mode"] != ink_mode
-        or metadata["bbox"] != candidate.bbox.model_dump(mode="json")
+        metadata.get("cache_version") != _REFERENCE_EXTRACTION_CACHE_VERSION
+        or metadata.get("source_sha256") != source_sha256
+        or metadata.get("reference_id") != candidate.glyph_id
+        or metadata.get("ink_mode") != ink_mode
+        or metadata.get("bbox") != candidate.bbox.model_dump(mode="json")
+        or metadata.get("route_fingerprint")
+        != _route_extraction_cache_fingerprint(source_sha256, candidate, ink_mode)
     ):
-        raise ValueError("cached reference extraction does not match the candidate")
+        raise ValueError("cached reference extraction does not match the candidate or route policy")
     with np.load(arrays_path, allow_pickle=False) as arrays:
         mask = arrays["mask"]
         path_xy = arrays["path_xy"]
@@ -529,13 +657,21 @@ def _load_reference_extraction(
         continuous_radius_px = arrays["continuous_radius_px"]
         continuous_confidence = arrays["continuous_confidence"]
         continuous_progress = arrays["continuous_progress"]
-    route_extraction = extract_segmented_glyph(
-        candidate,
-        source_path=source_path,
-        allow_path_failure=True,
-        analysis=prepared_analysis,
+        route_arrays = {
+            name: arrays[name] for name in arrays.files if name.startswith("route_array_")
+        }
+    diagnostics = (
+        diagnostics_from_analysis(prepared_analysis)
+        if prepared_analysis is not None
+        else analyze_skeleton(mask)
     )
-    diagnostics = route_extraction.diagnostics
+    route_candidates = tuple(
+        _decode_route_cache_value(item, route_arrays)
+        for item in metadata.get("route_candidates", ())
+    )
+    if len(route_candidates) != metadata.get("route_candidate_count"):
+        raise ValueError("cached route candidate count does not match its metadata")
+    route_descriptors = tuple(route_descriptor(route, candidate) for route in route_candidates)
     path_info = metadata["ordered_path"]
     ordered_path = (
         OrderedPath(
@@ -580,11 +716,15 @@ def _load_reference_extraction(
         ),
         diagnostics=diagnostics,
         ordered_path=ordered_path,
-        resampled_xy=resampled_xy if ordered_path is not None else None,
+        resampled_xy=(resampled_xy if len(resampled_xy) >= 2 else None),
         continuous_path=continuous_path,
         geometry_warning=metadata["geometry_warning"],
-        route_candidates=route_extraction.route_candidates,
-        route_descriptors=route_extraction.route_descriptors,
+        route_evidence_status=metadata.get("route_evidence_status", "available"),
+        route_search_truncated=metadata.get("route_search_truncated", False),
+        route_warning=metadata.get("route_warning"),
+        route_search_failure=metadata.get("route_search_failure"),
+        route_candidates=route_candidates,
+        route_descriptors=route_descriptors,
         component_role_sequence=candidate.component_role_sequence,
         secondary_mark_centroids=candidate.secondary_mark_centroids,
     )
@@ -595,12 +735,17 @@ def _save_reference_extraction(
     source_sha256: str,
     ink_mode: MaskMode,
     glyph_id: str,
+    candidate: SegmentedGlyph,
     extraction: ExtractedLetter,
 ) -> None:
     metadata_path, arrays_path, image_path = _reference_extraction_paths(cache_dir, glyph_id)
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     ordered_path = extraction.ordered_path
     continuous_path = extraction.continuous_path
+    route_arrays: dict[str, np.ndarray] = {}
+    route_candidate_data = [
+        _encode_route_cache_value(route, route_arrays) for route in extraction.route_candidates
+    ]
     np.savez_compressed(
         arrays_path,
         mask=extraction.mask_result.mask,
@@ -626,9 +771,21 @@ def _save_reference_extraction(
         continuous_progress=(
             continuous_path.progress if continuous_path is not None else np.zeros(0)
         ),
+        **route_arrays,
     )
     extraction.image.save(image_path, format="PNG")
     metadata = {
+        "cache_version": _REFERENCE_EXTRACTION_CACHE_VERSION,
+        "route_fingerprint": _route_extraction_cache_fingerprint(
+            source_sha256, candidate, ink_mode
+        ),
+        "route_candidates": route_candidate_data,
+        "route_evidence_status": extraction.route_evidence_status,
+        "route_search_truncated": extraction.route_search_truncated,
+        "route_warning": extraction.route_warning,
+        "route_search_failure": extraction.route_search_failure,
+        "route_candidate_count": len(extraction.route_candidates),
+        "route_status": extraction.route_evidence_status,
         "source_sha256": source_sha256,
         "ink_mode": ink_mode,
         "reference_id": glyph_id,
@@ -694,9 +851,12 @@ def _get_reference_extraction(
             analysis=prepared_analysis,
         )
     if extraction.route_candidates:
+        shortlisted_routes = shortlist_writing_route_candidates(extraction.route_candidates)
+        fitted_routes = fit_writing_route_candidates(shortlisted_routes)
         extraction = replace(
             extraction,
-            route_candidates=fit_writing_route_candidates(extraction.route_candidates),
+            route_candidates=fitted_routes,
+            route_descriptors=tuple(route_descriptor(route, candidate) for route in fitted_routes),
         )
     if cache_status == "miss":
         _save_reference_extraction(
@@ -704,16 +864,49 @@ def _get_reference_extraction(
             source_sha256,
             ink_mode,
             candidate.glyph_id,
+            candidate,
             extraction,
         )
+    elapsed_seconds = round(perf_counter() - started, 3)
+    search_diagnostics = [
+        route.hypothesis.search_diagnostics
+        for route in extraction.route_candidates
+        if route.hypothesis.search_diagnostics is not None
+    ]
     details: dict[str, Any] = {
         "reference_id": candidate.glyph_id,
         "cache": cache_status,
-        "message": f"Reference extraction {candidate.glyph_id}: cache {cache_status}",
+        "elapsed_seconds": elapsed_seconds,
+        "route_status": extraction.route_evidence_status,
+        "route_candidate_count": len(extraction.route_candidates),
+        "route_search_truncated": extraction.route_search_truncated,
+        "junction_count": extraction.diagnostics.topology.junction_count,
+        "max_junction_degree": max(
+            (item.maximum_junction_degree for item in search_diagnostics), default=0
+        ),
+        "stroke_hypothesis_count": len(
+            {route.orientation_group for route in extraction.route_candidates}
+        ),
+        "route_search_state_count": sum(item.explored_states for item in search_diagnostics),
+        "route_pairing_count": sum(
+            item.generated_local_pairings + item.generated_combinations
+            for item in search_diagnostics
+        ),
+        "geometry_warning_type": (
+            extraction.route_search_failure.get("type") if extraction.route_search_failure else None
+        ),
+        "message": (
+            f"Reference extraction {candidate.glyph_id}: {cache_status}, "
+            f"{len(extraction.route_candidates)} routes, {extraction.route_evidence_status} "
+            f"({elapsed_seconds:.2f}s)"
+            if extraction.route_candidates
+            else f"Reference extraction {candidate.glyph_id}: {cache_status}, "
+            f"route search limited -> topology fallback ({elapsed_seconds:.2f}s)"
+            if extraction.route_search_failure
+            else f"Reference extraction {candidate.glyph_id}: {cache_status}, "
+            f"route evidence unavailable ({elapsed_seconds:.2f}s)"
+        ),
     }
-    if progress.verbose:
-        details["elapsed_seconds"] = round(perf_counter() - started, 3)
-        details["message"] += f" ({details['elapsed_seconds']:.3f}s)"
     progress.stage("reference_extraction", details=details)
     return extraction
 
@@ -1310,9 +1503,16 @@ def _compare_letter_page_impl(
             allow_path_failure=True,
         )
         if sample_extracted.route_candidates:
+            shortlisted_routes = shortlist_writing_route_candidates(
+                sample_extracted.route_candidates
+            )
+            fitted_routes = fit_writing_route_candidates(shortlisted_routes)
             sample_extracted = replace(
                 sample_extracted,
-                route_candidates=fit_writing_route_candidates(sample_extracted.route_candidates),
+                route_candidates=fitted_routes,
+                route_descriptors=tuple(
+                    route_descriptor(route, sample_candidate) for route in fitted_routes
+                ),
             )
         coarse = rank_reference_candidates(
             sample_candidate,
@@ -1363,6 +1563,10 @@ def _compare_letter_page_impl(
             "stop_reason": progressive.stop_reason,
             "search_truncated": progressive.search_truncated,
             "refinement_limit": refinement_limit,
+            "route_evidence_status": ranked[0].route_evidence_status,
+            "route_search_truncated": ranked[0].route_search_truncated,
+            "route_warning": ranked[0].route_warning,
+            "route_search_failure": ranked[0].route_search_failure,
         }
         progress.stage(
             "path_refinement",

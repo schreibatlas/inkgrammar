@@ -10,6 +10,7 @@ import numpy as np
 from rasterregions import MaskMode, MaskResult, foreground_evidence, foreground_pyramid
 from skeletonpaths import (
     SkeletonAnalysis,
+    StrokeSearchLimitError,
     SubpixelReconstructionError,
     SubpixelReconstructionLimitError,
 )
@@ -40,6 +41,8 @@ from .progress import ProgressReporter
 from .reconstruction import render_reconstructed_strokes
 from .report import WrittenComparisonReport, write_comparison_report
 from .routes import (
+    COMPARISON_ROUTE_SEARCH_LIMIT,
+    COMPARISON_STROKE_SEARCH_LIMITS,
     ROUTE_REPORT_LIMIT,
     align_writing_routes,
     evaluate_writing_route_pairs,
@@ -70,10 +73,14 @@ def _route_paths(
     OrderedPath | None,
     ContinuousPath | None,
     str | None,
+    dict[str, str | int] | None,
 ]:
     try:
         candidates = generate_writing_route_candidates(
             diagnostics,
+            limit=COMPARISON_ROUTE_SEARCH_LIMIT,
+            limits=COMPARISON_STROKE_SEARCH_LIMITS,
+            on_limit="truncate",
             decision_field=decision_field,
             expected_strokes=expected_strokes,
             structure_policy=structure_policy,
@@ -84,7 +91,7 @@ def _route_paths(
             None,
         )
         if candidate is None:
-            return candidates, None, None, None
+            return candidates, None, None, None, None
         walk = candidate.hypothesis.walks[0]
         ordered_path = OrderedPath(
             xy=walk.xy,
@@ -92,9 +99,10 @@ def _route_paths(
             total_edge_count=walk.total_edge_count,
             walk=walk,
         )
-        return candidates, ordered_path, candidate.continuous_strokes[0], None
+        return candidates, ordered_path, candidate.continuous_strokes[0], None, None
     except (
         PathExtractionError,
+        StrokeSearchLimitError,
         SubpixelReconstructionError,
         SubpixelReconstructionLimitError,
         ValueError,
@@ -107,7 +115,40 @@ def _route_paths(
         if allow_path_failure:
             with suppress(PathExtractionError):
                 ordered_path = recover_ordered_path(diagnostics)
-        return (), ordered_path, None, f"Writing-route reconstruction failed: {error}"
+        return (
+            (),
+            ordered_path,
+            None,
+            f"Writing-route reconstruction failed ({type(error).__name__}): {error}",
+            (
+                {
+                    "type": type(error).__name__,
+                    "limit_name": error.limit_name,
+                    "configured_value": error.configured_value,
+                    "observed_value": error.observed_value,
+                    "stage": error.search_stage,
+                }
+                if isinstance(error, StrokeSearchLimitError)
+                else None
+            ),
+        )
+
+
+def _route_status(
+    candidates: tuple[WritingRouteCandidate, ...],
+    warning: str | None,
+    search_failure: dict[str, str | int] | None,
+) -> tuple[Literal["available", "truncated", "unavailable", "search-truncated-fallback"], bool]:
+    truncated = search_failure is not None or any(
+        candidate.hypothesis.truncated for candidate in candidates
+    )
+    if search_failure is not None:
+        return "search-truncated-fallback", True
+    if warning is not None:
+        return "unavailable", truncated
+    if truncated:
+        return "truncated", True
+    return "available", False
 
 
 def _with_selected_route(
@@ -326,7 +367,13 @@ def extract_letter(
         threshold=evidence.threshold,
     )
     diagnostics = analyze_skeleton(mask_result.mask)
-    route_candidates, ordered_path, continuous_path, geometry_warning = _route_paths(
+    (
+        route_candidates,
+        ordered_path,
+        continuous_path,
+        geometry_warning,
+        route_search_failure,
+    ) = _route_paths(
         diagnostics,
         expected_strokes=(
             writing_structure_policy or WritingStructurePolicy()
@@ -334,6 +381,9 @@ def extract_letter(
         structure_policy=writing_structure_policy,
         decision_field=evidence.decision_field,
         allow_path_failure=allow_path_failure,
+    )
+    route_evidence_status, route_search_truncated = _route_status(
+        route_candidates, geometry_warning, route_search_failure
     )
     return ExtractedLetter(
         source_path=source_path,
@@ -345,6 +395,10 @@ def extract_letter(
         resampled_xy=(resample_path(continuous_path.xy) if continuous_path is not None else None),
         continuous_path=continuous_path,
         geometry_warning=geometry_warning,
+        route_evidence_status=route_evidence_status,
+        route_search_truncated=route_search_truncated,
+        route_warning=geometry_warning,
+        route_search_failure=route_search_failure,
         route_candidates=route_candidates,
         route_descriptors=tuple(route_descriptor(route) for route in route_candidates),
         foreground_evidence=evidence,
@@ -365,12 +419,21 @@ def extract_segmented_glyph(
         if analysis is not None
         else analyze_skeleton(candidate.mask)
     )
-    route_candidates, ordered_path, continuous_path, geometry_warning = _route_paths(
+    (
+        route_candidates,
+        ordered_path,
+        continuous_path,
+        geometry_warning,
+        route_search_failure,
+    ) = _route_paths(
         diagnostics,
         expected_strokes=candidate.expected_stroke_count(writing_structure_policy),
         structure_policy=writing_structure_policy,
         ambiguous_component_count=len(candidate.ambiguous_component_indices),
         allow_path_failure=allow_path_failure,
+    )
+    route_evidence_status, route_search_truncated = _route_status(
+        route_candidates, geometry_warning, route_search_failure
     )
     return ExtractedLetter(
         source_path=Path(source_path),
@@ -387,6 +450,10 @@ def extract_segmented_glyph(
         resampled_xy=(resample_path(continuous_path.xy) if continuous_path is not None else None),
         continuous_path=continuous_path,
         geometry_warning=geometry_warning,
+        route_evidence_status=route_evidence_status,
+        route_search_truncated=route_search_truncated,
+        route_warning=geometry_warning,
+        route_search_failure=route_search_failure,
         route_candidates=route_candidates,
         route_descriptors=tuple(route_descriptor(route, candidate) for route in route_candidates),
         component_role_sequence=candidate.component_role_sequence,
@@ -413,6 +480,11 @@ def compare_extracted_letters(
         for side, extracted in (("Reference", reference), ("Sample", sample))
         if extracted.geometry_warning is not None
     ]
+    if reference.route_evidence_status != "available":
+        warnings.append(
+            "The selected reference was matched with incomplete writing-route evidence; "
+            "raster and topology evidence remained available."
+        )
     route_selection = route_pair_selection
     if reference.route_candidates and sample.route_candidates:
         if route_selection is None and reconstruction_config is not None:

@@ -134,6 +134,10 @@ class MatchScore:
     route_descriptor_cost: float | None = None
     route_topology_cost: float | None = None
     missing_evidence_penalty: float = 0.0
+    route_evidence_status: str | None = None
+    route_search_truncated: bool = False
+    route_warning: str | None = None
+    route_search_failure: dict[str, str | int] | None = None
     route_pair_selection: WritingRoutePairSelection | None = None
 
     @property
@@ -371,6 +375,14 @@ def refine_match(
 ) -> MatchScore:
     """Add continuous path evidence to raster ranking without rejecting candidates."""
     pair_selection = _route_pair_selection(sample_extracted, reference_extracted)
+    if reference_extracted is not None:
+        coarse_score = replace(
+            coarse_score,
+            route_evidence_status=reference_extracted.route_evidence_status,
+            route_search_truncated=reference_extracted.route_search_truncated,
+            route_warning=reference_extracted.route_warning,
+            route_search_failure=reference_extracted.route_search_failure,
+        )
     if pair_selection is not None:
         route_structure = _route_structure_cost(
             sample_extracted,

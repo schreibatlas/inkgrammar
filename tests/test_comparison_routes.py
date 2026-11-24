@@ -141,6 +141,49 @@ def test_route_search_uses_stroke_diversity_and_global_reversal(monkeypatch) -> 
     )
 
 
+def test_route_shortlist_preserves_best_stroke_count_and_orientation_alternatives(monkeypatch):
+    from types import SimpleNamespace
+
+    import inkgrammar.comparison.steering as steering
+    from inkgrammar.comparison.routes import shortlist_writing_route_candidates
+
+    base = _candidate()
+    candidates = []
+    for index in range(10):
+        hypothesis = replace(
+            base.hypothesis,
+            orientation_ambiguous=(index == 0),
+            orientation_ambiguous_strokes=(index == 0,),
+        )
+        candidates.append(
+            replace(
+                base,
+                hypothesis=hypothesis,
+                continuous_strokes=(base.continuous_strokes[0],) * (2 if index == 2 else 1),
+                score=replace(base.score, steering_complexity_cost=float(index)),
+                orientation_variant="global-reverse" if index == 1 else "native",
+                orientation_group=1 if index in (0, 1) else index + 1,
+            )
+        )
+
+    shortlist = shortlist_writing_route_candidates(tuple(candidates), limit=4)
+
+    assert {id(item) for item in shortlist} == {id(candidates[index]) for index in (0, 1, 2, 3)}
+
+    fit_calls = []
+
+    def count_fit(path):
+        fit_calls.append(path)
+        return SimpleNamespace(selected_change_count=0)
+
+    monkeypatch.setattr(steering, "fit_heading_rate_model", count_fit)
+    fitted = steering.fit_writing_route_candidates(shortlist)
+
+    assert len(fitted) == len(shortlist)
+    assert len(fit_calls) == sum(len(candidate.continuous_strokes) for candidate in shortlist)
+    assert len(fit_calls) < sum(len(candidate.continuous_strokes) for candidate in candidates)
+
+
 def test_joint_route_selection_is_deterministic_and_marks_near_ties() -> None:
     candidate = _candidate()
     straight = _continuous_path(((0, 0), (1, 0), (2, 0), (3, 0)))

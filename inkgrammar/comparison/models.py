@@ -406,6 +406,12 @@ class ExtractedLetter:
     resampled_xy: np.ndarray | None
     continuous_path: ContinuousPath | None = None
     geometry_warning: str | None = None
+    route_evidence_status: Literal[
+        "available", "truncated", "unavailable", "search-truncated-fallback"
+    ] = "available"
+    route_search_truncated: bool = False
+    route_warning: str | None = None
+    route_search_failure: dict[str, str | int] | None = None
     route_candidates: tuple[WritingRouteCandidate, ...] = ()
     route_descriptors: tuple[RouteDescriptor, ...] = ()
     foreground_evidence: ForegroundEvidence | None = None

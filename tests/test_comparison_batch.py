@@ -187,6 +187,16 @@ def test_batch_writes_pair_reports_summaries_and_reuses_hash_keyed_reference_cac
         raise AssertionError("reference segmentation should be loaded from the content-hash cache")
 
     monkeypatch.setattr("inkgrammar.comparison.batch.segment_reference_gallery", no_rebuild)
+    import inkgrammar.comparison.batch as batch_module
+
+    original_extract = batch_module.extract_segmented_glyph
+
+    def fail_reference_route_extraction(candidate, **kwargs):
+        if candidate.glyph_id.startswith("ref-"):
+            raise AssertionError("cache hits must not run reference route extraction")
+        return original_extract(candidate, **kwargs)
+
+    monkeypatch.setattr(batch_module, "extract_segmented_glyph", fail_reference_route_extraction)
     analysis_calls = 0
     original_analyze = comparison_api.analyze_skeleton
 
@@ -347,6 +357,12 @@ def test_progress_and_run_files_cover_success_failure_and_quiet_mode(tmp_path, c
     extraction_events = [event for event in events if event["stage"] == "reference_extraction"]
     assert extraction_events
     assert all("elapsed_seconds" in event["details"] for event in extraction_events)
+    assert all("route_status" in event["details"] for event in extraction_events)
+    assert all("route_candidate_count" in event["details"] for event in extraction_events)
+    assert all("route_search_truncated" in event["details"] for event in extraction_events)
+    assert all("junction_count" in event["details"] for event in extraction_events)
+    assert all("max_junction_degree" in event["details"] for event in extraction_events)
+    assert all("stroke_hypothesis_count" in event["details"] for event in extraction_events)
     segmentation_events = [event for event in events if event["stage"] == "reference_segmentation"]
     assert segmentation_events
     assert segmentation_events[0]["details"]["reference_profile"] == "generic"
@@ -786,6 +802,7 @@ def test_rejected_reference_segmentation_stops_before_downstream_work(tmp_path, 
 
 
 def test_reference_cache_round_trips_cleanup_evidence_and_rejects_old_policy(tmp_path):
+
     import shutil
 
     from inkgrammar.comparison.batch import _load_reference_cache, _save_reference_cache
@@ -829,3 +846,145 @@ def test_reference_cache_round_trips_cleanup_evidence_and_rejects_old_policy(tmp
             "dark",
             "generic",
         )
+
+
+def test_cached_route_search_fallback_is_reused_without_route_generation(tmp_path, monkeypatch):
+    import numpy as np
+    from PIL import ImageDraw
+    from skeletonpaths import JunctionPairingLimitError
+
+    from inkgrammar.comparison import api
+    from inkgrammar.comparison.batch import (
+        _load_reference_extraction,
+        _save_reference_extraction,
+    )
+    from inkgrammar.comparison.models import CropRect
+    from inkgrammar.comparison.segmentation import SegmentedGlyph
+    from inkgrammar.comparison.skeleton import analyze_skeleton
+
+    mask = np.zeros((24, 24), dtype=bool)
+    mask[3:21, 11:14] = True
+    image = Image.new("RGB", (24, 24), "white")
+    ImageDraw.Draw(image).rectangle((11, 3, 13, 20), fill="black")
+    candidate = SegmentedGlyph(
+        glyph_id="ref-000",
+        bbox=CropRect(x=0, y=0, width=24, height=24),
+        row_index=0,
+        column_index=0,
+        reading_order=0,
+        segmentation_confidence=1.0,
+        image=image,
+        mask=mask,
+    )
+    analysis = analyze_skeleton(mask).analysis
+    assert analysis is not None
+    error = JunctionPairingLimitError(
+        "max_junction_pairings", 1000, 1001, "junction-pairing-generation"
+    )
+
+    def fail_with_limit(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(api, "generate_writing_route_candidates", fail_with_limit)
+    extracted = api.extract_segmented_glyph(
+        candidate,
+        source_path=tmp_path / "reference.png",
+        allow_path_failure=True,
+        analysis=analysis,
+    )
+    cache_dir = tmp_path / "cache"
+    _save_reference_extraction(
+        cache_dir, "source-sha", "auto", candidate.glyph_id, candidate, extracted
+    )
+
+    def fail_route_search(*args, **kwargs):
+        raise AssertionError("cached fallback must not repeat route generation")
+
+    monkeypatch.setattr(api, "generate_writing_route_candidates", fail_route_search)
+    cached = _load_reference_extraction(
+        cache_dir,
+        tmp_path / "reference.png",
+        "source-sha",
+        candidate,
+        "auto",
+        prepared_analysis=analysis,
+    )
+
+    assert cached.route_candidates == ()
+    assert cached.geometry_warning == extracted.geometry_warning
+    assert "JunctionPairingLimitError" in cached.geometry_warning
+    assert cached.route_evidence_status == "search-truncated-fallback"
+    assert cached.route_search_truncated is True
+    assert cached.route_search_failure["type"] == "JunctionPairingLimitError"
+
+
+def test_pathological_reference_route_does_not_abort_comparison_batch(tmp_path, monkeypatch):
+    from skeletonpaths import JunctionPairingLimitError
+
+    import inkgrammar.comparison.batch as batch_module
+    from inkgrammar.comparison import api
+
+    reference = _page(tmp_path / "reference.png", ("e", "n", "l"), y=22)
+    sample = _page(tmp_path / "sample.png", ("e", "n", "l"), y=30)
+    original_extract = batch_module.extract_segmented_glyph
+    original_route_search = api.generate_writing_route_candidates
+
+    def fail_route_search(*args, **kwargs):
+        raise JunctionPairingLimitError(
+            "max_junction_pairings", 1000, 1001, "junction-pairing-generation"
+        )
+
+    def degrade_one_reference(candidate, **kwargs):
+        if candidate.glyph_id == "ref-000":
+            monkeypatch.setattr(api, "generate_writing_route_candidates", fail_route_search)
+            try:
+                return original_extract(candidate, **kwargs)
+            finally:
+                monkeypatch.setattr(api, "generate_writing_route_candidates", original_route_search)
+        return original_extract(candidate, **kwargs)
+
+    monkeypatch.setattr(batch_module, "extract_segmented_glyph", degrade_one_reference)
+    output = tmp_path / "contained-batch"
+    report = batch_module.compare_letter_page(
+        reference,
+        sample,
+        expected_letters=3,
+        output_dir=output,
+    )
+
+    run = json.loads((output / "run.json").read_text())
+    progress = [json.loads(line) for line in (output / "progress.jsonl").read_text().splitlines()]
+    failed_reference = next(
+        event
+        for event in progress
+        if event["stage"] == "reference_extraction"
+        and event["details"]["reference_id"] == "ref-000"
+    )
+    assert report.payload["sample"]["detected_count"] == 3
+    assert run["status"] == "completed"
+    assert failed_reference["details"]["route_status"] == "search-truncated-fallback"
+    assert failed_reference["details"]["route_candidate_count"] == 0
+    assert all(item["search"]["coarse_candidate_count"] == 3 for item in report.payload["matches"])
+    degraded_match = report.payload["matches"][0]
+    assert degraded_match["leading_reference_id"] == "ref-000"
+    assert degraded_match["leading_match"]["route_evidence_status"] == "search-truncated-fallback"
+    assert degraded_match["leading_match"]["route_search_truncated"] is True
+    assert (
+        degraded_match["leading_match"]["route_search_failure"]["stage"]
+        == "junction-pairing-generation"
+    )
+    assert degraded_match["leading_match"]["centerline_cost"] is None
+    assert degraded_match["leading_match"]["feature_coverage"]["available_features"] == [
+        "raster",
+        "aspect",
+        "fill",
+        "topology",
+    ]
+    pair_report = json.loads((output / degraded_match["report_json"]).read_text())
+    assert any(
+        "incomplete writing-route evidence" in warning for warning in pair_report["warnings"]
+    )
+    assert any(
+        "raster and topology evidence remained available" in warning
+        for warning in pair_report["warnings"]
+    )

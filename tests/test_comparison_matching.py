@@ -258,6 +258,40 @@ def test_glyph_descriptor_reuses_prepared_skeleton_analysis(monkeypatch) -> None
     assert descriptor.path_available is True
 
 
+def test_degraded_reference_route_evidence_flows_through_refinement(monkeypatch):
+    from skeletonpaths import JunctionPairingLimitError
+
+    from inkgrammar.comparison import api
+
+    sample = _shape("e")
+    reference = _shape("l")
+    sample_extracted = api.extract_segmented_glyph(sample, source_path="sample.png")
+    coarse = rank_reference_candidates(sample, _gallery(reference))[0]
+    error = JunctionPairingLimitError(
+        "max_junction_pairings", 1000, 1001, "junction-pairing-generation"
+    )
+
+    def fail_route_search(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(api, "generate_writing_route_candidates", fail_route_search)
+    degraded = api.extract_segmented_glyph(reference, source_path="reference.png")
+    refined = refine_match(
+        sample,
+        reference,
+        coarse,
+        sample_extracted=sample_extracted,
+        reference_extracted=degraded,
+    )
+
+    assert refined.route_pair_selection is None
+    assert refined.missing_evidence_penalty > 0.0
+    assert refined.route_evidence_status == "search-truncated-fallback"
+    assert refined.route_search_truncated
+    assert refined.route_warning == degraded.geometry_warning
+    assert refined.route_search_failure["stage"] == "junction-pairing-generation"
+
+
 def test_semantic_topology_mismatch_changes_coarse_cost() -> None:
     descriptor = glyph_descriptor(_shape("l"))
     same = coarse_match_cost(descriptor, descriptor)

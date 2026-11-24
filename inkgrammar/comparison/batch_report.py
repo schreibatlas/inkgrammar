@@ -93,6 +93,10 @@ def match_score_payload(score: MatchScore) -> dict[str, Any]:
         "route_descriptor_cost": score.route_descriptor_cost,
         "route_topology_cost": score.route_topology_cost,
         "missing_evidence_penalty": score.missing_evidence_penalty,
+        "route_evidence_status": score.route_evidence_status,
+        "route_search_truncated": score.route_search_truncated,
+        "route_warning": score.route_warning,
+        "route_search_failure": score.route_search_failure,
         "feature_coverage": {
             "available_features": list(score.evidence.available_features),
             "unavailable_features": list(score.evidence.unavailable_features),

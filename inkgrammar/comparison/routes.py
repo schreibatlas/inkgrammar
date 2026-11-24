@@ -40,6 +40,17 @@ from .path import (
 )
 
 ROUTE_SEARCH_LIMIT = 32
+COMPARISON_ROUTE_SEARCH_LIMIT = 12
+COMPARISON_STROKE_SEARCH_LIMITS = StrokeSearchLimits(
+    max_states=20_000,
+    max_hypotheses=256,
+    max_walk_steps=2_000,
+    max_repeated_edges=4,
+    max_strokes=16,
+    max_junction_pairings=256,
+    max_pairings_per_junction=128,
+    max_junction_combinations=256,
+)
 ROUTE_REPORT_LIMIT = 5
 DEFAULT_ROUTE_CANDIDATE_LIMIT = ROUTE_SEARCH_LIMIT
 ROUTE_AMBIGUITY_ABSOLUTE_MARGIN = 0.04
@@ -190,6 +201,7 @@ def generate_writing_route_candidates(
     decision_field: np.ndarray | None = None,
     limit: int = ROUTE_SEARCH_LIMIT,
     limits: StrokeSearchLimits | None = None,
+    on_limit: str = "raise",
     expected_strokes: int | None = None,
     structure_policy: WritingStructurePolicy | None = None,
     ambiguous_component_count: int = 0,
@@ -208,6 +220,7 @@ def generate_writing_route_candidates(
         expected_strokes=expected_strokes,
         limit=limit,
         limits=limits,
+        on_limit=on_limit,
         diversity="stroke-count",
     )
     if not hypotheses:
@@ -295,6 +308,56 @@ def generate_writing_route_candidates(
             message += f": {reconstruction_failures[-1]}"
         raise PathExtractionError(message)
     return tuple(candidates)
+
+
+COMPARISON_ROUTE_FIT_LIMIT = 8
+
+
+def shortlist_writing_route_candidates(
+    candidates: tuple[WritingRouteCandidate, ...],
+    *,
+    limit: int = COMPARISON_ROUTE_FIT_LIMIT,
+) -> tuple[WritingRouteCandidate, ...]:
+    if limit < 1:
+        raise ValueError("route shortlist limit must be positive")
+    ranked = tuple(sorted(candidates, key=lambda item: item.score.intrinsic_cost))
+    if len(ranked) <= limit:
+        return ranked
+
+    selected: list[int] = []
+
+    def retain(index: int) -> None:
+        if index not in selected and len(selected) < limit:
+            selected.append(index)
+
+    retain(0)
+    retained_stroke_counts: set[int] = set()
+    for index, candidate in enumerate(ranked):
+        stroke_count = len(candidate.continuous_strokes)
+        if stroke_count not in retained_stroke_counts:
+            retain(index)
+            retained_stroke_counts.add(stroke_count)
+
+    for index in tuple(selected):
+        candidate = ranked[index]
+        if candidate.hypothesis.orientation_ambiguous or any(
+            candidate.hypothesis.orientation_ambiguous_strokes
+        ):
+            counterpart = next(
+                (
+                    other_index
+                    for other_index, other in enumerate(ranked)
+                    if other.orientation_group == candidate.orientation_group
+                    and other.orientation_variant != candidate.orientation_variant
+                ),
+                None,
+            )
+            if counterpart is not None:
+                retain(counterpart)
+
+    for index in range(len(ranked)):
+        retain(index)
+    return tuple(ranked[index] for index in selected)
 
 
 def _centerline_cost(
